@@ -58,7 +58,7 @@ COVER_SIZE = 300
 REQUEST_TIMEOUT = 15
 ROOT_DIR = Path(__file__).resolve().parent
 COVERS_DIR = ROOT_DIR / "covers"
-STATIC_FALLBACK_BASE = "https://stargraph.xiey.work"
+STATIC_FALLBACK_BASE = os.environ.get("STAR_GRAPH_STATIC_FALLBACK", "").rstrip("/")
 
 # clean 模式：一次性标志，下次页面加载时前端清空封面缓存
 _CLEAN_CACHE = False
@@ -95,35 +95,35 @@ def _download_cover_one(item):
 
 
 def _download_cover_one_unlocked(item):
-        key = str(item["key"])
-        url = _normalize_cover_url(item.get("cover_url"))
-        if not re.fullmatch(r"\d+", key) or not Handler._is_allowed(url):
-            return key, "failed"
-        COVERS_DIR.mkdir(parents=True, exist_ok=True)
-        target = COVERS_DIR / f"{key}.jpg"
-        if target.exists() and target.stat().st_size > 0:
-            return key, "skipped"
-        # MC CDN 在部分 Python/OpenSSL 环境会出现 SSL EOF；回退到已部署的静态封面，
-        # 仍然保存到本地 covers，不使用浏览器反代。
-        sources = [url, f"{STATIC_FALLBACK_BASE}/covers/{key}.jpg"]
-        for source in sources:
-            temp = COVERS_DIR / f".{key}.{uuid.uuid4().hex}.tmp"
-            try:
-                req = urllib.request.Request(source, headers={"User-Agent": USER_AGENT, "Referer": REFERER})
-                with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                    content_type = resp.headers.get("Content-Type", "")
-                    data = resp.read()
-                if len(data) < 100 or (content_type and not content_type.startswith("image/")):
-                    raise ValueError("not an image")
-                temp.write_bytes(data)
-                temp.replace(target)
-                return key, "downloaded"
-            except Exception:
-                try:
-                    temp.unlink(missing_ok=True)
-                except OSError:
-                    pass
+    key = str(item["key"])
+    url = _normalize_cover_url(item.get("cover_url"))
+    if not re.fullmatch(r"\d+", key) or not Handler._is_allowed(url):
         return key, "failed"
+    COVERS_DIR.mkdir(parents=True, exist_ok=True)
+    target = COVERS_DIR / f"{key}.jpg"
+    if target.exists() and target.stat().st_size > 0:
+        return key, "skipped"
+    sources = [url]
+    if STATIC_FALLBACK_BASE:
+        sources.append(f"{STATIC_FALLBACK_BASE}/covers/{key}.jpg")
+    for source in sources:
+        temp = COVERS_DIR / f".{key}.{uuid.uuid4().hex}.tmp"
+        try:
+            req = urllib.request.Request(source, headers={"User-Agent": USER_AGENT, "Referer": REFERER})
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                data = resp.read()
+            if len(data) < 100 or (content_type and not content_type.startswith("image/")):
+                raise ValueError("not an image")
+            temp.write_bytes(data)
+            temp.replace(target)
+            return key, "downloaded"
+        except Exception:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return key, "failed"
 
 def _existing_cover_keys():
     keys = []
@@ -408,9 +408,11 @@ class Handler(SimpleHTTPRequestHandler):
             if target and target.exists() and target.stat().st_size > 0:
                 data = target.read_bytes()
             else:
+                # CI 已经把大多数封面部署为静态文件；优先取静态回源，
+                # 避免本机 Python/OpenSSL 先在 MC CDN TLS 上等待超时。
                 sources = [url]
-                if key:
-                    sources.append(f"{STATIC_FALLBACK_BASE}/covers/{key}.jpg")
+                if key and STATIC_FALLBACK_BASE:
+                    sources.insert(0, f"{STATIC_FALLBACK_BASE}/covers/{key}.jpg")
                 for source in sources:
                     try:
                         req = urllib.request.Request(source, headers={"User-Agent": USER_AGENT, "Referer": REFERER})

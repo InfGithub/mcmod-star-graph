@@ -196,15 +196,15 @@ async function loadExistingLocalCovers(source) {
   }
 }
 
-function buildLocalCoverMap(data, source) {
+function buildLocalCoverMap(data, source, existingKeys = new Set()) {
   const map = new Map();
   for (const node of data.nodes || []) {
     if (node.type !== "core" || !node.cover_url) continue;
     const key = String(node.key);
     const url = normalizeCoverUrl(node.cover_url);
     const proxy = `${source.base}/cover_proxy?key=${encodeURIComponent(key)}&url=${encodeURIComponent(url)}`;
-    // 本地模式统一走 proxy；proxy 内部决定返回 covers/<key>.jpg 还是下载上游。
-    map.set(key, { thumb: proxy, orig: proxy });
+    // 本地模式统一走 proxy；已有文件仍走 proxy，但不占用联网限速队列。
+    map.set(key, { thumb: proxy, orig: proxy, local: existingKeys.has(key) });
   }
   return map;
 }
@@ -316,11 +316,11 @@ function waitForImageSource(source) {
   });
 }
 
-async function loadCoverImageSource(source) {
+async function loadCoverImageSource(source, localCover = false) {
   const url = new URL(source, document.baseURI).href;
   const isLocalProxy = new URL(url).pathname === "/cover_proxy";
-  if (isLocalProxy) {
-    // 本地反代逐个请求并留出间隔；线上静态图片不经过这个限速队列。
+  if (isLocalProxy && !localCover) {
+    // 只有缺失本地文件、确实可能访问上游时才进入联网限速队列。
     await runCoverNetworkTask(() => waitForImageSource(url));
     return url;
   }
@@ -328,10 +328,10 @@ async function loadCoverImageSource(source) {
   return url;
 }
 
-async function loadCoverObjectUrlWithRetry(source) {
+async function loadCoverObjectUrlWithRetry(source, localCover = false) {
   for (let attempt = 0; attempt <= COVER_LOAD_RETRIES; attempt++) {
     try {
-      return await loadCoverImageSource(source);
+      return await loadCoverImageSource(source, localCover);
     } catch (error) {
       if (attempt >= COVER_LOAD_RETRIES) throw error;
       await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
@@ -379,6 +379,7 @@ function buildGraph(data, coverMap) {
       image: null,
       thumb: cover ? cover.thumb : null,
       imageSrc: cover ? cover.orig : null, // 原图（导出大图用）
+      localCover: !!(cover && cover.local),
       views: n.views,
       favorites: n.favorites,
       category: n.category,
@@ -724,7 +725,7 @@ function main() {
       }
       if (!coverMap) {
         const existingLocal = await loadExistingLocalCovers(localServer);
-        coverMap = buildLocalCoverMap(data, localServer);
+        coverMap = buildLocalCoverMap(data, localServer, new Set(existingLocal.keys));
         localDownloadContext = { data, source: localServer, existingCount: existingLocal.count };
       }
     } else {
@@ -876,7 +877,7 @@ function main() {
         if (state.status !== "queued") continue;
         state.status = "loading";
         activeCoverLoads += 1;
-        loadCoverObjectUrlWithRetry(item.src)
+        loadCoverObjectUrlWithRetry(item.src, item.local)
           .then((imageSource) => {
             if (!imageSource) throw new Error("empty image");
             state.status = "ready";
@@ -919,7 +920,7 @@ function main() {
         state.priority = (insideViewport ? 0 : 1e9) + centerDistance;
         if (state.status === "idle") {
           state.status = "queued";
-          coverQueue.push({ key, src: attrs.thumb });
+          coverQueue.push({ key, src: attrs.thumb, local: !!attrs.localCover });
         }
       });
 
