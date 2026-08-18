@@ -34,9 +34,8 @@ python server.py [--data 文件] [端口] [host] [clean]
 
 修改 `server.py` 顶部的 `COVER_SIZE`，然后用 `python server.py clean` 启动一次以清缓存重下。
 
-## 开发
+## 声明
 
-```bash
-npm install
-npm run build    # esbuild → main.bundle.js
-```
+- 本项目的图数据来源于 MC 百科（mcmod.cn）公开页面，抓取日期见各 Release 说明。
+- 模组信息与封面图片的版权归原作者及 MC 百科所有。
+- 本项目仅用于学习研究，请勿用于商业用途。
