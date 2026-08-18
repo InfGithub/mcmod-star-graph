@@ -1,5 +1,9 @@
 # mcmod-star-graph
 
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue)
+![JavaScript ES2020](https://img.shields.io/badge/JavaScript-ES2020-yellow)
+
 数据来源：MC 百科（mcmod.cn），仅用于学习研究。
 
 ## 快速开始
@@ -36,7 +40,3 @@ python server.py [--data 文件] [端口] [host] [clean]
 npm install
 npm run build    # esbuild → main.bundle.js
 ```
-
-## 协议
-
-[MIT](LICENSE)
