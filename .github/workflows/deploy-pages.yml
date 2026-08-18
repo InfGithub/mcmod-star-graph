@@ -86,6 +86,13 @@ jobs:
           COVER_RETRIES: 2
         run: node scripts/prepare-covers.mjs
 
+      # 展示缩略图（96px）：WebGL 纹理内存约缩小 16 倍，配合前端视口懒加载；
+      # 原图保留供导出。缩略图在 covers/ 内，随封面缓存一并持久化。
+      - name: Pre-generate cover thumbnails
+        env:
+          THUMB_CONCURRENCY: 8
+        run: node scripts/prepare-thumbs.mjs
+
       # Save before Pages 配置步骤，配置错误也不会丢失封面缓存
       - name: Save static cover cache
         if: steps.cover-cache.outputs.cache-hit != 'true'

@@ -8072,6 +8072,7 @@ var HIGHLIGHT_NODE_COLOR = "#ffd700";
 var HIGHLIGHT_EDGE_RGB = [255, 215, 0];
 var HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1);
 var COVER_MANIFEST_URL = "covers/manifest.json";
+var COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
 function communityColor(community, type) {
   if (type === "external") return EXTERNAL_COLOR;
   if (community < 0) return ISOLATED_COLOR;
@@ -8111,30 +8112,45 @@ async function loadGraph() {
   return res.json();
 }
 async function loadCoverManifest() {
+  const map = /* @__PURE__ */ new Map();
+  let data = null;
   try {
-    const res = await fetch(COVER_MANIFEST_URL);
-    if (!res.ok) return /* @__PURE__ */ new Set();
-    const data = await res.json();
-    const keys = Array.isArray(data) ? data : data.keys;
-    return new Set(Array.isArray(keys) ? keys.map(String) : []);
+    const res = await fetch(COVER_SMALL_MANIFEST_URL);
+    if (res.ok) data = await res.json();
   } catch (e) {
-    console.warn("[\u8B66\u544A] \u672A\u627E\u5230\u9759\u6001\u5C01\u9762\u6E05\u5355\uFF0C\u4F7F\u7528\u7EAF\u8272\u8282\u70B9", e);
-    return /* @__PURE__ */ new Set();
   }
+  if (!data) {
+    try {
+      const res = await fetch(COVER_MANIFEST_URL);
+      if (res.ok) data = await res.json();
+    } catch (e) {
+      console.warn("[\u8B66\u544A] \u672A\u627E\u5230\u5C01\u9762\u6E05\u5355\uFF0C\u4F7F\u7528\u7EAF\u8272\u8282\u70B9", e);
+      return map;
+    }
+  }
+  const keys = Array.isArray(data) ? data : data.keys;
+  const items = data && typeof data.items === "object" ? data.items : {};
+  for (const key of Array.isArray(keys) ? keys : []) {
+    const k = String(key);
+    const it = items[k] || {};
+    map.set(k, {
+      thumb: String(it.path || `covers/small/${k}.png`).replace(/^\/+/, ""),
+      orig: String(it.orig || `covers/${k}.jpg`).replace(/^\/+/, "")
+    });
+  }
+  return map;
 }
-function staticCoverPath(node, coverKeys) {
-  if (!coverKeys.has(String(node.key))) return null;
-  const path = node.cover || "covers/" + node.key + ".jpg";
-  return String(path).replace(/^\/+/, "");
+function coverPaths(node, coverMap) {
+  return coverMap.get(String(node.key)) || null;
 }
-function buildGraph(data, coverKeys) {
+function buildGraph(data, coverMap) {
   const graph = new import_graphology.default({ multi: true });
   const labelIndex = /* @__PURE__ */ new Map();
   const degMap = /* @__PURE__ */ new Map();
   for (const n of data.nodes) {
     degMap.set(n.key, n.in_degree);
     const isCore = n.type === "core";
-    const coverUrl = isCore ? staticCoverPath(n, coverKeys) : null;
+    const cover = isCore ? coverPaths(n, coverMap) : null;
     graph.addNode(n.key, {
       x: typeof n.x === "number" ? n.x : Math.random() * 100,
       y: typeof n.y === "number" ? n.y : Math.random() * 100,
@@ -8145,8 +8161,13 @@ function buildGraph(data, coverKeys) {
       name_en: n.name_en,
       description: n.description,
       kind: n.type,
-      type: coverUrl ? "image" : "circle",
-      image: coverUrl,
+      // 懒加载：初始一律画圆，进入视口后才由 coverVisibility 置为 image
+      type: "circle",
+      image: null,
+      thumb: cover ? cover.thumb : null,
+      // 展示用缩略图（96px，纹理内存小）
+      imageSrc: cover ? cover.orig : null,
+      // 原图（导出大图用）
       views: n.views,
       favorites: n.favorites,
       category: n.category,
@@ -8343,10 +8364,10 @@ function main() {
     const data = await loadGraph();
     setProgress(10, "\u52A0\u8F7D\u9759\u6001\u5C01\u9762\u6E05\u5355\u2026\u2026", "covers/manifest.json");
     await new Promise((r) => setTimeout(r, 30));
-    const coverKeys = await loadCoverManifest();
-    setProgress(20, coverKeys.size ? "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026" : "\u672A\u627E\u5230\u5C01\u9762\uFF0C\u4F7F\u7528\u7EAF\u8272\u8282\u70B9\u2026\u2026", coverKeys.size + " \u5F20\u5C01\u9762\u5DF2\u5C31\u7EEA");
+    const coverMap = await loadCoverManifest();
+    setProgress(20, coverMap.size ? "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026" : "\u672A\u627E\u5230\u5C01\u9762\uFF0C\u4F7F\u7528\u7EAF\u8272\u8282\u70B9\u2026\u2026", coverMap.size + " \u5F20\u5C01\u9762\u5DF2\u5C31\u7EEA");
     await new Promise((r) => setTimeout(r, 30));
-    const built = buildGraph(data, coverKeys);
+    const built = buildGraph(data, coverMap);
     graph = built.graph;
     searchIndex = buildSearch(data);
     allNodes = [...data.nodes].sort((a, b) => (b.views || 0) - (a.views || 0));
@@ -8377,6 +8398,7 @@ function main() {
         image: FadingNodeImageProgram
       }
     });
+    window.__sigma = renderer;
     bindEvents();
     container.addEventListener("contextmenu", (e) => {
       e.preventDefault();
@@ -8419,6 +8441,51 @@ function main() {
       return attr;
     });
     const cam = renderer.getCamera();
+    let coverVisibleKeys = /* @__PURE__ */ new Set();
+    let coverDirty = false;
+    const COVER_MARGIN = 240;
+    const COVER_MIN_SCREEN_RADIUS = 6;
+    function computeCoverVisibility() {
+      const st = cam.getState();
+      if (!st) return;
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      const next = /* @__PURE__ */ new Set();
+      graph.forEachNode((key, attrs) => {
+        if (!attrs.thumb) return;
+        if (attrs.size * st.ratio < COVER_MIN_SCREEN_RADIUS) return;
+        const p = renderer.graphToViewport({ x: attrs.x, y: attrs.y });
+        if (p.x >= -COVER_MARGIN && p.x <= w + COVER_MARGIN && p.y >= -COVER_MARGIN && p.y <= h + COVER_MARGIN) {
+          next.add(key);
+        }
+      });
+      let changed = next.size !== coverVisibleKeys.size;
+      if (!changed) {
+        for (const k of next) {
+          if (!coverVisibleKeys.has(k)) {
+            changed = true;
+            break;
+          }
+        }
+      }
+      if (changed) {
+        coverVisibleKeys = next;
+        coverDirty = true;
+      }
+    }
+    function applyCoverVisibility() {
+      if (!coverDirty || !graph) return;
+      coverDirty = false;
+      graph.updateEachNodeAttributes(
+        (key, attrs) => {
+          if (!attrs.thumb) return attrs;
+          const on = coverVisibleKeys.has(key);
+          return { ...attrs, image: on ? attrs.thumb : null, type: on ? "image" : "circle" };
+        },
+        { attributes: ["image", "type"] }
+      );
+      renderer.refresh();
+    }
     let lodLastRun = 0;
     cam.on("updated", () => {
       const now = performance.now();
@@ -8429,6 +8496,8 @@ function main() {
         nodeVisibleCount = computeVisibleNodeCount(state.ratio, nodeLodStrength);
         updateCulling(state);
         startFade();
+        computeCoverVisibility();
+        applyCoverVisibility();
       };
       if (lodTimer) clearTimeout(lodTimer);
       const elapsed = now - lodLastRun;
@@ -8441,6 +8510,8 @@ function main() {
     lodThresholdValue = computeLodThreshold(cam.getState().ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
     nodeVisibleCount = computeVisibleNodeCount(cam.getState().ratio, nodeLodStrength);
     updateCulling(cam.getState());
+    computeCoverVisibility();
+    applyCoverVisibility();
     renderer.refresh();
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     await new Promise((r) => setTimeout(r, 700));
@@ -9159,9 +9230,10 @@ function main() {
         const attrs = item.attrs;
         const cx = item.cx, cy = item.cy, r = item.r;
         let img = null;
-        if (attrs.image) {
+        const src = attrs.imageSrc || attrs.image;
+        if (src) {
           img = new Image();
-          img.src = attrs.image;
+          img.src = src;
           await new Promise((resolve) => {
             img.onload = resolve;
             img.onerror = resolve;
