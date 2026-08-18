@@ -1,42 +1,62 @@
 # mcmod-star-graph
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue)
+![GitHub Pages](https://img.shields.io/badge/deploy-GitHub%20Pages-222?logo=github)
 ![JavaScript ES2020](https://img.shields.io/badge/JavaScript-ES2020-yellow)
 
-数据来源：MC 百科（mcmod.cn），仅用于学习研究。
+NeoForge 1.21.1 模组生态关系图。数据来自 MC 百科（mcmod.cn），仅用于学习研究。
 
-## 快速开始
+## 在线静态站点
 
-1. 从 [Releases](https://github.com/InfGithub/mcmod-star-graph/releases) 下载最新数据包 `graph-YYYYMMDD.json`，放入项目根目录
-2. 启动本地服务器：
-   ```bash
-   python server.py --data graph-YYYYMMDD.json
-   ```
-3. 浏览器打开 <http://127.0.0.1:1119/>
+本项目已改造成**无后端 GitHub Pages 站点**：
 
-首次打开需下载模组封面：点击"确定下载"，封面将缓存到浏览器 IndexedDB，下次无需重复下载。
+- 图数据直接读取仓库中的 `graph.json`
+- 封面由 GitHub Actions 在部署前预生成到 `covers/`
+- 页面只请求 GitHub Pages 同源静态资源，不依赖 `/cover_proxy`、Python 服务或运行时跨域下载
+- 某个封面下载失败时，该节点自动回退为彩色圆点，图谱仍可正常使用
 
-## 用法
+部署地址：<https://huntersxy.github.io/mcmod-star-graph/>
 
-### 服务器参数
+## GitHub Pages 部署
+
+推送到 `main` 分支会触发 `.github/workflows/deploy-pages.yml`：
+
+1. 安装 Node.js 依赖并构建 `main.bundle.js`
+2. 从 `graph.json` 读取封面 URL，下载静态封面到 `covers/`
+3. 生成 `covers/manifest.json`
+4. 使用 GitHub Pages artifact 部署整个静态站点
+
+也可以在 Actions 页面手动运行工作流，通过 `cover_limit` 控制封面数量；`0` 表示下载全部封面。封面下载失败不会使部署失败，便于在源站限流时仍发布可用的图谱。
+
+> 首次启用时，请在仓库 Settings → Pages → Build and deployment 中将 Source 设为 **GitHub Actions**。
+
+## 本地预览
 
 ```bash
-python server.py [--data 文件] [端口] [host] [clean]
+npm ci
+npm run build
+npm run prepare:covers       # 可选；下载全部封面
+python -m http.server 1119   # GitHub Pages 同样的静态服务方式
 ```
 
-- **默认**：`python server.py`，服务根目录的 `graph.json`
-- **`--data 文件`**：把指定数据文件映射为 `/graph.json` 加载，下载的 release 资产免改名
-- **端口 / host**：`python server.py 8080 0.0.0.0`
-- **`clean`**：清空浏览器封面缓存
+然后打开 <http://127.0.0.1:1119/>。如果只想快速预览图谱而不下载封面，直接创建一个空的 `covers/manifest.json` 即可，节点会使用纯色回退样式。
 
-### 封面尺寸
+可用环境变量限制本地预生成规模：
 
-修改 `server.py` 顶部的 `COVER_SIZE`，然后用 `python server.py clean` 启动一次以清缓存重下。
+```bash
+$env:COVER_LIMIT=200
+npm run prepare:covers
+```
 
 ## 开发
 
 ```bash
-npm install
-npm run build    # esbuild → main.bundle.js
+npm ci
+npm run build
 ```
+
+`server.py` 保留为旧版本地封面代理/数据映射工具，不再是 GitHub Pages 部署的一部分。
+
+## 数据
+
+`graph.json` 是静态发布数据包，包含节点坐标、关系、统计信息和原始封面 URL。更新数据后重新运行 GitHub Actions 即可发布新版本。

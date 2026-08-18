@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "esbuild main.js --bundle --format=esm --outfile=main.bundle.js --sourcemap"
+    "build": "esbuild main.js --bundle --format=esm --outfile=main.bundle.js --sourcemap",
+    "prepare:covers": "node scripts/prepare-covers.mjs"
   },
   "dependencies": {
     "@sigma/node-image": "^3.0.0",
