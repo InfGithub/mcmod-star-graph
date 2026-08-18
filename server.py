@@ -43,6 +43,8 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 1119
+DEFAULT_MODE = "enhanced"
+VALID_MODES = {"enhanced", "upstream"}
 PROXY_PATH = "/cover_proxy"
 CLEAN_PATH = "/clean"
 HEALTH_PATH = "/health"
@@ -66,6 +68,7 @@ _CLEAN_CACHE = False
 _DATA_FILE = None
 _DOWNLOAD_JOBS = {}
 _DOWNLOAD_LOCK = threading.Lock()
+_SERVER_MODE = DEFAULT_MODE
 _COVER_LOCKS = {}
 _COVER_LOCKS_GUARD = threading.Lock()
 USER_AGENT = (
@@ -289,6 +292,9 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_download_start(self):
+        if _SERVER_MODE != "enhanced":
+            self._send_json(404, {"error": "cover download disabled in upstream mode"})
+            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or length > 20 * 1024 * 1024:
@@ -329,6 +335,9 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(400, {"error": str(error)})
 
     def _handle_existing_covers(self):
+        if _SERVER_MODE != "enhanced":
+            self._send_json(404, {"error": "local cover storage disabled in upstream mode"})
+            return
         keys = _existing_cover_keys()
         # 启动下载前先把已有文件同步到清单，避免 manifest 落后于 covers 目录。
         _write_cover_manifest([{"key": key} for key in keys])
@@ -352,7 +361,7 @@ class Handler(SimpleHTTPRequestHandler):
         self._send_json(200, job)
 
     def _handle_health(self):
-        body = json.dumps({"ok": True, "service": "star-graph-server"}).encode("utf-8")
+        body = json.dumps({"ok": True, "service": "star-graph-server", "mode": _SERVER_MODE}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -401,7 +410,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(403, "host not allowed")
             return
         url = _normalize_cover_url(url)
-        target = COVERS_DIR / f"{key}.jpg" if key else None
+        persist = _SERVER_MODE == "enhanced" and bool(key)
+        target = COVERS_DIR / f"{key}.jpg" if persist else None
         content_type = "image/jpeg"
         data = None
         with _cover_lock(key) if key else _NullLock():
@@ -463,6 +473,7 @@ def main():
     host = DEFAULT_HOST
     clean_mode = False
     data_file = None
+    mode = DEFAULT_MODE
     i = 0
     while i < len(args):
         arg = args[i]
@@ -473,18 +484,34 @@ def main():
             if i >= len(args):
                 raise SystemExit("[ERROR] --data 需要一个文件路径")
             data_file = args[i]
+        elif arg == "--mode":
+            i += 1
+            if i >= len(args) or args[i] not in VALID_MODES:
+                raise SystemExit("[ERROR] --mode 必须是 enhanced 或 upstream")
+            mode = args[i]
+        elif arg.startswith("--mode="):
+            mode = arg.split("=", 1)[1]
+            if mode not in VALID_MODES:
+                raise SystemExit("[ERROR] --mode 必须是 enhanced 或 upstream")
+        elif arg == "--upstream":
+            mode = "upstream"
         elif arg.isdigit():
             port = int(arg)
         else:
             host = arg
         i += 1
-    if data_file and not os.path.exists(data_file):
-        raise SystemExit(f"[ERROR] 数据文件不存在: {data_file}")
-    global _CLEAN_CACHE, _DATA_FILE
+    if data_file:
+        data_file = os.path.abspath(data_file)
+        if not os.path.exists(data_file):
+            raise SystemExit(f"[ERROR] 数据文件不存在: {data_file}")
+    os.chdir(ROOT_DIR)
+    global _CLEAN_CACHE, _DATA_FILE, _SERVER_MODE
     _CLEAN_CACHE = clean_mode
     _DATA_FILE = data_file
+    _SERVER_MODE = mode
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"[START] star_graph server running at http://{host}:{port}/")
+    print(f"[INFO] server mode: {mode}")
     print(f"[INFO] cover proxy endpoint: http://{host}:{port}{PROXY_PATH}?url=...")
     if data_file:
         print(f"[INFO] serving data file as /{DATA_ALIAS}: {data_file}")

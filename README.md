@@ -22,13 +22,15 @@
 ### 服务器参数
 
 ```bash
-python server.py [--data 文件] [端口] [host] [clean]
+python server.py [--data 文件] [--mode enhanced|upstream] [端口] [host] [clean]
 ```
 
 - **默认**：`python server.py`，服务根目录的 `graph.json`
 - **`--data 文件`**：把指定数据文件映射为 `/graph.json` 加载，下载的 release 资产免改名
 - **端口 / host**：`python server.py 8080 0.0.0.0`
-- **`clean`**：清空浏览器封面缓存
+- **`--mode enhanced`**：增强模式（默认），支持本地 covers 保存、焦点反代懒加载和后台批量保存
+- **`--mode upstream`**：上游兼容模式，只提供静态文件与 `/cover_proxy` 反代，不保存本地封面
+- **`clean`**：清理兼容缓存标记
 
 ### 封面尺寸
 

@@ -230,7 +230,7 @@ async function detectLocalServer() {
         const body = await res.json().catch(() => ({}));
         if (body.service === "star-graph-server" || body.ok === true) {
           clearTimeout(timer);
-          return { base };
+          return { base, mode: body.mode === "upstream" ? "upstream" : "enhanced" };
         }
       }
     } catch {
@@ -724,9 +724,14 @@ function main() {
         coverMap = await loadCoverManifest();
       }
       if (!coverMap) {
-        const existingLocal = await loadExistingLocalCovers(localServer);
-        coverMap = buildLocalCoverMap(data, localServer, new Set(existingLocal.keys));
-        localDownloadContext = { data, source: localServer, existingCount: existingLocal.count };
+        if (localServer.mode === "upstream") {
+          // 上游模式：纯反代，不读取/写入本地 covers，也不启动批量下载。
+          coverMap = buildLocalCoverMap(data, localServer);
+        } else {
+          const existingLocal = await loadExistingLocalCovers(localServer);
+          coverMap = buildLocalCoverMap(data, localServer, new Set(existingLocal.keys));
+          localDownloadContext = { data, source: localServer, existingCount: existingLocal.count };
+        }
       }
     } else {
       showToast("未连接本地 server.py，使用在线静态数据。", "warning");

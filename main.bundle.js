@@ -8169,7 +8169,7 @@ async function detectLocalServer() {
         const body = await res.json().catch(() => ({}));
         if (body.service === "star-graph-server" || body.ok === true) {
           clearTimeout(timer);
-          return { base };
+          return { base, mode: body.mode === "upstream" ? "upstream" : "enhanced" };
         }
       }
     } catch {
@@ -8616,9 +8616,13 @@ function main() {
         coverMap = await loadCoverManifest();
       }
       if (!coverMap) {
-        const existingLocal = await loadExistingLocalCovers(localServer);
-        coverMap = buildLocalCoverMap(data, localServer, new Set(existingLocal.keys));
-        localDownloadContext = { data, source: localServer, existingCount: existingLocal.count };
+        if (localServer.mode === "upstream") {
+          coverMap = buildLocalCoverMap(data, localServer);
+        } else {
+          const existingLocal = await loadExistingLocalCovers(localServer);
+          coverMap = buildLocalCoverMap(data, localServer, new Set(existingLocal.keys));
+          localDownloadContext = { data, source: localServer, existingCount: existingLocal.count };
+        }
       }
     } else {
       showToast("\u672A\u8FDE\u63A5\u672C\u5730 server.py\uFF0C\u4F7F\u7528\u5728\u7EBF\u9759\u6001\u6570\u636E\u3002", "warning");
