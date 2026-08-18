@@ -1,6 +1,6 @@
 // scripts/prepare-thumbs.mjs
-// 从 covers/ 的原图生成 96x96 展示缩略图到 covers/small/，供前端图上渲染
-// 使用（相较原图可显著降低 WebGL 纹理内存；所有节点启动时统一加载）。
+// 从 covers/ 的原图生成 96x96 展示缩略图到 covers/small/，供前端渐进式视口加载
+// 使用（相较原图可显著降低 WebGL 纹理内存；已加载节点会在页面内持续复用）。
 // 原图 covers/*.jpg 保留不动（导出大图用）。
 // 输出 covers/small-manifest.json：{ keys, items: { key: { path, orig, bytes } } }
 //

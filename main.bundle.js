@@ -8073,6 +8073,9 @@ var HIGHLIGHT_EDGE_RGB = [255, 215, 0];
 var HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1);
 var COVER_MANIFEST_URL = "covers/manifest.json";
 var COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
+var COVER_CACHE_NAME = "star-graph-covers-v1";
+var COVER_LOAD_CONCURRENCY = 8;
+var COVER_LOAD_RETRIES = 2;
 function communityColor(community, type) {
   if (type === "external") return EXTERNAL_COLOR;
   if (community < 0) return ISOLATED_COLOR;
@@ -8143,6 +8146,59 @@ async function loadCoverManifest() {
 function coverPaths(node, coverMap) {
   return coverMap.get(String(node.key)) || null;
 }
+var coverCachePromise = null;
+function getCoverCache() {
+  if (!("caches" in window)) return Promise.resolve(null);
+  if (!coverCachePromise) {
+    coverCachePromise = caches.open(COVER_CACHE_NAME).catch(() => null);
+  }
+  return coverCachePromise;
+}
+function decodeCoverBlob(blob) {
+  return new Promise((resolve) => {
+    const objectUrl = URL.createObjectURL(blob);
+    const image = new Image();
+    image.onload = () => resolve(objectUrl);
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      resolve(null);
+    };
+    image.src = objectUrl;
+  });
+}
+async function loadCoverObjectUrl(source) {
+  const url = new URL(source, document.baseURI).href;
+  const cache = await getCoverCache();
+  if (cache) {
+    const cached = await cache.match(url).catch(() => null);
+    if (cached && cached.ok) {
+      const objectUrl2 = await decodeCoverBlob(await cached.blob());
+      if (objectUrl2) return objectUrl2;
+      await cache.delete(url).catch(() => {
+      });
+    }
+  }
+  const response = await fetch(url, { cache: "force-cache" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const copy = response.clone();
+  const blob = await response.blob();
+  if (cache) await cache.put(url, copy).catch(() => {
+  });
+  const objectUrl = await decodeCoverBlob(blob);
+  if (!objectUrl) throw new Error("invalid image");
+  return objectUrl;
+}
+async function loadCoverObjectUrlWithRetry(source) {
+  for (let attempt = 0; attempt <= COVER_LOAD_RETRIES; attempt++) {
+    try {
+      return await loadCoverObjectUrl(source);
+    } catch (error) {
+      if (attempt >= COVER_LOAD_RETRIES) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  return null;
+}
 function buildGraph(data, coverMap) {
   const graph = new import_graphology.default({ multi: true });
   const labelIndex = /* @__PURE__ */ new Map();
@@ -8161,9 +8217,10 @@ function buildGraph(data, coverMap) {
       name_en: n.name_en,
       description: n.description,
       kind: n.type,
-      // 所有有封面的节点直接使用 image；不再做视口懒加载。
-      type: cover ? "image" : "circle",
-      image: cover ? cover.thumb : null,
+      // 初始只保留封面 URL；节点进入视口并由调度器加载成功后才切换 image。
+      // 已加载节点不会被切回 circle，因此离开/重新进入视口不会重复请求。
+      type: "circle",
+      image: null,
       thumb: cover ? cover.thumb : null,
       imageSrc: cover ? cover.orig : null,
       // 原图（导出大图用）
@@ -8440,6 +8497,79 @@ function main() {
       return attr;
     });
     const cam = renderer.getCamera();
+    const coverStates = /* @__PURE__ */ new Map();
+    const coverQueue = [];
+    let activeCoverLoads = 0;
+    let coverScheduleTimer = null;
+    function coverState(key) {
+      let state = coverStates.get(key);
+      if (!state) {
+        state = { status: "idle", priority: Infinity, objectUrl: null };
+        coverStates.set(key, state);
+      }
+      return state;
+    }
+    function pumpCoverLoads() {
+      coverQueue.sort((a, b) => coverState(a.key).priority - coverState(b.key).priority);
+      while (activeCoverLoads < COVER_LOAD_CONCURRENCY && coverQueue.length) {
+        const item = coverQueue.shift();
+        const state = coverState(item.key);
+        if (state.status !== "queued") continue;
+        state.status = "loading";
+        activeCoverLoads += 1;
+        loadCoverObjectUrlWithRetry(item.src).then((objectUrl) => {
+          if (!objectUrl) throw new Error("empty image");
+          state.status = "ready";
+          state.objectUrl = objectUrl;
+          graph.updateNodeAttributes(item.key, (attrs) => ({
+            ...attrs,
+            image: objectUrl,
+            type: "image"
+          }), { attributes: ["image", "type"] });
+          renderer.refresh();
+        }).catch(() => {
+          state.status = "failed";
+        }).finally(() => {
+          activeCoverLoads -= 1;
+          pumpCoverLoads();
+        });
+      }
+    }
+    function scheduleCoverLoads() {
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      const margin = 320;
+      const visible = /* @__PURE__ */ new Set();
+      graph.forEachNode((key, attrs) => {
+        if (!attrs.thumb || attrs.type === "image") return;
+        const state = coverState(key);
+        if (state.status === "ready" || state.status === "failed" || state.status === "loading") return;
+        const point = renderer.graphToViewport({ x: attrs.x, y: attrs.y });
+        const inside = point.x >= -margin && point.x <= w + margin && point.y >= -margin && point.y <= h + margin;
+        if (!inside) return;
+        visible.add(key);
+        const dx = point.x < 0 ? -point.x : point.x > w ? point.x - w : 0;
+        const dy = point.y < 0 ? -point.y : point.y > h ? point.y - h : 0;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        const screenSize = renderer.scaleSize(attrs.size);
+        state.priority = (point.x >= 0 && point.x <= w && point.y >= 0 && point.y <= h ? 0 : 1) * 1e9 + distance * 100 - screenSize;
+        if (state.status === "idle") {
+          state.status = "queued";
+          coverQueue.push({ key, src: attrs.thumb });
+        }
+      });
+      for (const [key, state] of coverStates) {
+        if (state.status === "queued" && !visible.has(key)) state.status = "idle";
+      }
+      pumpCoverLoads();
+    }
+    function scheduleCoverLoadsSoon() {
+      if (coverScheduleTimer) return;
+      coverScheduleTimer = requestAnimationFrame(() => {
+        coverScheduleTimer = null;
+        scheduleCoverLoads();
+      });
+    }
     let lodLastRun = 0;
     cam.on("updated", () => {
       const now = performance.now();
@@ -8450,6 +8580,7 @@ function main() {
         nodeVisibleCount = computeVisibleNodeCount(state.ratio, nodeLodStrength);
         updateCulling(state);
         startFade();
+        scheduleCoverLoadsSoon();
       };
       if (lodTimer) clearTimeout(lodTimer);
       const elapsed = now - lodLastRun;
@@ -8462,6 +8593,7 @@ function main() {
     lodThresholdValue = computeLodThreshold(cam.getState().ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
     nodeVisibleCount = computeVisibleNodeCount(cam.getState().ratio, nodeLodStrength);
     updateCulling(cam.getState());
+    scheduleCoverLoads();
     renderer.refresh();
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     await new Promise((r) => setTimeout(r, 700));
