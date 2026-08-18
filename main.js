@@ -237,10 +237,10 @@ async function loadCoverManifest(base = "") {
       const res = await fetch(normalUrl, { cache: "no-store" });
       if (res.ok) data = await res.json();
     } catch (e) {
-      console.warn("[警告] 未找到封面清单，使用纯色节点", e);
-      return map;
+      // 清单不存在时由调用方决定是否继续下载或使用纯色节点。
     }
   }
+  if (!data) return map;
   const keys = Array.isArray(data) ? data : data.keys;
   const items = data && typeof data.items === "object" ? data.items : {};
   for (const key of Array.isArray(keys) ? keys : []) {

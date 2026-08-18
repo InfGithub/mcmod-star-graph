@@ -8166,10 +8166,9 @@ async function loadCoverManifest(base = "") {
       const res = await fetch(normalUrl, { cache: "no-store" });
       if (res.ok) data = await res.json();
     } catch (e) {
-      console.warn("[\u8B66\u544A] \u672A\u627E\u5230\u5C01\u9762\u6E05\u5355\uFF0C\u4F7F\u7528\u7EAF\u8272\u8282\u70B9", e);
-      return map;
     }
   }
+  if (!data) return map;
   const keys = Array.isArray(data) ? data : data.keys;
   const items = data && typeof data.items === "object" ? data.items : {};
   for (const key of Array.isArray(keys) ? keys : []) {
