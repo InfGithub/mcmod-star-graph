@@ -86,6 +86,18 @@ jobs:
           COVER_RETRIES: 2
         run: node scripts/prepare-covers.mjs
 
+      # 缩略图转换器：runner 镜像不保证预装 ImageMagick，探测缺失时安装
+      - name: Install ImageMagick if missing
+        run: |
+          if ! command -v magick >/dev/null 2>&1 && ! command -v convert >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends imagemagick
+          fi
+          if ! command -v magick >/dev/null 2>&1 && ! command -v convert >/dev/null 2>&1; then
+            echo "::error::ImageMagick 安装失败"
+            exit 1
+          fi
+
       # 展示缩略图（96px）：WebGL 纹理内存约缩小 16 倍，配合前端视口懒加载；
       # 原图保留供导出。缩略图在 covers/ 内，随封面缓存一并持久化。
       - name: Pre-generate cover thumbnails
