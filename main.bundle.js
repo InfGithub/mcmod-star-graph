@@ -2584,8 +2584,8 @@ var Program = /* @__PURE__ */ (function() {
       var program = loadProgram(gl, [vertexShader, fragmentShader]);
       var uniformLocations = {};
       def.UNIFORMS.forEach(function(uniformName) {
-        var location = gl.getUniformLocation(program, uniformName);
-        if (location) uniformLocations[uniformName] = location;
+        var location2 = gl.getUniformLocation(program, uniformName);
+        if (location2) uniformLocations[uniformName] = location2;
       });
       var attributeLocations = {};
       def.ATTRIBUTES.forEach(function(attr) {
@@ -2664,18 +2664,18 @@ var Program = /* @__PURE__ */ (function() {
     value: function bindAttribute(attr, program, offset, setDivisor) {
       var sizeFactor = SIZE_FACTOR_PER_ATTRIBUTE_TYPE[attr.type];
       if (typeof sizeFactor !== "number") throw new Error('Program.bind: yet unsupported attribute type "'.concat(attr.type, '"'));
-      var location = program.attributeLocations[attr.name];
+      var location2 = program.attributeLocations[attr.name];
       var gl = program.gl;
-      if (location !== -1) {
-        gl.enableVertexAttribArray(location);
+      if (location2 !== -1) {
+        gl.enableVertexAttribArray(location2);
         var stride = !this.isInstanced ? this.ATTRIBUTES_ITEMS_COUNT * Float32Array.BYTES_PER_ELEMENT : (setDivisor ? this.ATTRIBUTES_ITEMS_COUNT : getAttributesItemsCount(this.CONSTANT_ATTRIBUTES)) * Float32Array.BYTES_PER_ELEMENT;
-        gl.vertexAttribPointer(location, attr.size, attr.type, attr.normalized || false, stride, offset);
+        gl.vertexAttribPointer(location2, attr.size, attr.type, attr.normalized || false, stride, offset);
         if (this.isInstanced && setDivisor) {
           if (gl instanceof WebGL2RenderingContext) {
-            gl.vertexAttribDivisor(location, 1);
+            gl.vertexAttribDivisor(location2, 1);
           } else {
             var ext = gl.getExtension("ANGLE_instanced_arrays");
-            if (ext) ext.vertexAttribDivisorANGLE(location, 1);
+            if (ext) ext.vertexAttribDivisorANGLE(location2, 1);
           }
         }
       }
@@ -2684,16 +2684,16 @@ var Program = /* @__PURE__ */ (function() {
   }, {
     key: "unbindAttribute",
     value: function unbindAttribute(attr, program, unsetDivisor) {
-      var location = program.attributeLocations[attr.name];
+      var location2 = program.attributeLocations[attr.name];
       var gl = program.gl;
-      if (location !== -1) {
-        gl.disableVertexAttribArray(location);
+      if (location2 !== -1) {
+        gl.disableVertexAttribArray(location2);
         if (this.isInstanced && unsetDivisor) {
           if (gl instanceof WebGL2RenderingContext) {
-            gl.vertexAttribDivisor(location, 0);
+            gl.vertexAttribDivisor(location2, 0);
           } else {
             var ext = gl.getExtension("ANGLE_instanced_arrays");
-            if (ext) ext.vertexAttribDivisorANGLE(location, 0);
+            if (ext) ext.vertexAttribDivisorANGLE(location2, 0);
           }
         }
       }
@@ -8026,6 +8026,7 @@ function drawNodeLabel(context, data, settings) {
   }
 }
 var GRAPH_URL = "graph.json";
+var LOCAL_SERVER_ORIGINS = ["http://127.0.0.1:1119", "http://localhost:1119"];
 var PALETTE = [
   "#e6194b",
   "#3cb44b",
@@ -8075,7 +8076,6 @@ var COVER_MANIFEST_URL = "covers/manifest.json";
 var COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
 var COVER_LOAD_CONCURRENCY = 24;
 var COVER_LOAD_RETRIES = 2;
-var COVER_NETWORK_INTERVAL_MS = 150;
 function communityColor(community, type) {
   if (type === "external") return EXTERNAL_COLOR;
   if (community < 0) return ISOLATED_COLOR;
@@ -8109,10 +8109,57 @@ function hexToRgba(hex, alpha, premul) {
   const bb = premul ? Math.round(b * alpha) : b;
   return "rgba(" + rr + "," + gg + "," + bb + "," + alpha.toFixed(4) + ")";
 }
-async function loadGraph() {
-  const res = await fetch(GRAPH_URL);
+async function loadGraph(source = null) {
+  const url = source ? `${source.base}/graph.json` : GRAPH_URL;
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error("\u52A0\u8F7D graph.json \u5931\u8D25: " + res.status);
   return res.json();
+}
+function normalizeCoverUrl(value) {
+  let url = String(value || "").trim();
+  if (url.startsWith("//")) url = "https:" + url;
+  return url;
+}
+function buildServerCoverMap(data, source) {
+  const map = /* @__PURE__ */ new Map();
+  for (const node of data.nodes || []) {
+    if (node.type !== "core") continue;
+    if (node.cover_url) {
+      const url = normalizeCoverUrl(node.cover_url);
+      if (!url) continue;
+      const proxy = `${source.base}/cover_proxy?url=${encodeURIComponent(url)}`;
+      map.set(String(node.key), { thumb: proxy, orig: proxy });
+    } else if (node.cover) {
+      const path = String(node.cover).replace(/^\/+/, "");
+      const local = `${source.base}/${path}`;
+      map.set(String(node.key), { thumb: local, orig: local });
+    }
+  }
+  return map;
+}
+async function detectLocalServer() {
+  for (const base of LOCAL_SERVER_ORIGINS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 900);
+    try {
+      const res = await fetch(`${base}/health`, {
+        cache: "no-store",
+        mode: "cors",
+        signal: controller.signal
+      });
+      if (res.ok) {
+        const body = await res.json().catch(() => ({}));
+        if (body.service === "star-graph-server" || body.ok === true) {
+          clearTimeout(timer);
+          return { base };
+        }
+      }
+    } catch {
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return null;
 }
 async function loadCoverManifest() {
   const map = /* @__PURE__ */ new Map();
@@ -8147,57 +8194,30 @@ function coverPaths(node, coverMap) {
   return coverMap.get(String(node.key)) || null;
 }
 var coverNetworkTail = Promise.resolve();
-var nextCoverNetworkTime = 0;
-function runCoverNetworkTask(task) {
-  const run = coverNetworkTail.then(async () => {
-    const wait = Math.max(0, nextCoverNetworkTime - performance.now());
-    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-    nextCoverNetworkTime = performance.now() + COVER_NETWORK_INTERVAL_MS;
-    return task();
-  });
-  coverNetworkTail = run.catch(() => {
-  });
-  return run;
-}
-function decodeCoverBlob(blob) {
-  return new Promise((resolve) => {
-    const objectUrl = URL.createObjectURL(blob);
-    const image = new Image();
-    image.onload = () => resolve(objectUrl);
-    image.onerror = () => {
-      URL.revokeObjectURL(objectUrl);
-      resolve(null);
-    };
-    image.src = objectUrl;
-  });
-}
-async function fetchCoverResponse(url) {
-  const controlled = !!navigator.serviceWorker?.controller;
-  if (controlled) {
-    return fetch(url, { cache: "no-store" });
-  }
-  return runCoverNetworkTask(async () => {
-    let response = await fetch(url, { cache: "force-cache" });
-    if (response.status === 570) {
-      await new Promise((resolve) => setTimeout(resolve, COVER_NETWORK_INTERVAL_MS));
-      nextCoverNetworkTime = performance.now() + COVER_NETWORK_INTERVAL_MS;
-      response = await fetch(url, { cache: "no-store" });
-    }
-    return response;
-  });
-}
-async function loadCoverObjectUrl(source) {
+function loadCoverImageSource(source) {
   const url = new URL(source, document.baseURI).href;
-  const response = await fetchCoverResponse(url);
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const objectUrl = await decodeCoverBlob(await response.blob());
-  if (!objectUrl) throw new Error("invalid image");
-  return objectUrl;
+  const controlled = !!navigator.serviceWorker?.controller && new URL(url, document.baseURI).origin === location.origin;
+  return (async () => {
+    if (!controlled) {
+      const response = await fetchCoverResponse(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      await response.blob();
+    }
+    await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.crossOrigin = "anonymous";
+      image.decoding = "async";
+      image.onload = resolve;
+      image.onerror = () => reject(new Error("image decode failed"));
+      image.src = url;
+    });
+    return url;
+  })();
 }
 async function loadCoverObjectUrlWithRetry(source) {
   for (let attempt = 0; attempt <= COVER_LOAD_RETRIES; attempt++) {
     try {
-      return await loadCoverObjectUrl(source);
+      return await loadCoverImageSource(source);
     } catch (error) {
       if (attempt >= COVER_LOAD_RETRIES) throw error;
       await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
@@ -8372,6 +8392,24 @@ async function encodePNG(width, height, getScanlines) {
   parts.push(pngChunk("IEND", new Uint8Array(0)));
   return new Blob(parts, { type: "image/png" });
 }
+function showToast(message, kind = "warning") {
+  let container = document.getElementById("toast-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "toast-container";
+    container.setAttribute("aria-live", "polite");
+    document.body.appendChild(container);
+  }
+  const toast = document.createElement("div");
+  toast.className = `toast toast-${kind}`;
+  toast.textContent = message;
+  container.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add("toast-visible"));
+  setTimeout(() => {
+    toast.classList.remove("toast-visible");
+    setTimeout(() => toast.remove(), 300);
+  }, 5e3);
+}
 function main() {
   const container = document.getElementById("container");
   const statusEl = document.getElementById("status");
@@ -8433,11 +8471,31 @@ function main() {
     }, 700);
   }
   async function boot() {
-    setProgress(0, "\u52A0\u8F7D\u6570\u636E\u4E2D\u2026\u2026", "graph.json");
-    const data = await loadGraph();
-    setProgress(10, "\u52A0\u8F7D\u9759\u6001\u5C01\u9762\u6E05\u5355\u2026\u2026", "covers/manifest.json");
-    await new Promise((r) => setTimeout(r, 30));
-    const coverMap = await loadCoverManifest();
+    setProgress(0, "\u68C0\u6D4B\u672C\u5730 server.py\u2026\u2026", "127.0.0.1:1119");
+    const localServer = await detectLocalServer();
+    let data;
+    let coverMap;
+    if (localServer) {
+      showToast("\u5DF2\u8FDE\u63A5\u672C\u5730 server.py\uFF0C\u4F7F\u7528\u672C\u5730\u56FE\u6570\u636E\u3002", "success");
+      setProgress(5, "\u52A0\u8F7D\u672C\u5730\u56FE\u6570\u636E\u2026\u2026", localServer.base + "/graph.json");
+      try {
+        data = await loadGraph(localServer);
+        coverMap = buildServerCoverMap(data, localServer);
+        if (!coverMap.size) coverMap = await loadCoverManifest();
+      } catch (error) {
+        showToast("\u672C\u5730 server.py \u6570\u636E\u52A0\u8F7D\u5931\u8D25\uFF0C\u5DF2\u56DE\u9000\u5728\u7EBF\u6570\u636E\u3002", "warning");
+        data = await loadGraph();
+        setProgress(10, "\u52A0\u8F7D\u9759\u6001\u5C01\u9762\u6E05\u5355\u2026\u2026", "covers/manifest.json");
+        coverMap = await loadCoverManifest();
+      }
+    } else {
+      showToast("\u672A\u8FDE\u63A5\u672C\u5730 server.py\uFF0C\u4F7F\u7528\u5728\u7EBF\u9759\u6001\u6570\u636E\u3002", "warning");
+      setProgress(5, "\u52A0\u8F7D\u5728\u7EBF\u6570\u636E\u2026\u2026", GRAPH_URL);
+      data = await loadGraph();
+      setProgress(10, "\u52A0\u8F7D\u9759\u6001\u5C01\u9762\u6E05\u5355\u2026\u2026", "covers/manifest.json");
+      await new Promise((r) => setTimeout(r, 30));
+      coverMap = await loadCoverManifest();
+    }
     setProgress(20, coverMap.size ? "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026" : "\u672A\u627E\u5230\u5C01\u9762\uFF0C\u4F7F\u7528\u7EAF\u8272\u8282\u70B9\u2026\u2026", coverMap.size + " \u5F20\u5C01\u9762\u5DF2\u5C31\u7EEA");
     await new Promise((r) => setTimeout(r, 30));
     const built = buildGraph(data, coverMap);
@@ -8556,12 +8614,11 @@ function main() {
         if (state.status !== "queued") continue;
         state.status = "loading";
         activeCoverLoads += 1;
-        loadCoverObjectUrlWithRetry(item.src).then((result) => {
-          const objectUrl = result && result.objectUrl;
-          if (!objectUrl) throw new Error("empty image");
+        loadCoverObjectUrlWithRetry(item.src).then((imageSource) => {
+          if (!imageSource) throw new Error("empty image");
           state.status = "ready";
-          state.objectUrl = objectUrl;
-          queueCoverImageUpdate(item.key, objectUrl);
+          state.objectUrl = imageSource;
+          queueCoverImageUpdate(item.key, imageSource);
         }).catch(() => {
           state.status = "failed";
         }).finally(() => {

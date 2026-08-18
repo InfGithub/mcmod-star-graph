@@ -70,6 +70,7 @@ function drawNodeLabel(context, data, settings) {
 
 // 图数据路径固定为 graph.json；可用服务器参数 --data 映射其他文件（见 server.py）
 const GRAPH_URL = "graph.json";
+const LOCAL_SERVER_ORIGINS = ["http://127.0.0.1:1119", "http://localhost:1119"];
 
 const PALETTE = [
   "#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231",
@@ -165,10 +166,61 @@ function hexToRgba(hex, alpha, premul) {
   return "rgba(" + rr + "," + gg + "," + bb + "," + alpha.toFixed(4) + ")";
 }
 
-async function loadGraph() {
-  const res = await fetch(GRAPH_URL);
+async function loadGraph(source = null) {
+  const url = source ? `${source.base}/graph.json` : GRAPH_URL;
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error("加载 graph.json 失败: " + res.status);
   return res.json();
+}
+
+function normalizeCoverUrl(value) {
+  let url = String(value || "").trim();
+  if (url.startsWith("//")) url = "https:" + url;
+  return url;
+}
+
+function buildServerCoverMap(data, source) {
+  const map = new Map();
+  for (const node of data.nodes || []) {
+    if (node.type !== "core") continue;
+    if (node.cover_url) {
+      const url = normalizeCoverUrl(node.cover_url);
+      if (!url) continue;
+      const proxy = `${source.base}/cover_proxy?url=${encodeURIComponent(url)}`;
+      map.set(String(node.key), { thumb: proxy, orig: proxy });
+    } else if (node.cover) {
+      const path = String(node.cover).replace(/^\/+/, "");
+      const local = `${source.base}/${path}`;
+      map.set(String(node.key), { thumb: local, orig: local });
+    }
+  }
+  return map;
+}
+
+async function detectLocalServer() {
+  for (const base of LOCAL_SERVER_ORIGINS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 900);
+    try {
+      const res = await fetch(`${base}/health`, {
+        cache: "no-store",
+        mode: "cors",
+        signal: controller.signal,
+      });
+      if (res.ok) {
+        const body = await res.json().catch(() => ({}));
+        if (body.service === "star-graph-server" || body.ok === true) {
+          clearTimeout(timer);
+          return { base };
+        }
+      }
+    } catch {
+      // 本地 server.py 未运行或当前页面无法访问 localhost，继续尝试下一个地址。
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return null;
 }
 
 // ==================== 封面：CI 预生成 + 静态加载 ====================
@@ -227,51 +279,34 @@ function runCoverNetworkTask(task) {
   return run;
 }
 
-function decodeCoverBlob(blob) {
-  return new Promise((resolve) => {
-    const objectUrl = URL.createObjectURL(blob);
-    const image = new Image();
-    image.onload = () => resolve(objectUrl);
-    image.onerror = () => {
-      URL.revokeObjectURL(objectUrl);
-      resolve(null);
-    };
-    image.src = objectUrl;
-  });
-}
-
-async function fetchCoverResponse(url) {
-  const controlled = !!navigator.serviceWorker?.controller;
-  if (controlled) {
-    // SW 先查 Cache Storage；只有 miss 才进入 SW 的串行网络队列。
-    return fetch(url, { cache: "no-store" });
-  }
-
-  // 首次安装 SW 尚未接管当前页面时的兜底，避免旧磁盘缓存 570 继续复用。
-  return runCoverNetworkTask(async () => {
-    let response = await fetch(url, { cache: "force-cache" });
-    if (response.status === 570) {
-      await new Promise((resolve) => setTimeout(resolve, COVER_NETWORK_INTERVAL_MS));
-      nextCoverNetworkTime = performance.now() + COVER_NETWORK_INTERVAL_MS;
-      response = await fetch(url, { cache: "no-store" });
-    }
-    return response;
-  });
-}
-
-async function loadCoverObjectUrl(source) {
+function loadCoverImageSource(source) {
   const url = new URL(source, document.baseURI).href;
-  const response = await fetchCoverResponse(url);
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const objectUrl = await decodeCoverBlob(await response.blob());
-  if (!objectUrl) throw new Error("invalid image");
-  return objectUrl;
+  const controlled = !!navigator.serviceWorker?.controller &&
+    new URL(url, document.baseURI).origin === location.origin;
+
+  return (async () => {
+    if (!controlled) {
+      const response = await fetchCoverResponse(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      // 兜底 fetch 先走完网络队列，再让 Image 复用浏览器 HTTP cache 解码。
+      await response.blob();
+    }
+    await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.crossOrigin = "anonymous";
+      image.decoding = "async";
+      image.onload = resolve;
+      image.onerror = () => reject(new Error("image decode failed"));
+      image.src = url;
+    });
+    return url;
+  })();
 }
 
 async function loadCoverObjectUrlWithRetry(source) {
   for (let attempt = 0; attempt <= COVER_LOAD_RETRIES; attempt++) {
     try {
-      return await loadCoverObjectUrl(source);
+      return await loadCoverImageSource(source);
     } catch (error) {
       if (attempt >= COVER_LOAD_RETRIES) throw error;
       await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
@@ -468,6 +503,25 @@ async function encodePNG(width, height, getScanlines) {
   return new Blob(parts, { type: "image/png" });
 }
 
+function showToast(message, kind = "warning") {
+  let container = document.getElementById("toast-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "toast-container";
+    container.setAttribute("aria-live", "polite");
+    document.body.appendChild(container);
+  }
+  const toast = document.createElement("div");
+  toast.className = `toast toast-${kind}`;
+  toast.textContent = message;
+  container.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add("toast-visible"));
+  setTimeout(() => {
+    toast.classList.remove("toast-visible");
+    setTimeout(() => toast.remove(), 300);
+  }, 5000);
+}
+
 function main() {
   const container = document.getElementById("container");
   const statusEl = document.getElementById("status");
@@ -534,13 +588,32 @@ function main() {
   }
 
   async function boot() {
-    setProgress(0, "加载数据中……", "graph.json");
-    const data = await loadGraph();
-    setProgress(10, "加载静态封面清单……", "covers/manifest.json");
-    await new Promise((r) => setTimeout(r, 30));
-
-    // 封面：CI 预生成后随站点静态发布；清单缺失时回退为纯色节点。
-    const coverMap = await loadCoverManifest();
+    setProgress(0, "检测本地 server.py……", "127.0.0.1:1119");
+    const localServer = await detectLocalServer();
+    let data;
+    let coverMap;
+    if (localServer) {
+      showToast("已连接本地 server.py，使用本地图数据。", "success");
+      setProgress(5, "加载本地图数据……", localServer.base + "/graph.json");
+      try {
+        data = await loadGraph(localServer);
+        coverMap = buildServerCoverMap(data, localServer);
+        if (!coverMap.size) coverMap = await loadCoverManifest();
+      } catch (error) {
+        showToast("本地 server.py 数据加载失败，已回退在线数据。", "warning");
+        data = await loadGraph();
+        setProgress(10, "加载静态封面清单……", "covers/manifest.json");
+        coverMap = await loadCoverManifest();
+      }
+    } else {
+      showToast("未连接本地 server.py，使用在线静态数据。", "warning");
+      setProgress(5, "加载在线数据……", GRAPH_URL);
+      data = await loadGraph();
+      setProgress(10, "加载静态封面清单……", "covers/manifest.json");
+      await new Promise((r) => setTimeout(r, 30));
+      // 封面：CI 预生成后随站点静态发布；清单缺失时回退为纯色节点。
+      coverMap = await loadCoverManifest();
+    }
     setProgress(20, coverMap.size
       ? "构建图结构……"
       : "未找到封面，使用纯色节点……", coverMap.size + " 张封面已就绪");
@@ -682,12 +755,11 @@ function main() {
         state.status = "loading";
         activeCoverLoads += 1;
         loadCoverObjectUrlWithRetry(item.src)
-          .then((result) => {
-            const objectUrl = result && result.objectUrl;
-            if (!objectUrl) throw new Error("empty image");
+          .then((imageSource) => {
+            if (!imageSource) throw new Error("empty image");
             state.status = "ready";
-            state.objectUrl = objectUrl;
-            queueCoverImageUpdate(item.key, objectUrl);
+            state.objectUrl = imageSource;
+            queueCoverImageUpdate(item.key, imageSource);
           })
           .catch(() => {
             // 失败只记状态，不向控制台输出重复堆栈；下次重新打开页面可重试。

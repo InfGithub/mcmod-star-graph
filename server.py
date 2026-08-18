@@ -38,6 +38,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 1119
 PROXY_PATH = "/cover_proxy"
 CLEAN_PATH = "/clean"
+HEALTH_PATH = "/health"
 # 前端固定请求的图数据文件名；--data 参数可把其他文件映射到这个名字
 DATA_ALIAS = "graph.json"
 # SSRF 防护：只允许转发 mcmod 封面域名（老封面在 www.mcmod.cn/pages/class/images/cover/）
@@ -61,9 +62,22 @@ REFERER = "https://www.mcmod.cn/"
 class Handler(SimpleHTTPRequestHandler):
     """静态文件（继承 SimpleHTTPRequestHandler，自带目录穿越防护）+ /cover_proxy 代理。"""
 
+    def end_headers(self):
+        # 允许在线页面探测/使用本机 server.py（不携带凭据）。
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.end_headers()
+
     def do_GET(self):
         parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path == PROXY_PATH:
+        if parsed.path == HEALTH_PATH:
+            self._handle_health()
+        elif parsed.path == PROXY_PATH:
             self._handle_proxy(parsed)
         elif parsed.path == CLEAN_PATH:
             self._handle_clean()
@@ -71,6 +85,15 @@ class Handler(SimpleHTTPRequestHandler):
             self._handle_data()
         else:
             super().do_GET()
+
+    def _handle_health(self):
+        body = json.dumps({"ok": True, "service": "star-graph-server"}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_data(self):
         """把 --data 指定的文件以 /graph.json 名字返回。"""
