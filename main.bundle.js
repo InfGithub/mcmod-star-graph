@@ -7985,7 +7985,9 @@ var NodePictogramProgram = createNodeImageProgram({
 });
 
 // main.js
-var FadingNodeImageProgram = class extends NodeImageProgram {
+var FadingNodeImageProgram = class extends createNodeImageProgram({
+  size: { mode: "max", value: 128 }
+}) {
   getDefinition() {
     const def = super.getDefinition();
     def.FRAGMENT_SHADER_SOURCE = def.FRAGMENT_SHADER_SOURCE.replace("max(texel.a, v_color.a)", "v_color.a").replace(
@@ -8115,14 +8117,37 @@ async function loadGraph() {
   if (!res.ok) throw new Error("\u52A0\u8F7D graph.json \u5931\u8D25: " + res.status);
   return res.json();
 }
+function renderMetaPanel(meta) {
+  const el = document.getElementById("panel-meta");
+  if (!el || !meta) return;
+  const w = meta.weights || {};
+  const rows = [
+    ["\u7248\u672C", meta.mc_version],
+    ["\u52A0\u8F7D\u5668", meta.api],
+    ["\u8282\u70B9", meta.node_count],
+    ["\u4F9D\u8D56\u8FB9", meta.dependency_edges],
+    ["\u8054\u52A8\u8FB9", meta.interaction_edges],
+    ["\u793E\u533A", meta.community_count],
+    ["\u8FDE\u901A\u5206\u91CF", meta.component_count],
+    ["\u751F\u6210\u65F6\u95F4", meta.generated_at],
+    ["\u5E03\u5C40", meta.layout],
+    ["\u4F9D\u8D56\u6743\u91CD", w.dependency],
+    ["\u8054\u52A8\u6743\u91CD", w.interaction],
+    ["\u6570\u636E\u6E90", meta.source_db]
+  ];
+  const html = '<div class="meta-title">\u56FE\u5143\u6570\u636E</div>' + rows.map((row) => '<div class="meta-row"><span>' + row[0] + "</span><b>" + String(row[1]) + "</b></div>").join("");
+  el.innerHTML = html;
+}
 var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function openCoverDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(COVER_DB_NAME, 1);
+    const req = indexedDB.open(COVER_DB_NAME, 2);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains(COVER_STORE)) {
         db.createObjectStore(COVER_STORE);
+      } else {
+        req.transaction.objectStore(COVER_STORE).clear();
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -8143,13 +8168,6 @@ function idbPut(db, key, value) {
     req.onerror = () => reject(req.error);
   });
 }
-function idbCount(db) {
-  return new Promise((resolve, reject) => {
-    const req = db.transaction(COVER_STORE, "readonly").objectStore(COVER_STORE).count();
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
 function idbClear(db) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(COVER_STORE, "readwrite");
@@ -8165,15 +8183,38 @@ function normalizeCoverUrl(url) {
   return u;
 }
 async function loadAllCovers(db, items) {
-  const map = /* @__PURE__ */ new Map();
+  const blobUrls = /* @__PURE__ */ new Map();
+  const staleKeys = [];
   for (const item of items) {
     try {
-      const blob = await idbGet(db, item.key);
-      if (blob) map.set(item.key, URL.createObjectURL(blob));
+      const entry = await idbGet(db, item.key);
+      if (entry && entry.url === item.url && entry.blob) {
+        blobUrls.set(item.key, URL.createObjectURL(entry.blob));
+      } else {
+        staleKeys.push(item.key);
+      }
     } catch (e) {
+      staleKeys.push(item.key);
     }
   }
-  return map;
+  return { blobUrls, staleKeys };
+}
+function purgeStaleKeys(db, items) {
+  return new Promise((resolve, reject) => {
+    const keep = new Set(items.map((it) => it.key));
+    const tx = db.transaction(COVER_STORE, "readwrite");
+    const store = tx.objectStore(COVER_STORE);
+    const req = store.openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (cursor) {
+        if (!keep.has(cursor.key)) cursor.delete();
+        cursor.continue();
+      }
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
 }
 async function downloadCovers(db, items, onProgress) {
   let idx = 0;
@@ -8192,7 +8233,7 @@ async function downloadCovers(db, items, onProgress) {
           const resp = await fetch(COVER_PROXY + encodeURIComponent(item.url));
           if (!resp.ok) throw new Error("HTTP " + resp.status);
           const blob = await resp.blob();
-          await idbPut(db, item.key, blob);
+          await idbPut(db, item.key, { url: item.url, blob });
           ok = true;
         } catch (e) {
           lastErr = String(e && e.message || e);
@@ -8217,9 +8258,9 @@ async function downloadCovers(db, items, onProgress) {
   await Promise.all(workers);
   return { failed, failedKeys, errors };
 }
-function showCoverModal(db, coverItems) {
+function showCoverModal(db, downloadItems, allItems) {
   return new Promise((resolve) => {
-    const coverByKey = new Map(coverItems.map((it) => [it.key, it.url]));
+    const coverByKey = new Map(downloadItems.map((it) => [it.key, it.url]));
     const modal = document.createElement("div");
     modal.className = "cover-modal";
     modal.innerHTML = '<div class="cover-box">  <div class="cover-head">    <span class="cover-title"></span>    <button class="cover-close" title="\u62D2\u7EDD\u4E0B\u8F7D">\xD7</button>  </div>  <div class="cover-desc"></div>  <div class="cover-progress hidden">    <div class="cover-track"><div class="cover-fill"></div></div>    <div class="cover-label"></div>  </div>  <div class="cover-actions">    <button class="cover-btn primary"></button>    <button class="cover-btn ghost hidden"></button>  </div></div>';
@@ -8233,20 +8274,19 @@ function showCoverModal(db, coverItems) {
     const primaryBtn = modal.querySelector(".cover-btn.primary");
     const ghostBtn = modal.querySelector(".cover-btn.ghost");
     let state = "confirm";
-    let pending = coverItems.slice();
+    let pending = downloadItems.slice();
     let doneCount = 0;
     let failedCount = 0;
     let failedKeys = [];
     let failErrors = [];
     let elapsedStart = 0;
-    const totalMB = Math.max(1, Math.round(coverItems.length * 0.02));
     function showState() {
       closeEl.classList.toggle("hidden", state !== "confirm");
       progressEl.classList.toggle("hidden", state !== "downloading");
       ghostBtn.classList.toggle("hidden", state !== "failed");
       if (state === "confirm") {
         titleEl.textContent = "\u4E0B\u8F7D\u5C01\u9762";
-        descEl.textContent = "\u672C\u56FE\u9700\u8981\u4E0B\u8F7D " + coverItems.length + " \u5F20\u6A21\u7EC4\u5C01\u9762\uFF08\u7EA6 " + totalMB + " MB\uFF09\u624D\u80FD\u6B63\u5E38\u4F7F\u7528\u3002\u5C01\u9762\u5C06\u7F13\u5B58\u5230\u6D4F\u89C8\u5668\u672C\u5730\uFF0C\u4E0B\u6B21\u6253\u5F00\u65E0\u9700\u91CD\u590D\u4E0B\u8F7D\u3002";
+        descEl.textContent = "\u672C\u56FE\u9700\u8981\u4E0B\u8F7D " + downloadItems.length + " \u5F20\u6A21\u7EC4\u5C01\u9762\u624D\u80FD\u6B63\u5E38\u4F7F\u7528\u3002\u5C01\u9762\u5C06\u7F13\u5B58\u5230\u6D4F\u89C8\u5668\u672C\u5730\uFF0C\u4E0B\u6B21\u6253\u5F00\u65E0\u9700\u91CD\u590D\u4E0B\u8F7D\u3002";
         primaryBtn.textContent = "\u786E\u5B9A\u4E0B\u8F7D";
         primaryBtn.classList.remove("hidden");
       } else if (state === "refuse") {
@@ -8306,17 +8346,18 @@ function showCoverModal(db, coverItems) {
         state = "failed";
         showState();
       } else {
-        const blobUrls = await loadAllCovers(db, coverItems);
-        finish(blobUrls);
+        const loaded = await loadAllCovers(db, allItems);
+        finish(loaded.blobUrls);
       }
     }
     primaryBtn.addEventListener("click", async () => {
       if (state === "confirm") {
         startDownload(pending);
       } else if (state === "refuse") {
-        startDownload(coverItems.slice());
+        startDownload(downloadItems.slice());
       } else if (state === "failed") {
-        const urls = await loadAllCovers(db, coverItems);
+        const loaded = await loadAllCovers(db, allItems);
+        const urls = loaded.blobUrls;
         finish(urls);
       }
     });
@@ -8536,6 +8577,8 @@ function main() {
   const exportHeight = document.getElementById("export-height");
   const exportButton = document.getElementById("export-button");
   const exportWarning = document.getElementById("export-warning");
+  const exportLodSlider = document.getElementById("export-lod-slider");
+  const exportLodValue = document.getElementById("export-lod-value");
   let renderer = null;
   let graph = null;
   let searchIndex = null;
@@ -8555,6 +8598,7 @@ function main() {
   let showInteraction = true;
   let highlightNodes = /* @__PURE__ */ new Set();
   let highlightEdges = /* @__PURE__ */ new Set();
+  let coverBlobUrls = /* @__PURE__ */ new Map();
   function setProgress(pct, text, label) {
     statusText.textContent = text;
     progressFill.style.width = Math.max(0, Math.min(100, pct)) + "%";
@@ -8574,6 +8618,7 @@ function main() {
   async function boot() {
     setProgress(0, "\u52A0\u8F7D\u6570\u636E\u4E2D\u2026\u2026", "graph.json");
     const data = await loadGraph();
+    renderMetaPanel(data.meta);
     setProgress(10, "\u68C0\u67E5\u5C01\u9762\u7F13\u5B58\u2026\u2026", "");
     await new Promise((r) => setTimeout(r, 30));
     const coverItems = [];
@@ -8591,20 +8636,27 @@ function main() {
     if (!coverItems.length) {
       console.warn("[\u8B66\u544A] graph.json \u65E0\u5C01\u9762 URL\uFF0C\u8282\u70B9\u5C06\u663E\u793A\u4E3A\u7EAF\u8272\u5706");
       blobUrls = /* @__PURE__ */ new Map();
-    } else if (await idbCount(db) >= coverItems.length) {
-      blobUrls = await loadAllCovers(db, coverItems);
     } else {
       const proxyStatus = await checkCoverProxy();
       if (proxyStatus !== "ok") {
         await showProxyErrorModal(proxyStatus);
         return;
       }
-      blobUrls = (await showCoverModal(db, coverItems)).blobUrls;
+      const loaded = await loadAllCovers(db, coverItems);
+      blobUrls = loaded.blobUrls;
+      if (loaded.staleKeys.length) {
+        const byKey = new Map(coverItems.map((it) => [it.key, it.url]));
+        const downloadItems = loaded.staleKeys.map((k) => ({ key: k, url: byKey.get(k) }));
+        const result = await showCoverModal(db, downloadItems, coverItems);
+        blobUrls = result.blobUrls;
+      }
+      await purgeStaleKeys(db, coverItems);
     }
     setProgress(20, "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026", "");
     await new Promise((r) => setTimeout(r, 30));
     const built = buildGraph(data, blobUrls);
     graph = built.graph;
+    coverBlobUrls = blobUrls;
     searchIndex = buildSearch(data);
     allNodes = [...data.nodes].sort((a, b) => (b.views || 0) - (a.views || 0));
     searchMatches = [...allNodes];
@@ -8779,6 +8831,9 @@ function main() {
       renderer.setSetting("renderLabels", showLabels.checked);
     });
     exportButton.addEventListener("click", exportPNG);
+    exportLodSlider.addEventListener("input", () => {
+      exportLodValue.textContent = exportLodSlider.value + "%";
+    });
     function updateExportWarning() {
       const w = parseInt(exportWidth.value, 10) || 0;
       const h = parseInt(exportHeight.value, 10) || 0;
@@ -8791,7 +8846,7 @@ function main() {
   function renderSearchResults() {
     searchList.innerHTML = "";
     searchPagination.innerHTML = "";
-    const pageSize = 20;
+    const pageSize = 10;
     const total = searchMatches.length;
     const pages = Math.max(1, Math.ceil(total / pageSize));
     if (searchPage >= pages) searchPage = pages - 1;
@@ -9369,8 +9424,9 @@ function main() {
     contextMenu.classList.remove("hidden");
     positionMenu(x, y);
   }
-  function drawEdges(ctx, tx, ty, scale2) {
+  function drawEdges(ctx, tx, ty, scale2, minImportance) {
     graph.forEachEdge((edge, attrs, source, target, sa, ta) => {
+      if (minImportance > 0 && (attrs.importance || 0) < minImportance) return;
       const rgb = attrs.rgb || DEPENDENCY_EDGE_RGB;
       ctx.strokeStyle = rgbaString(rgb, EDGE_ALPHA);
       ctx.lineWidth = Math.max(1, (attrs.size || 0.5) * scale2);
@@ -9416,9 +9472,10 @@ function main() {
         const attrs = item.attrs;
         const cx = item.cx, cy = item.cy, r = item.r;
         let img = null;
-        if (attrs.image) {
+        const src = coverBlobUrls.get(attrs.key) || attrs.image;
+        if (src) {
           img = new Image();
-          img.src = attrs.image;
+          img.src = src;
           await new Promise((resolve) => {
             img.onload = resolve;
             img.onerror = resolve;
@@ -9457,14 +9514,14 @@ function main() {
       }, "image/png");
     });
   }
-  async function renderSingle(W, H, scale2, nodePixels, toX, toY) {
+  async function renderSingle(W, H, scale2, nodePixels, toX, toY, minImportance) {
     const canvas = document.createElement("canvas");
     canvas.width = W;
     canvas.height = H;
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = "#000000";
     ctx.fillRect(0, 0, W, H);
-    drawEdges(ctx, toX, toY, scale2);
+    drawEdges(ctx, toX, toY, scale2, minImportance);
     const items = nodePixels.map((n) => ({ attrs: n.attrs, cx: n.px, cy: n.py, r: n.pr }));
     const startTime = Date.now();
     await drawNodesAt(ctx, items, (done, total) => {
@@ -9477,7 +9534,7 @@ function main() {
     });
     return canvasToBlob(canvas);
   }
-  async function renderTiled(W, H, scale2, nodePixels, toX, toY) {
+  async function renderTiled(W, H, scale2, nodePixels, toX, toY, minImportance) {
     const TILE_W = 8192;
     const TILE_H = 1024;
     const cols = Math.ceil(W / TILE_W);
@@ -9501,7 +9558,7 @@ function main() {
           ctx.fillRect(0, 0, tileW, tileH);
           const tx = (x) => toX(x) - tileX0;
           const ty = (y) => toY(y) - tileY0;
-          drawEdges(ctx, tx, ty, scale2);
+          drawEdges(ctx, tx, ty, scale2, minImportance);
           const items = [];
           for (const n of nodePixels) {
             const labelBottom = LABEL_FONT_SIZE * 3.25;
@@ -9572,7 +9629,8 @@ function main() {
         pr: attrs.size * scale2
       }));
       const SINGLE_MAX = 16384;
-      const blob = W < SINGLE_MAX && H < SINGLE_MAX ? await renderSingle(W, H, scale2, nodePixels, toX, toY) : await renderTiled(W, H, scale2, nodePixels, toX, toY);
+      const minImportance = Math.round(LOD_MAX_THRESHOLD * ((Number(exportLodSlider.value) || 0) / 100));
+      const blob = W < SINGLE_MAX && H < SINGLE_MAX ? await renderSingle(W, H, scale2, nodePixels, toX, toY, minImportance) : await renderTiled(W, H, scale2, nodePixels, toX, toY, minImportance);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;

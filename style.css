@@ -176,6 +176,7 @@ html, body {
 
 #panel.collapsed .panel-title,
 #panel.collapsed .panel-body,
+#panel.collapsed .panel-meta,
 #panel.collapsed .panel-footer {
   display: none;
 }
@@ -381,6 +382,43 @@ html, body {
 
 .export-warning.hidden {
   display: none;
+}
+
+/* ==================== 图元数据 ==================== */
+
+.panel-meta {
+  flex: none;
+  margin-top: 12px;
+  padding: 8px 2px 0;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+}
+
+.meta-title {
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.meta-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  line-height: 1.5;
+}
+
+.meta-row span {
+  color: var(--text-muted);
+  flex: none;
+}
+
+.meta-row b {
+  font-weight: normal;
+  color: var(--text-secondary);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ==================== 侧边栏页脚 ==================== */

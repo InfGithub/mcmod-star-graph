@@ -10,12 +10,16 @@
  */
 import Graph from "graphology";
 import Sigma from "sigma";
-import { NodeImageProgram } from "@sigma/node-image";
+import { createNodeImageProgram } from "@sigma/node-image";
 
 // 支持封面透明度淡入淡出的图像节点程序。
 // sigma 使用预乘 alpha 混合（blendFunc(ONE, ONE_MINUS_SRC_ALPHA)），
 // 因此颜色 RGB 必须先乘以 alpha，否则降低 alpha 会变成加色混合（变亮）而不是变透明。
-class FadingNodeImageProgram extends NodeImageProgram {
+// 纹理强制 max 128px：封面以 128px 入图集（每图集约 961 张），
+// 避免封面多时图集数超 WebGL MAX_TEXTURE_IMAGE_UNITS(16)；导出用原始 blob 不受影响。
+class FadingNodeImageProgram extends createNodeImageProgram({
+  size: { mode: "max", value: 128 },
+}) {
   getDefinition() {
     const def = super.getDefinition();
     def.FRAGMENT_SHADER_SOURCE = def.FRAGMENT_SHADER_SOURCE
@@ -171,17 +175,47 @@ async function loadGraph() {
   return res.json();
 }
 
+// 渲染侧边栏底部的图元数据面板（字段独立一行，值为 null 原样显示）
+function renderMetaPanel(meta) {
+  const el = document.getElementById("panel-meta");
+  if (!el || !meta) return;
+  const w = meta.weights || {};
+  const rows = [
+    ["版本", meta.mc_version],
+    ["加载器", meta.api],
+    ["节点", meta.node_count],
+    ["依赖边", meta.dependency_edges],
+    ["联动边", meta.interaction_edges],
+    ["社区", meta.community_count],
+    ["连通分量", meta.component_count],
+    ["生成时间", meta.generated_at],
+    ["布局", meta.layout],
+    ["依赖权重", w.dependency],
+    ["联动权重", w.interaction],
+    ["数据源", meta.source_db],
+  ];
+  const html =
+    '<div class="meta-title">图元数据</div>' +
+    rows
+      .map((row) => '<div class="meta-row"><span>' + row[0] + "</span><b>" + String(row[1]) + "</b></div>")
+      .join("");
+  el.innerHTML = html;
+}
+
 // ==================== 封面：IndexedDB 缓存 + 强制下载 ====================
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function openCoverDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(COVER_DB_NAME, 1);
+    const req = indexedDB.open(COVER_DB_NAME, 2);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains(COVER_STORE)) {
         db.createObjectStore(COVER_STORE); // key = class_id
+      } else {
+        // 版本 1 → 2：旧数据是纯 blob，无 url 字段可校验，作废重下
+        req.transaction.objectStore(COVER_STORE).clear();
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -205,14 +239,6 @@ function idbPut(db, key, value) {
   });
 }
 
-function idbCount(db) {
-  return new Promise((resolve, reject) => {
-    const req = db.transaction(COVER_STORE, "readonly").objectStore(COVER_STORE).count();
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
 function idbClear(db) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(COVER_STORE, "readwrite");
@@ -230,16 +256,41 @@ function normalizeCoverUrl(url) {
   return u;
 }
 
-// 从 IndexedDB 读取全部已缓存封面 → blob URL map
+// 读取全部封面缓存并校验 URL；返回 { blobUrls, staleKeys }
+// staleKeys：缺失或 URL 已变化的条目（需重新下载）
 async function loadAllCovers(db, items) {
-  const map = new Map();
+  const blobUrls = new Map();
+  const staleKeys = [];
   for (const item of items) {
     try {
-      const blob = await idbGet(db, item.key);
-      if (blob) map.set(item.key, URL.createObjectURL(blob));
-    } catch (e) { /* 单条失败忽略 */ }
+      const entry = await idbGet(db, item.key);
+      if (entry && entry.url === item.url && entry.blob) {
+        blobUrls.set(item.key, URL.createObjectURL(entry.blob));
+      } else {
+        staleKeys.push(item.key);
+      }
+    } catch (e) { staleKeys.push(item.key); }
   }
-  return map;
+  return { blobUrls, staleKeys };
+}
+
+// 清理当前图不需要的缓存条目（旧图残留）
+function purgeStaleKeys(db, items) {
+  return new Promise((resolve, reject) => {
+    const keep = new Set(items.map((it) => it.key));
+    const tx = db.transaction(COVER_STORE, "readwrite");
+    const store = tx.objectStore(COVER_STORE);
+    const req = store.openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (cursor) {
+        if (!keep.has(cursor.key)) cursor.delete();
+        cursor.continue();
+      }
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
 }
 
 // 并发下载封面，每张重试 COVER_RETRIES 次；返回 { failed, failedKeys, errors }
@@ -261,7 +312,7 @@ async function downloadCovers(db, items, onProgress) {
           const resp = await fetch(COVER_PROXY + encodeURIComponent(item.url));
           if (!resp.ok) throw new Error("HTTP " + resp.status);
           const blob = await resp.blob();
-          await idbPut(db, item.key, blob);
+          await idbPut(db, item.key, { url: item.url, blob });
           ok = true;
         } catch (e) {
           lastErr = String((e && e.message) || e);
@@ -288,10 +339,11 @@ async function downloadCovers(db, items, onProgress) {
   return { failed, failedKeys, errors };
 }
 
-// 强制下载门槛 modal。resolve({ blobUrls }) 表示可进入星图。
-function showCoverModal(db, coverItems) {
+// 强制下载门槛 modal（下载 downloadItems 差异部分，完成后加载 allItems 全量）。
+// resolve({ blobUrls }) 表示可进入星图。
+function showCoverModal(db, downloadItems, allItems) {
   return new Promise((resolve) => {
-    const coverByKey = new Map(coverItems.map((it) => [it.key, it.url]));
+    const coverByKey = new Map(downloadItems.map((it) => [it.key, it.url]));
 
     const modal = document.createElement("div");
     modal.className = "cover-modal";
@@ -323,14 +375,12 @@ function showCoverModal(db, coverItems) {
     const ghostBtn = modal.querySelector(".cover-btn.ghost");
 
     let state = "confirm";
-    let pending = coverItems.slice();
+    let pending = downloadItems.slice();
     let doneCount = 0;
     let failedCount = 0;
     let failedKeys = [];
     let failErrors = [];
     let elapsedStart = 0;
-
-    const totalMB = Math.max(1, Math.round((coverItems.length * 0.02)));
 
     function showState() {
       closeEl.classList.toggle("hidden", state !== "confirm");
@@ -339,7 +389,7 @@ function showCoverModal(db, coverItems) {
       if (state === "confirm") {
         titleEl.textContent = "下载封面";
         descEl.textContent =
-          "本图需要下载 " + coverItems.length + " 张模组封面（约 " + totalMB + " MB）才能正常使用。" +
+          "本图需要下载 " + downloadItems.length + " 张模组封面才能正常使用。" +
           "封面将缓存到浏览器本地，下次打开无需重复下载。";
         primaryBtn.textContent = "确定下载";
         primaryBtn.classList.remove("hidden");
@@ -406,8 +456,8 @@ function showCoverModal(db, coverItems) {
         state = "failed";
         showState();
       } else {
-        const blobUrls = await loadAllCovers(db, coverItems);
-        finish(blobUrls);
+        const loaded = await loadAllCovers(db, allItems);
+        finish(loaded.blobUrls);
       }
     }
 
@@ -415,9 +465,10 @@ function showCoverModal(db, coverItems) {
       if (state === "confirm") {
         startDownload(pending);
       } else if (state === "refuse") {
-        startDownload(coverItems.slice());
+        startDownload(downloadItems.slice());
       } else if (state === "failed") {
-        const urls = await loadAllCovers(db, coverItems);
+        const loaded = await loadAllCovers(db, allItems);
+        const urls = loaded.blobUrls;
         finish(urls);
       }
     });
@@ -678,6 +729,8 @@ function main() {
   const exportHeight = document.getElementById("export-height");
   const exportButton = document.getElementById("export-button");
   const exportWarning = document.getElementById("export-warning");
+  const exportLodSlider = document.getElementById("export-lod-slider");
+  const exportLodValue = document.getElementById("export-lod-value");
 
   let renderer = null;
   let graph = null;
@@ -698,6 +751,8 @@ function main() {
   let showInteraction = true;
   let highlightNodes = new Set();
   let highlightEdges = new Set();
+  // 导出用全量封面映射（与屏幕渲染的 image 属性解耦，导出不受纹理限制影响）
+  let coverBlobUrls = new Map();
 
   function setProgress(pct, text, label) {
     statusText.textContent = text;
@@ -721,6 +776,7 @@ function main() {
   async function boot() {
     setProgress(0, "加载数据中……", "graph.json");
     const data = await loadGraph();
+    renderMetaPanel(data.meta);
     setProgress(10, "检查封面缓存……", "");
     await new Promise((r) => setTimeout(r, 30));
 
@@ -732,7 +788,7 @@ function main() {
       if (url) coverItems.push({ key: n.key, url });
     }
 
-    // 封面门槛：缓存齐全直接进；否则强制下载（拒绝不服务，失败可放行）
+    // 封面：按 URL 校验缓存，缺失/变更的差异部分强制下载（拒绝不服务，失败可放行）
     const db = await openCoverDB();
     if (await checkCleanFlag()) {
       await idbClear(db);
@@ -742,15 +798,21 @@ function main() {
     if (!coverItems.length) {
       console.warn("[警告] graph.json 无封面 URL，节点将显示为纯色圆");
       blobUrls = new Map();
-    } else if ((await idbCount(db)) >= coverItems.length) {
-      blobUrls = await loadAllCovers(db, coverItems);
     } else {
       const proxyStatus = await checkCoverProxy();
       if (proxyStatus !== "ok") {
         await showProxyErrorModal(proxyStatus);
         return;
       }
-      blobUrls = (await showCoverModal(db, coverItems)).blobUrls;
+      const loaded = await loadAllCovers(db, coverItems);
+      blobUrls = loaded.blobUrls;
+      if (loaded.staleKeys.length) {
+        const byKey = new Map(coverItems.map((it) => [it.key, it.url]));
+        const downloadItems = loaded.staleKeys.map((k) => ({ key: k, url: byKey.get(k) }));
+        const result = await showCoverModal(db, downloadItems, coverItems);
+        blobUrls = result.blobUrls;
+      }
+      await purgeStaleKeys(db, coverItems);
     }
 
     setProgress(20, "构建图结构……", "");
@@ -758,6 +820,7 @@ function main() {
 
     const built = buildGraph(data, blobUrls);
     graph = built.graph;
+    coverBlobUrls = blobUrls;
     searchIndex = buildSearch(data);
     allNodes = [...data.nodes].sort((a, b) => (b.views || 0) - (a.views || 0));
     searchMatches = [...allNodes];
@@ -956,6 +1019,11 @@ function main() {
 
     exportButton.addEventListener("click", exportPNG);
 
+    // 导出边 LoD：阈值 = LOD_MAX_THRESHOLD × 强度（0 = 全量），只影响导出 PNG
+    exportLodSlider.addEventListener("input", () => {
+      exportLodValue.textContent = exportLodSlider.value + "%";
+    });
+
     function updateExportWarning() {
       const w = parseInt(exportWidth.value, 10) || 0;
       const h = parseInt(exportHeight.value, 10) || 0;
@@ -969,7 +1037,7 @@ function main() {
   function renderSearchResults() {
     searchList.innerHTML = "";
     searchPagination.innerHTML = "";
-    const pageSize = 20;
+    const pageSize = 10;
     const total = searchMatches.length;
     const pages = Math.max(1, Math.ceil(total / pageSize));
     if (searchPage >= pages) searchPage = pages - 1;
@@ -1617,8 +1685,10 @@ function main() {
     positionMenu(x, y);
   }
 
-  function drawEdges(ctx, tx, ty, scale) {
+  function drawEdges(ctx, tx, ty, scale, minImportance) {
     graph.forEachEdge((edge, attrs, source, target, sa, ta) => {
+      // 导出边 LoD：importance 低于阈值的边不画（importance = min 两端被依赖次数）
+      if (minImportance > 0 && (attrs.importance || 0) < minImportance) return;
       const rgb = attrs.rgb || DEPENDENCY_EDGE_RGB;
       ctx.strokeStyle = rgbaString(rgb, EDGE_ALPHA);
       ctx.lineWidth = Math.max(1, (attrs.size || 0.5) * scale);
@@ -1673,9 +1743,11 @@ function main() {
         const cx = item.cx, cy = item.cy, r = item.r;
 
         let img = null;
-        if (attrs.image) {
+        // 导出用独立的全量封面映射（coverBlobUrls），不依赖被封面 LoD 控制的 image 属性
+        const src = coverBlobUrls.get(attrs.key) || attrs.image;
+        if (src) {
           img = new Image();
-          img.src = attrs.image;
+          img.src = src;
           await new Promise((resolve) => {
             img.onload = resolve;
             img.onerror = resolve;
@@ -1721,7 +1793,7 @@ function main() {
     });
   }
 
-  async function renderSingle(W, H, scale, nodePixels, toX, toY) {
+  async function renderSingle(W, H, scale, nodePixels, toX, toY, minImportance) {
     const canvas = document.createElement("canvas");
     canvas.width = W;
     canvas.height = H;
@@ -1729,7 +1801,7 @@ function main() {
     ctx.fillStyle = "#000000";
     ctx.fillRect(0, 0, W, H);
 
-    drawEdges(ctx, toX, toY, scale);
+    drawEdges(ctx, toX, toY, scale, minImportance);
 
     const items = nodePixels.map((n) => ({ attrs: n.attrs, cx: n.px, cy: n.py, r: n.pr }));
     const startTime = Date.now();
@@ -1745,7 +1817,7 @@ function main() {
     return canvasToBlob(canvas);
   }
 
-  async function renderTiled(W, H, scale, nodePixels, toX, toY) {
+  async function renderTiled(W, H, scale, nodePixels, toX, toY, minImportance) {
     const TILE_W = 8192;
     const TILE_H = 1024;
     const cols = Math.ceil(W / TILE_W);
@@ -1774,7 +1846,7 @@ function main() {
 
           const tx = (x) => toX(x) - tileX0;
           const ty = (y) => toY(y) - tileY0;
-          drawEdges(ctx, tx, ty, scale);
+          drawEdges(ctx, tx, ty, scale, minImportance);
 
           const items = [];
           for (const n of nodePixels) {
@@ -1859,9 +1931,11 @@ function main() {
       }));
 
       const SINGLE_MAX = 16384;
+      // 导出边 LoD 阈值：与屏幕边 LoD 100% 缩到底的骨干阈值一致（LOD_MAX_THRESHOLD × 强度）
+      const minImportance = Math.round(LOD_MAX_THRESHOLD * ((Number(exportLodSlider.value) || 0) / 100));
       const blob = (W < SINGLE_MAX && H < SINGLE_MAX)
-        ? await renderSingle(W, H, scale, nodePixels, toX, toY)
-        : await renderTiled(W, H, scale, nodePixels, toX, toY);
+        ? await renderSingle(W, H, scale, nodePixels, toX, toY, minImportance)
+        : await renderTiled(W, H, scale, nodePixels, toX, toY, minImportance);
 
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NeoForge 1.21.1 生态关系图</title>
+  <title>星图</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -19,7 +19,7 @@
   <div id="context-menu" class="hidden"></div>
   <div id="panel">
     <div class="panel-header">
-      <span class="panel-title">NeoForge 1.21.1 生态关系图</span>
+      <span class="panel-title">星图</span>
       <button id="panel-toggle" title="收起侧边栏">«</button>
     </div>
     <div class="panel-body">
@@ -51,6 +51,13 @@
       </div>
       <div class="export-control">
         <div class="export-label">导出 PNG</div>
+        <div class="lod-control">
+          <div class="lod-header">
+            <span class="lod-label">导出边 LoD 强度</span>
+            <span class="lod-value" id="export-lod-value">0%</span>
+          </div>
+          <input type="range" id="export-lod-slider" min="0" max="100" step="1" value="0">
+        </div>
         <div class="export-row">
           <input type="number" id="export-width" value="65536" min="64" step="64">
           <span class="export-x">×</span>
@@ -62,6 +69,7 @@
         </div>
       </div>
     </div>
+    <div class="panel-meta" id="panel-meta"></div>
     <div class="panel-footer">
       <div>作者：Infinitive</div>
       <div>开源协议：MIT</div>
