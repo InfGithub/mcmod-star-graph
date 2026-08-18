@@ -1,4 +1,4 @@
-const CACHE_NAME = "star-graph-covers-v3";
+const CACHE_NAME = "star-graph-covers-v4";
 const COVER_PREFIX = "/covers/small/";
 const PROXY_PATH = "/cover_proxy";
 const NETWORK_INTERVAL_MS = 150;
@@ -24,9 +24,9 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const request = event.request;
   const url = new URL(request.url);
-  if (request.method !== "GET" || url.origin !== self.location.origin || !(url.pathname.includes(COVER_PREFIX) || url.pathname === PROXY_PATH)) {
-    return;
-  }
+  const isCover = (url.pathname.startsWith("/covers/") && !url.pathname.endsWith(".json")) ||
+    url.pathname === PROXY_PATH;
+  if (request.method !== "GET" || url.origin !== self.location.origin || !isCover) return;
   event.respondWith(cacheFirstCover(request));
 });
 

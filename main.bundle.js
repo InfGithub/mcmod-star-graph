@@ -8115,30 +8115,15 @@ async function loadGraph(source = null) {
   if (!res.ok) throw new Error("\u52A0\u8F7D graph.json \u5931\u8D25: " + res.status);
   return res.json();
 }
-function normalizeCoverUrl(value) {
-  let url = String(value || "").trim();
-  if (url.startsWith("//")) url = "https:" + url;
-  return url;
-}
-function buildServerCoverMap(data, source) {
-  const map = /* @__PURE__ */ new Map();
-  for (const node of data.nodes || []) {
-    if (node.type !== "core") continue;
-    if (node.cover_url) {
-      const url = normalizeCoverUrl(node.cover_url);
-      if (!url) continue;
-      const proxy = `${source.base}/cover_proxy?url=${encodeURIComponent(url)}`;
-      map.set(String(node.key), { thumb: proxy, orig: proxy });
-    } else if (node.cover) {
-      const path = String(node.cover).replace(/^\/+/, "");
-      const local = `${source.base}/${path}`;
-      map.set(String(node.key), { thumb: local, orig: local });
-    }
-  }
-  return map;
-}
 async function detectLocalServer() {
+  const origins = [];
+  if ((location.hostname === "127.0.0.1" || location.hostname === "localhost") && location.origin !== "null") {
+    origins.push(location.origin);
+  }
   for (const base of LOCAL_SERVER_ORIGINS) {
+    if (!origins.includes(base)) origins.push(base);
+  }
+  for (const base of origins) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 900);
     try {
@@ -8161,17 +8146,24 @@ async function detectLocalServer() {
   }
   return null;
 }
-async function loadCoverManifest() {
+async function loadCoverManifest(base = "") {
   const map = /* @__PURE__ */ new Map();
+  const root = String(base || "").replace(/\/$/, "");
+  const smallUrl = root ? `${root}/covers/small-manifest.json` : COVER_SMALL_MANIFEST_URL;
+  const normalUrl = root ? `${root}/covers/manifest.json` : COVER_MANIFEST_URL;
+  const pathFor = (value) => {
+    const path = String(value || "").replace(/^\/+/, "");
+    return root ? `${root}/${path}` : path;
+  };
   let data = null;
   try {
-    const res = await fetch(COVER_SMALL_MANIFEST_URL);
+    const res = await fetch(smallUrl, { cache: "no-store" });
     if (res.ok) data = await res.json();
   } catch (e) {
   }
   if (!data) {
     try {
-      const res = await fetch(COVER_MANIFEST_URL);
+      const res = await fetch(normalUrl, { cache: "no-store" });
       if (res.ok) data = await res.json();
     } catch (e) {
       console.warn("[\u8B66\u544A] \u672A\u627E\u5230\u5C01\u9762\u6E05\u5355\uFF0C\u4F7F\u7528\u7EAF\u8272\u8282\u70B9", e);
@@ -8184,8 +8176,8 @@ async function loadCoverManifest() {
     const k = String(key);
     const it = items[k] || {};
     map.set(k, {
-      thumb: String(it.path || `covers/small/${k}.png`).replace(/^\/+/, ""),
-      orig: String(it.orig || `covers/${k}.jpg`).replace(/^\/+/, "")
+      thumb: pathFor(it.path || `covers/small/${k}.png`),
+      orig: pathFor(it.orig || `covers/${k}.jpg`)
     });
   }
   return map;
@@ -8392,6 +8384,67 @@ async function encodePNG(width, height, getScanlines) {
   parts.push(pngChunk("IEND", new Uint8Array(0)));
   return new Blob(parts, { type: "image/png" });
 }
+var coverDownloadToast = null;
+function updateCoverDownloadProgress(job) {
+  let container = document.getElementById("toast-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "toast-container";
+    container.setAttribute("aria-live", "polite");
+    document.body.appendChild(container);
+  }
+  if (!coverDownloadToast) {
+    coverDownloadToast = document.createElement("div");
+    coverDownloadToast.className = "toast toast-progress toast-success toast-visible";
+    coverDownloadToast.innerHTML = '<div class="toast-progress-text"></div><div class="toast-progress-track"><div class="toast-progress-fill"></div></div>';
+    container.appendChild(coverDownloadToast);
+  }
+  const total = Math.max(1, Number(job.total) || 1);
+  const done = Math.min(total, Number(job.done) || 0);
+  const pct = Math.round(done / total * 100);
+  coverDownloadToast.querySelector(".toast-progress-text").textContent = `\u6B63\u5728\u4E0B\u8F7D\u672C\u5730\u5C01\u9762 ${done} / ${total}\uFF08${pct}%\uFF09`;
+  coverDownloadToast.querySelector(".toast-progress-fill").style.width = `${pct}%`;
+}
+function finishCoverDownloadProgress(message, kind = "success") {
+  if (!coverDownloadToast) return;
+  coverDownloadToast.className = `toast toast-progress toast-${kind} toast-visible`;
+  coverDownloadToast.querySelector(".toast-progress-text").textContent = message;
+  coverDownloadToast.querySelector(".toast-progress-fill").style.width = "100%";
+  const toast = coverDownloadToast;
+  coverDownloadToast = null;
+  setTimeout(() => {
+    toast.classList.remove("toast-visible");
+    setTimeout(() => toast.remove(), 300);
+  }, 1800);
+}
+async function downloadLocalCovers(data, source) {
+  const nodes = (data.nodes || []).filter((node) => node.type === "core" && node.cover_url).map((node) => ({ key: String(node.key), cover_url: node.cover_url }));
+  if (!nodes.length) return { total: 0, done: 0, downloaded: 0, skipped: 0, failed: 0 };
+  const response = await fetch(`${source.base}/cover_download/start`, {
+    method: "POST",
+    mode: "cors",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nodes })
+  });
+  if (!response.ok) throw new Error(`\u542F\u52A8\u5C01\u9762\u4E0B\u8F7D\u5931\u8D25\uFF1A${response.status}`);
+  const started = await response.json();
+  updateCoverDownloadProgress(started);
+  let job = started;
+  while (job.status === "running") {
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const status = await fetch(`${source.base}/cover_download/status?id=${encodeURIComponent(started.id)}`, {
+      mode: "cors",
+      cache: "no-store"
+    });
+    if (!status.ok) throw new Error(`\u8BFB\u53D6\u5C01\u9762\u4E0B\u8F7D\u8FDB\u5EA6\u5931\u8D25\uFF1A${status.status}`);
+    job = await status.json();
+    updateCoverDownloadProgress(job);
+  }
+  if (job.status !== "done") throw new Error("\u672C\u5730\u5C01\u9762\u4E0B\u8F7D\u5931\u8D25");
+  finishCoverDownloadProgress(`\u672C\u5730\u5C01\u9762\u5B8C\u6210\uFF1A${job.downloaded} \u4E0B\u8F7D\uFF0C${job.skipped} \u5DF2\u5B58\u5728\uFF0C${job.failed} \u5931\u8D25`);
+  return job;
+}
 function showToast(message, kind = "warning") {
   let container = document.getElementById("toast-container");
   if (!container) {
@@ -8480,13 +8533,36 @@ function main() {
       setProgress(5, "\u52A0\u8F7D\u672C\u5730\u56FE\u6570\u636E\u2026\u2026", localServer.base + "/graph.json");
       try {
         data = await loadGraph(localServer);
-        coverMap = buildServerCoverMap(data, localServer);
-        if (!coverMap.size) coverMap = await loadCoverManifest();
       } catch (error) {
         showToast("\u672C\u5730 server.py \u6570\u636E\u52A0\u8F7D\u5931\u8D25\uFF0C\u5DF2\u56DE\u9000\u5728\u7EBF\u6570\u636E\u3002", "warning");
         data = await loadGraph();
         setProgress(10, "\u52A0\u8F7D\u9759\u6001\u5C01\u9762\u6E05\u5355\u2026\u2026", "covers/manifest.json");
         coverMap = await loadCoverManifest();
+      }
+      if (!coverMap) {
+        const existingLocalCovers = await loadCoverManifest(localServer.base);
+        const shouldDownload = window.confirm(
+          `\u5DF2\u8FDE\u63A5\u672C\u5730 server.py\u3002
+\u662F\u5426\u4E0B\u8F7D/\u8865\u5168\u5C01\u9762\u5230 server.py \u540C\u76EE\u5F55\u7684 covers \u6587\u4EF6\u5939\uFF1F
+
+\u5DF2\u6709 ${existingLocalCovers.size} \u5F20\u672C\u5730\u5C01\u9762\u3002`
+        );
+        if (shouldDownload) {
+          try {
+            await downloadLocalCovers(data, localServer);
+            coverMap = await loadCoverManifest(localServer.base);
+          } catch (error) {
+            finishCoverDownloadProgress("\u672C\u5730\u5C01\u9762\u4E0B\u8F7D\u5931\u8D25\uFF0C\u7EE7\u7EED\u52A0\u8F7D\u56FE\u6570\u636E\u3002", "warning");
+            showToast("\u672C\u5730\u5C01\u9762\u4E0B\u8F7D\u5931\u8D25\uFF0C\u7EE7\u7EED\u52A0\u8F7D\u56FE\u6570\u636E\u3002", "warning");
+            coverMap = existingLocalCovers;
+          }
+        } else {
+          coverMap = existingLocalCovers;
+          showToast(
+            coverMap.size ? "\u5DF2\u8DF3\u8FC7\u4E0B\u8F7D\uFF0C\u4F7F\u7528\u5DF2\u6709\u672C\u5730\u5C01\u9762\u3002" : "\u5DF2\u8DF3\u8FC7\u4E0B\u8F7D\uFF0C\u672C\u5730\u6CA1\u6709\u5C01\u9762\uFF0C\u7EE7\u7EED\u52A0\u8F7D\u56FE\u6570\u636E\u3002",
+            coverMap.size ? "success" : "warning"
+          );
+        }
       }
     } else {
       showToast("\u672A\u8FDE\u63A5\u672C\u5730 server.py\uFF0C\u4F7F\u7528\u5728\u7EBF\u9759\u6001\u6570\u636E\u3002", "warning");

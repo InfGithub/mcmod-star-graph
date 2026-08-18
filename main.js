@@ -3,7 +3,7 @@
  *
  * 基于 sigma.js v3 + graphology，数据来自 graph.json（GitHub Releases 分发）。
  * 封面由 CI 从 MC 百科预生成到 covers/，随站点静态发布；纯前端运行，
- * 不依赖 python 后端（无需 /cover_proxy / IndexedDB）。
+ * 可独立运行；检测到本地 server.py 时支持本地图数据与本地封面下载。
  *
  * 构建：npm run build（esbuild → main.bundle.js），需先 npm install。
  * 运行：任意静态服务器（python -m http.server 1119 / GitHub Pages）。
@@ -179,26 +179,15 @@ function normalizeCoverUrl(value) {
   return url;
 }
 
-function buildServerCoverMap(data, source) {
-  const map = new Map();
-  for (const node of data.nodes || []) {
-    if (node.type !== "core") continue;
-    if (node.cover_url) {
-      const url = normalizeCoverUrl(node.cover_url);
-      if (!url) continue;
-      const proxy = `${source.base}/cover_proxy?url=${encodeURIComponent(url)}`;
-      map.set(String(node.key), { thumb: proxy, orig: proxy });
-    } else if (node.cover) {
-      const path = String(node.cover).replace(/^\/+/, "");
-      const local = `${source.base}/${path}`;
-      map.set(String(node.key), { thumb: local, orig: local });
-    }
-  }
-  return map;
-}
-
 async function detectLocalServer() {
+  const origins = [];
+  if ((location.hostname === "127.0.0.1" || location.hostname === "localhost") && location.origin !== "null") {
+    origins.push(location.origin);
+  }
   for (const base of LOCAL_SERVER_ORIGINS) {
+    if (!origins.includes(base)) origins.push(base);
+  }
+  for (const base of origins) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 900);
     try {
@@ -229,16 +218,23 @@ async function detectLocalServer() {
 // 以清单索引，随站点静态发布（浏览器 HTTP 缓存）。
 // 图上统一使用缩略图（WebGL 纹理内存约 1/16），导出大图用原图。
 // 清单缺失时回退为纯色节点。
-async function loadCoverManifest() {
+async function loadCoverManifest(base = "") {
   const map = new Map();
+  const root = String(base || "").replace(/\/$/, "");
+  const smallUrl = root ? `${root}/covers/small-manifest.json` : COVER_SMALL_MANIFEST_URL;
+  const normalUrl = root ? `${root}/covers/manifest.json` : COVER_MANIFEST_URL;
+  const pathFor = (value) => {
+    const path = String(value || "").replace(/^\/+/, "");
+    return root ? `${root}/${path}` : path;
+  };
   let data = null;
   try {
-    const res = await fetch(COVER_SMALL_MANIFEST_URL);
+    const res = await fetch(smallUrl, { cache: "no-store" });
     if (res.ok) data = await res.json();
   } catch (e) { /* 回退到普通清单 */ }
   if (!data) {
     try {
-      const res = await fetch(COVER_MANIFEST_URL);
+      const res = await fetch(normalUrl, { cache: "no-store" });
       if (res.ok) data = await res.json();
     } catch (e) {
       console.warn("[警告] 未找到封面清单，使用纯色节点", e);
@@ -251,8 +247,8 @@ async function loadCoverManifest() {
     const k = String(key);
     const it = items[k] || {};
     map.set(k, {
-      thumb: String(it.path || `covers/small/${k}.png`).replace(/^\/+/, ""),
-      orig: String(it.orig || `covers/${k}.jpg`).replace(/^\/+/, ""),
+      thumb: pathFor(it.path || `covers/small/${k}.png`),
+      orig: pathFor(it.orig || `covers/${k}.jpg`),
     });
   }
   return map;
@@ -503,6 +499,76 @@ async function encodePNG(width, height, getScanlines) {
   return new Blob(parts, { type: "image/png" });
 }
 
+let coverDownloadToast = null;
+
+function updateCoverDownloadProgress(job) {
+  let container = document.getElementById("toast-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "toast-container";
+    container.setAttribute("aria-live", "polite");
+    document.body.appendChild(container);
+  }
+  if (!coverDownloadToast) {
+    coverDownloadToast = document.createElement("div");
+    coverDownloadToast.className = "toast toast-progress toast-success toast-visible";
+    coverDownloadToast.innerHTML = '<div class="toast-progress-text"></div><div class="toast-progress-track"><div class="toast-progress-fill"></div></div>';
+    container.appendChild(coverDownloadToast);
+  }
+  const total = Math.max(1, Number(job.total) || 1);
+  const done = Math.min(total, Number(job.done) || 0);
+  const pct = Math.round((done / total) * 100);
+  coverDownloadToast.querySelector(".toast-progress-text").textContent =
+    `正在下载本地封面 ${done} / ${total}（${pct}%）`;
+  coverDownloadToast.querySelector(".toast-progress-fill").style.width = `${pct}%`;
+}
+
+function finishCoverDownloadProgress(message, kind = "success") {
+  if (!coverDownloadToast) return;
+  coverDownloadToast.className = `toast toast-progress toast-${kind} toast-visible`;
+  coverDownloadToast.querySelector(".toast-progress-text").textContent = message;
+  coverDownloadToast.querySelector(".toast-progress-fill").style.width = "100%";
+  const toast = coverDownloadToast;
+  coverDownloadToast = null;
+  setTimeout(() => {
+    toast.classList.remove("toast-visible");
+    setTimeout(() => toast.remove(), 300);
+  }, 1800);
+}
+
+async function downloadLocalCovers(data, source) {
+  const nodes = (data.nodes || [])
+    .filter((node) => node.type === "core" && node.cover_url)
+    .map((node) => ({ key: String(node.key), cover_url: node.cover_url }));
+  if (!nodes.length) return { total: 0, done: 0, downloaded: 0, skipped: 0, failed: 0 };
+
+  const response = await fetch(`${source.base}/cover_download/start`, {
+    method: "POST",
+    mode: "cors",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nodes }),
+  });
+  if (!response.ok) throw new Error(`启动封面下载失败：${response.status}`);
+  const started = await response.json();
+  updateCoverDownloadProgress(started);
+
+  let job = started;
+  while (job.status === "running") {
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const status = await fetch(`${source.base}/cover_download/status?id=${encodeURIComponent(started.id)}`, {
+      mode: "cors",
+      cache: "no-store",
+    });
+    if (!status.ok) throw new Error(`读取封面下载进度失败：${status.status}`);
+    job = await status.json();
+    updateCoverDownloadProgress(job);
+  }
+  if (job.status !== "done") throw new Error("本地封面下载失败");
+  finishCoverDownloadProgress(`本地封面完成：${job.downloaded} 下载，${job.skipped} 已存在，${job.failed} 失败`);
+  return job;
+}
+
 function showToast(message, kind = "warning") {
   let container = document.getElementById("toast-container");
   if (!container) {
@@ -597,13 +663,35 @@ function main() {
       setProgress(5, "加载本地图数据……", localServer.base + "/graph.json");
       try {
         data = await loadGraph(localServer);
-        coverMap = buildServerCoverMap(data, localServer);
-        if (!coverMap.size) coverMap = await loadCoverManifest();
       } catch (error) {
         showToast("本地 server.py 数据加载失败，已回退在线数据。", "warning");
         data = await loadGraph();
         setProgress(10, "加载静态封面清单……", "covers/manifest.json");
         coverMap = await loadCoverManifest();
+      }
+      if (!coverMap) {
+        const existingLocalCovers = await loadCoverManifest(localServer.base);
+        const shouldDownload = window.confirm(
+          `已连接本地 server.py。\n是否下载/补全封面到 server.py 同目录的 covers 文件夹？\n\n已有 ${existingLocalCovers.size} 张本地封面。`,
+        );
+        if (shouldDownload) {
+          try {
+            await downloadLocalCovers(data, localServer);
+            coverMap = await loadCoverManifest(localServer.base);
+          } catch (error) {
+            finishCoverDownloadProgress("本地封面下载失败，继续加载图数据。", "warning");
+            showToast("本地封面下载失败，继续加载图数据。", "warning");
+            coverMap = existingLocalCovers;
+          }
+        } else {
+          coverMap = existingLocalCovers;
+          showToast(
+            coverMap.size
+              ? "已跳过下载，使用已有本地封面。"
+              : "已跳过下载，本地没有封面，继续加载图数据。",
+            coverMap.size ? "success" : "warning",
+          );
+        }
       }
     } else {
       showToast("未连接本地 server.py，使用在线静态数据。", "warning");

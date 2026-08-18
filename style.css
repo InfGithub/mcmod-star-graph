@@ -810,3 +810,27 @@ html, body {
 .toast-success {
   border-color: rgba(63, 185, 80, 0.55);
 }
+
+.toast-progress {
+  min-width: min(320px, calc(100vw - 36px));
+}
+
+.toast-progress-text {
+  margin-bottom: 7px;
+}
+
+.toast-progress-track {
+  width: 100%;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.toast-progress-fill {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: #3fb950;
+  transition: width 0.2s ease;
+}

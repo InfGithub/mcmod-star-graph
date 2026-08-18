@@ -29,6 +29,11 @@ import json
 import os
 import re
 import sys
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,6 +44,8 @@ DEFAULT_PORT = 1119
 PROXY_PATH = "/cover_proxy"
 CLEAN_PATH = "/clean"
 HEALTH_PATH = "/health"
+DOWNLOAD_START_PATH = "/cover_download/start"
+DOWNLOAD_STATUS_PATH = "/cover_download/status"
 # 前端固定请求的图数据文件名；--data 参数可把其他文件映射到这个名字
 DATA_ALIAS = "graph.json"
 # SSRF 防护：只允许转发 mcmod 封面域名（老封面在 www.mcmod.cn/pages/class/images/cover/）
@@ -46,17 +53,89 @@ ALLOWED_HOSTS = {"i.mcmod.cn", "www.mcmod.cn"}
 # 封面边长（正方形）：对应 CDN 的 @NxN.jpg 缩略图后缀，下载时统一构造
 COVER_SIZE = 300
 REQUEST_TIMEOUT = 15
+ROOT_DIR = Path(__file__).resolve().parent
+COVERS_DIR = ROOT_DIR / "covers"
 
 # clean 模式：一次性标志，下次页面加载时前端清空封面缓存
 _CLEAN_CACHE = False
 # --data 指定的图数据文件（以 DATA_ALIAS 名字服务），None 时直接服务根目录同名文件
 _DATA_FILE = None
+_DOWNLOAD_JOBS = {}
+_DOWNLOAD_LOCK = threading.Lock()
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
 )
 # 伪装 Referer：CDN 只放行 mcmod.cn 域名的 Referer（裸请求也放行，伪装双保险）
 REFERER = "https://www.mcmod.cn/"
+
+
+def _normalize_cover_url(value):
+    url = str(value or "").strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    return re.sub(r"@\d+x\d+\.jpg$", f"@{COVER_SIZE}x{COVER_SIZE}.jpg", url)
+
+
+def _download_cover_one(item):
+    key = str(item["key"])
+    url = _normalize_cover_url(item.get("cover_url"))
+    if not re.fullmatch(r"\d+", key) or not Handler._is_allowed(url):
+        return key, "failed"
+    COVERS_DIR.mkdir(parents=True, exist_ok=True)
+    target = COVERS_DIR / f"{key}.jpg"
+    if target.exists() and target.stat().st_size > 0:
+        return key, "skipped"
+    temp = COVERS_DIR / f".{key}.{uuid.uuid4().hex}.tmp"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Referer": REFERER})
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            data = resp.read()
+        if len(data) < 100:
+            return key, "failed"
+        temp.write_bytes(data)
+        temp.replace(target)
+        return key, "downloaded"
+    except Exception:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return key, "failed"
+
+
+def _run_cover_download(job_id, nodes):
+    with _DOWNLOAD_LOCK:
+        job = _DOWNLOAD_JOBS[job_id]
+    def done(result):
+        key, status = result
+        with _DOWNLOAD_LOCK:
+            job["done"] += 1
+            job[status] += 1
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for result in pool.map(_download_cover_one, nodes):
+            done(result)
+
+    items = {}
+    for item in nodes:
+        key = str(item["key"])
+        target = COVERS_DIR / f"{key}.jpg"
+        if target.exists() and target.stat().st_size > 0:
+            items[key] = {"path": f"covers/{key}.jpg", "orig": f"covers/{key}.jpg", "bytes": target.stat().st_size}
+    manifest = {
+        "schema": 1,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "total": len(items),
+        "keys": sorted(items, key=lambda value: int(value)),
+        "items": items,
+    }
+    COVERS_DIR.mkdir(parents=True, exist_ok=True)
+    temp_manifest = COVERS_DIR / f".manifest.{uuid.uuid4().hex}.tmp"
+    temp_manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_manifest.replace(COVERS_DIR / "manifest.json")
+    with _DOWNLOAD_LOCK:
+        job["status"] = "done"
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -73,6 +152,13 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(204)
         self.end_headers()
 
+    def do_POST(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == DOWNLOAD_START_PATH:
+            self._handle_download_start()
+        else:
+            self.send_error(404)
+
     def do_GET(self):
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path == HEALTH_PATH:
@@ -81,10 +167,60 @@ class Handler(SimpleHTTPRequestHandler):
             self._handle_proxy(parsed)
         elif parsed.path == CLEAN_PATH:
             self._handle_clean()
+        elif parsed.path == DOWNLOAD_STATUS_PATH:
+            self._handle_download_status(parsed)
         elif _DATA_FILE and parsed.path == "/" + DATA_ALIAS:
             self._handle_data()
         else:
             super().do_GET()
+
+    def _send_json(self, status, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_download_start(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 20 * 1024 * 1024:
+                raise ValueError("invalid request size")
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            raw_nodes = payload.get("nodes", [])
+            nodes = []
+            seen = set()
+            for item in raw_nodes:
+                key = str(item.get("key", ""))
+                if key in seen or not re.fullmatch(r"\d+", key):
+                    continue
+                if not item.get("cover_url"):
+                    continue
+                seen.add(key)
+                nodes.append({"key": key, "cover_url": item.get("cover_url")})
+            if not nodes:
+                self._send_json(400, {"error": "no cover nodes"})
+                return
+            job_id = uuid.uuid4().hex
+            job = {"id": job_id, "status": "running", "total": len(nodes), "done": 0, "downloaded": 0, "skipped": 0, "failed": 0}
+            with _DOWNLOAD_LOCK:
+                _DOWNLOAD_JOBS[job_id] = job
+            threading.Thread(target=_run_cover_download, args=(job_id, nodes), daemon=True).start()
+            self._send_json(202, job)
+        except Exception as error:
+            self._send_json(400, {"error": str(error)})
+
+    def _handle_download_status(self, parsed):
+        query = urllib.parse.parse_qs(parsed.query)
+        job_id = query.get("id", [""])[0]
+        with _DOWNLOAD_LOCK:
+            job = dict(_DOWNLOAD_JOBS.get(job_id, {}))
+        if not job:
+            self._send_json(404, {"error": "job not found"})
+            return
+        self._send_json(200, job)
 
     def _handle_health(self):
         body = json.dumps({"ok": True, "service": "star-graph-server"}).encode("utf-8")
