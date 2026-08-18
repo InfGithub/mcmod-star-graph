@@ -118,7 +118,7 @@ const HIGHLIGHT_EDGE_RGB = [255, 215, 0]; // 六度分隔路径高亮色（边�
 const HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1.0);
 
 // 封面：CI 预生成到 covers/ 并以清单分发（纯前端静态加载，浏览器 HTTP 缓存）。
-// 展示用 96px 缩略图（covers/small/）供视口懒加载，原图保留供导出。
+// 展示用 96px 缩略图（covers/small/）用于图上渲染，原图保留供导出。
 const COVER_MANIFEST_URL = "covers/manifest.json";
 const COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
 
@@ -168,12 +168,12 @@ async function loadGraph() {
   return res.json();
 }
 
-// ==================== 封面：CI 预生成 + 静态加载 + 视口懒加载 ====================
+// ==================== 封面：CI 预生成 + 静态加载 ====================
 //
 // 纯前端运行：封面由 CI 下载到 covers/（原图）并生成 covers/small/ 缩略图，
 // 以清单索引，随站点静态发布（浏览器 HTTP 缓存）。
-// 渲染只用缩略图（WebGL 纹理内存约 1/16），且只在节点进入视口时才建纹理；
-// 导出大图用原图。清单缺失时回退为纯色节点。
+// 图上统一使用缩略图（WebGL 纹理内存约 1/16），导出大图用原图。
+// 清单缺失时回退为纯色节点。
 async function loadCoverManifest() {
   const map = new Map();
   let data = null;
@@ -227,10 +227,10 @@ function buildGraph(data, coverMap) {
       name_en: n.name_en,
       description: n.description,
       kind: n.type,
-      // 懒加载：初始一律画圆，进入视口后才由 coverVisibility 置为 image
-      type: "circle",
-      image: null,
-      thumb: cover ? cover.thumb : null, // 展示用缩略图（96px，纹理内存小）
+      // 所有有封面的节点直接使用 image；不再做视口懒加载。
+      type: cover ? "image" : "circle",
+      image: cover ? cover.thumb : null,
+      thumb: cover ? cover.thumb : null,
       imageSrc: cover ? cover.orig : null, // 原图（导出大图用）
       views: n.views,
       favorites: n.favorites,
@@ -543,69 +543,6 @@ function main() {
 
     const cam = renderer.getCamera();
 
-    // ===== 封面视口懒加载 =====
-    // 只有进入视口（含余量）且屏幕半径达标的节点才持有 image 纹理（96px 缩略图），
-    // 其余节点画纯色圆；纹理内存只随可见节点数走，与总封面数无关。
-    // 默认视图 sigma 归一化后全图都在视口内、节点普遍过小，若不处理首屏几乎全是
-    // 纯色圆——因此给影响力最大的节点做“头部预载”，首屏即可见封面。
-    let coverVisibleKeys = new Set();
-    let coverDirty = false;
-    const COVER_MARGIN = 240;
-    const COVER_MIN_SCREEN_RADIUS = 6; // 屏幕半径小于该值不加载封面（远距/全览）
-    const COVER_PRELOAD_TOP = 400; // 枢纽节点（按被依赖数）无条件预载封面
-
-    // 启动时按 in_degree 取头部节点（预载集合固定不变）
-    const preloadKeys = new Set(
-      graph.nodes()
-        .map((key) => [key, graph.getNodeAttribute(key, "in_degree") || 0])
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, COVER_PRELOAD_TOP)
-        .map(([key]) => key),
-    );
-
-    function computeCoverVisibility() {
-      const st = cam.getState();
-      if (!st) return;
-      const w = container.clientWidth;
-      const h = container.clientHeight;
-      const next = new Set(preloadKeys); // 头部节点无条件在列
-      graph.forEachNode((key, attrs) => {
-        if (preloadKeys.has(key) || !attrs.thumb) return;
-        // 屏幕尺寸不足的节点（全览/远距）不建封面纹理
-        if (attrs.size * st.ratio < COVER_MIN_SCREEN_RADIUS) return;
-        const p = renderer.graphToViewport({ x: attrs.x, y: attrs.y });
-        if (p.x >= -COVER_MARGIN && p.x <= w + COVER_MARGIN &&
-            p.y >= -COVER_MARGIN && p.y <= h + COVER_MARGIN) {
-          next.add(key);
-        }
-      });
-      let changed = next.size !== coverVisibleKeys.size;
-      if (!changed) {
-        for (const k of next) {
-          if (!coverVisibleKeys.has(k)) { changed = true; break; }
-        }
-      }
-      if (changed) {
-        coverVisibleKeys = next;
-        coverDirty = true;
-      }
-    }
-
-    function applyCoverVisibility() {
-      if (!coverDirty || !graph) return;
-      coverDirty = false;
-      graph.updateEachNodeAttributes(
-        (key, attrs) => {
-          // 整体替换语义：必须返回完整属性对象
-          if (!attrs.thumb) return attrs;
-          const on = coverVisibleKeys.has(key);
-          return { ...attrs, image: on ? attrs.thumb : null, type: on ? "image" : "circle" };
-        },
-        { attributes: ["image", "type"] },
-      );
-      renderer.refresh();
-    }
-
     let lodLastRun = 0;
     cam.on("updated", () => {
       const now = performance.now();
@@ -616,8 +553,6 @@ function main() {
         nodeVisibleCount = computeVisibleNodeCount(state.ratio, nodeLodStrength);
         updateCulling(state);
         startFade();
-        computeCoverVisibility();
-        applyCoverVisibility();
       };
       if (lodTimer) clearTimeout(lodTimer);
       const elapsed = now - lodLastRun;
@@ -631,9 +566,6 @@ function main() {
     nodeVisibleCount = computeVisibleNodeCount(cam.getState().ratio, nodeLodStrength);
     updateCulling(cam.getState());
 
-    // 首次渲染前先按当前视口建立封面可见集，再刷新（避免首帧全量建纹理）
-    computeCoverVisibility();
-    applyCoverVisibility();
     renderer.refresh();
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     await new Promise((r) => setTimeout(r, 700));

@@ -8161,11 +8161,10 @@ function buildGraph(data, coverMap) {
       name_en: n.name_en,
       description: n.description,
       kind: n.type,
-      // 懒加载：初始一律画圆，进入视口后才由 coverVisibility 置为 image
-      type: "circle",
-      image: null,
+      // 所有有封面的节点直接使用 image；不再做视口懒加载。
+      type: cover ? "image" : "circle",
+      image: cover ? cover.thumb : null,
       thumb: cover ? cover.thumb : null,
-      // 展示用缩略图（96px，纹理内存小）
       imageSrc: cover ? cover.orig : null,
       // 原图（导出大图用）
       views: n.views,
@@ -8441,55 +8440,6 @@ function main() {
       return attr;
     });
     const cam = renderer.getCamera();
-    let coverVisibleKeys = /* @__PURE__ */ new Set();
-    let coverDirty = false;
-    const COVER_MARGIN = 240;
-    const COVER_MIN_SCREEN_RADIUS = 6;
-    const COVER_PRELOAD_TOP = 400;
-    const preloadKeys = new Set(
-      graph.nodes().map((key) => [key, graph.getNodeAttribute(key, "in_degree") || 0]).sort((a, b) => b[1] - a[1]).slice(0, COVER_PRELOAD_TOP).map(([key]) => key)
-    );
-    function computeCoverVisibility() {
-      const st = cam.getState();
-      if (!st) return;
-      const w = container.clientWidth;
-      const h = container.clientHeight;
-      const next = new Set(preloadKeys);
-      graph.forEachNode((key, attrs) => {
-        if (preloadKeys.has(key) || !attrs.thumb) return;
-        if (attrs.size * st.ratio < COVER_MIN_SCREEN_RADIUS) return;
-        const p = renderer.graphToViewport({ x: attrs.x, y: attrs.y });
-        if (p.x >= -COVER_MARGIN && p.x <= w + COVER_MARGIN && p.y >= -COVER_MARGIN && p.y <= h + COVER_MARGIN) {
-          next.add(key);
-        }
-      });
-      let changed = next.size !== coverVisibleKeys.size;
-      if (!changed) {
-        for (const k of next) {
-          if (!coverVisibleKeys.has(k)) {
-            changed = true;
-            break;
-          }
-        }
-      }
-      if (changed) {
-        coverVisibleKeys = next;
-        coverDirty = true;
-      }
-    }
-    function applyCoverVisibility() {
-      if (!coverDirty || !graph) return;
-      coverDirty = false;
-      graph.updateEachNodeAttributes(
-        (key, attrs) => {
-          if (!attrs.thumb) return attrs;
-          const on = coverVisibleKeys.has(key);
-          return { ...attrs, image: on ? attrs.thumb : null, type: on ? "image" : "circle" };
-        },
-        { attributes: ["image", "type"] }
-      );
-      renderer.refresh();
-    }
     let lodLastRun = 0;
     cam.on("updated", () => {
       const now = performance.now();
@@ -8500,8 +8450,6 @@ function main() {
         nodeVisibleCount = computeVisibleNodeCount(state.ratio, nodeLodStrength);
         updateCulling(state);
         startFade();
-        computeCoverVisibility();
-        applyCoverVisibility();
       };
       if (lodTimer) clearTimeout(lodTimer);
       const elapsed = now - lodLastRun;
@@ -8514,8 +8462,6 @@ function main() {
     lodThresholdValue = computeLodThreshold(cam.getState().ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
     nodeVisibleCount = computeVisibleNodeCount(cam.getState().ratio, nodeLodStrength);
     updateCulling(cam.getState());
-    computeCoverVisibility();
-    applyCoverVisibility();
     renderer.refresh();
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     await new Promise((r) => setTimeout(r, 700));
