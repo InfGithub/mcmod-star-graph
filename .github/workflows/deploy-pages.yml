@@ -4,8 +4,8 @@ on:
   push:
     branches: [main]
   schedule:
-    # 每周从上游 Releases 拉最新数据包并复查封面，数据更新无需本仓库改动
-    - cron: "30 2 * * 0"
+    # 每三天（每月 1/4/7/…/28 日 02:30）合并全部数据包并增量检查封面
+    - cron: "30 2 */3 * *"
   workflow_dispatch:
     inputs:
       cover_limit:
@@ -13,11 +13,6 @@ on:
         required: false
         default: "0"
         type: string
-      refresh_covers:
-        description: "强制复查所有封面"
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -35,42 +30,58 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 仓库只做渲染，图数据从上游 InfGithub/mcmod-star-graph 的 Releases 抓取，
-      # 不依赖仓库内文件（浏览器无法跨域 fetch release 资产，故抓取在构建期完成）。
-      - name: Fetch latest graph data from upstream releases
-        id: fetch-data
+      # 仓库只做渲染：图数据来自上游 Releases 的并集（旧+新），合并与下载都在
+      # 构建期完成（浏览器无法跨域 fetch release 资产，release 域名无 CORS 头）。
+      - name: Compute release set key
+        id: release-set
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          API="repos/InfGithub/mcmod-star-graph/releases/latest"
-          tag="$(gh api "$API" --jq '.tag_name')"
-          asset="$(gh api "$API" --jq '[.assets[] | select(.name | startswith("graph-") and endswith(".json")) | .name][0] // ""')"
-          if [ -z "$asset" ]; then
-            echo "::error::上游最新 release 没有 graph-*.json 资产 (tag=$tag)"
-            exit 1
-          fi
-          curl -fL --retry 3 -o graph.json \
-            "https://github.com/InfGithub/mcmod-star-graph/releases/download/${tag}/${asset}"
-          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
-          echo "fetched $asset (tag $tag)"
+          names="$(gh api repos/InfGithub/mcmod-star-graph/releases?per_page=100 \
+            --jq '[.[] | .assets[] | select(.name | startswith("graph-") and endswith(".json")) | .name] | sort | join(",")')"
+          key="$(printf '%s' "$names" | sha256sum | cut -c1-16)"
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+          echo "releases=${names}"
+
+      - name: Restore release asset cache
+        id: release-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: release-cache
+          key: release-cache-${{ steps.release-set.outputs.key }}-${{ github.sha }}
+          restore-keys: |
+            release-cache-${{ steps.release-set.outputs.key }}-
+
+      - name: Merge all release graphs (old + new)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/merge-release-graphs.mjs
+
+      - name: Save release asset cache
+        if: steps.release-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: release-cache
+          key: release-cache-${{ steps.release-set.outputs.key }}-${{ github.sha }}
 
       - name: Restore static cover cache
         id: cover-cache
         uses: actions/cache/restore@v4
         with:
           path: covers
-          key: covers-v3-${{ steps.fetch-data.outputs.asset }}-${{ inputs.cover_limit || '0' }}-${{ (github.event_name == 'schedule' || inputs.refresh_covers) && github.run_id || github.sha }}
+          # 覆盖缓存与数据版本解耦：旧图长期驻留，仅 URL 变化的图才重下
+          key: covers-v3-${{ inputs.cover_limit || '0' }}-${{ github.sha }}
           restore-keys: |
-            covers-v3-${{ steps.fetch-data.outputs.asset }}-${{ inputs.cover_limit || '0' }}-
+            covers-v3-${{ inputs.cover_limit || '0' }}-
             covers-v3-
 
       # 封面由 CI 下载到 covers/（MC 百科防盗链只认服务端 Referer，浏览器直连会被
-      # 403，因此下载发生在构建期）；与数据包版本一致的缓存直接复用。
+      # 403，因此下载发生在构建期）。规则：封面 URL 不变且文件已缓存 → 全部复用，
+      # 零访问 mcmod；只有新增 key 或 URL 变化的图才增量下载；不再需要的旧图自动清理。
       - name: Pre-generate cover assets (diff only)
         env:
           COVER_LIMIT: ${{ inputs.cover_limit || '0' }}
-          COVER_REFRESH_ALL: ${{ github.event_name == 'schedule' || inputs.refresh_covers }}
           COVER_CONCURRENCY: 12
           COVER_RETRIES: 2
         run: node scripts/prepare-covers.mjs
@@ -81,7 +92,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: covers
-          key: covers-v3-${{ steps.fetch-data.outputs.asset }}-${{ inputs.cover_limit || '0' }}-${{ (github.event_name == 'schedule' || inputs.refresh_covers) && github.run_id || github.sha }}
+          key: covers-v3-${{ inputs.cover_limit || '0' }}-${{ github.sha }}
 
       - name: Assemble static artifact
         run: |

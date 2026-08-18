@@ -12,10 +12,11 @@ main.bundle.js.map
 graph.json
 release/
 
-# CI 生成的封面（scripts/prepare-covers.mjs 产出，随站点发布不入库）
+# CI 生成的封面与合并缓存（release 资产缓存、封面、dist 均随站点发布不入库）
 /covers/
+/release-cache/
+/dist
 
 # 私有工具（构建脚本与发布工具，不入库）
 build_graph.py
 pack_release.py
-/dist
