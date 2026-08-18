@@ -179,6 +179,40 @@ function normalizeCoverUrl(value) {
   return url;
 }
 
+async function loadExistingLocalCovers(source) {
+  try {
+    const res = await fetch(`${source.base}/cover_download/existing`, { mode: "cors", cache: "no-store" });
+    if (!res.ok) throw new Error(`existing covers: ${res.status}`);
+    const data = await res.json();
+    const keys = Array.isArray(data.keys) ? data.keys.map(String) : [];
+    const map = new Map(keys.map((key) => [key, {
+      thumb: `${source.base}/covers/${key}.jpg`,
+      orig: `${source.base}/covers/${key}.jpg`,
+    }]));
+    return { count: keys.length, keys, map };
+  } catch {
+    const map = await loadCoverManifest(source.base);
+    return { count: map.size, keys: [...map.keys()], map };
+  }
+}
+
+function buildLocalCoverMap(data, source, existingKeys = new Set()) {
+  const map = new Map();
+  for (const node of data.nodes || []) {
+    if (node.type !== "core" || !node.cover_url) continue;
+    const key = String(node.key);
+    if (existingKeys.has(key)) {
+      const local = `${source.base}/covers/${key}.jpg`;
+      map.set(key, { thumb: local, orig: local });
+      continue;
+    }
+    const url = normalizeCoverUrl(node.cover_url);
+    const proxy = `${source.base}/cover_proxy?key=${encodeURIComponent(key)}&url=${encodeURIComponent(url)}`;
+    map.set(key, { thumb: proxy, orig: proxy });
+  }
+  return map;
+}
+
 async function detectLocalServer() {
   const origins = [];
   if ((location.hostname === "127.0.0.1" || location.hostname === "localhost") && location.origin !== "null") {
@@ -277,8 +311,10 @@ function runCoverNetworkTask(task) {
 
 function loadCoverImageSource(source) {
   const url = new URL(source, document.baseURI).href;
+  const parsed = new URL(url, document.baseURI);
+  const isLocalProxy = parsed.pathname === "/cover_proxy";
   const controlled = !!navigator.serviceWorker?.controller &&
-    new URL(url, document.baseURI).origin === location.origin;
+    parsed.origin === location.origin && !isLocalProxy;
 
   return (async () => {
     if (!controlled) {
@@ -499,76 +535,6 @@ async function encodePNG(width, height, getScanlines) {
   return new Blob(parts, { type: "image/png" });
 }
 
-let coverDownloadToast = null;
-
-function updateCoverDownloadProgress(job) {
-  let container = document.getElementById("toast-container");
-  if (!container) {
-    container = document.createElement("div");
-    container.id = "toast-container";
-    container.setAttribute("aria-live", "polite");
-    document.body.appendChild(container);
-  }
-  if (!coverDownloadToast) {
-    coverDownloadToast = document.createElement("div");
-    coverDownloadToast.className = "toast toast-progress toast-success toast-visible";
-    coverDownloadToast.innerHTML = '<div class="toast-progress-text"></div><div class="toast-progress-track"><div class="toast-progress-fill"></div></div>';
-    container.appendChild(coverDownloadToast);
-  }
-  const total = Math.max(1, Number(job.total) || 1);
-  const done = Math.min(total, Number(job.done) || 0);
-  const pct = Math.round((done / total) * 100);
-  coverDownloadToast.querySelector(".toast-progress-text").textContent =
-    `正在下载本地封面 ${done} / ${total}（${pct}%）`;
-  coverDownloadToast.querySelector(".toast-progress-fill").style.width = `${pct}%`;
-}
-
-function finishCoverDownloadProgress(message, kind = "success") {
-  if (!coverDownloadToast) return;
-  coverDownloadToast.className = `toast toast-progress toast-${kind} toast-visible`;
-  coverDownloadToast.querySelector(".toast-progress-text").textContent = message;
-  coverDownloadToast.querySelector(".toast-progress-fill").style.width = "100%";
-  const toast = coverDownloadToast;
-  coverDownloadToast = null;
-  setTimeout(() => {
-    toast.classList.remove("toast-visible");
-    setTimeout(() => toast.remove(), 300);
-  }, 1800);
-}
-
-async function downloadLocalCovers(data, source) {
-  const nodes = (data.nodes || [])
-    .filter((node) => node.type === "core" && node.cover_url)
-    .map((node) => ({ key: String(node.key), cover_url: node.cover_url }));
-  if (!nodes.length) return { total: 0, done: 0, downloaded: 0, skipped: 0, failed: 0 };
-
-  const response = await fetch(`${source.base}/cover_download/start`, {
-    method: "POST",
-    mode: "cors",
-    cache: "no-store",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ nodes }),
-  });
-  if (!response.ok) throw new Error(`启动封面下载失败：${response.status}`);
-  const started = await response.json();
-  updateCoverDownloadProgress(started);
-
-  let job = started;
-  while (job.status === "running") {
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    const status = await fetch(`${source.base}/cover_download/status?id=${encodeURIComponent(started.id)}`, {
-      mode: "cors",
-      cache: "no-store",
-    });
-    if (!status.ok) throw new Error(`读取封面下载进度失败：${status.status}`);
-    job = await status.json();
-    updateCoverDownloadProgress(job);
-  }
-  if (job.status !== "done") throw new Error("本地封面下载失败");
-  finishCoverDownloadProgress(`本地封面完成：${job.downloaded} 下载，${job.skipped} 已存在，${job.failed} 失败`);
-  return job;
-}
-
 function showToast(message, kind = "warning") {
   let container = document.getElementById("toast-container");
   if (!container) {
@@ -670,28 +636,8 @@ function main() {
         coverMap = await loadCoverManifest();
       }
       if (!coverMap) {
-        const existingLocalCovers = await loadCoverManifest(localServer.base);
-        const shouldDownload = window.confirm(
-          `已连接本地 server.py。\n是否下载/补全封面到 server.py 同目录的 covers 文件夹？\n\n已有 ${existingLocalCovers.size} 张本地封面。`,
-        );
-        if (shouldDownload) {
-          try {
-            await downloadLocalCovers(data, localServer);
-            coverMap = await loadCoverManifest(localServer.base);
-          } catch (error) {
-            finishCoverDownloadProgress("本地封面下载失败，继续加载图数据。", "warning");
-            showToast("本地封面下载失败，继续加载图数据。", "warning");
-            coverMap = existingLocalCovers;
-          }
-        } else {
-          coverMap = existingLocalCovers;
-          showToast(
-            coverMap.size
-              ? "已跳过下载，使用已有本地封面。"
-              : "已跳过下载，本地没有封面，继续加载图数据。",
-            coverMap.size ? "success" : "warning",
-          );
-        }
+        const existingLocal = await loadExistingLocalCovers(localServer);
+        coverMap = buildLocalCoverMap(data, localServer, new Set(existingLocal.keys));
       }
     } else {
       showToast("未连接本地 server.py，使用在线静态数据。", "warning");
@@ -818,8 +764,8 @@ function main() {
       renderer.refresh();
     }
 
-    function queueCoverImageUpdate(key, objectUrl) {
-      pendingCoverUpdates.set(key, objectUrl);
+    function queueCoverImageUpdate(key, imageSource) {
+      pendingCoverUpdates.set(key, imageSource);
       if (coverUpdateFrame === null) {
         coverUpdateFrame = requestAnimationFrame(flushCoverImageUpdates);
       }
@@ -935,6 +881,7 @@ function main() {
 
     startFade();
     finishLoading();
+
   }
 
   function bindEvents() {

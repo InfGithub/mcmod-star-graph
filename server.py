@@ -28,10 +28,12 @@ star_graph/server.py - 本地服务器：静态文件服务 + 封面代理
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 import urllib.error
@@ -46,6 +48,7 @@ CLEAN_PATH = "/clean"
 HEALTH_PATH = "/health"
 DOWNLOAD_START_PATH = "/cover_download/start"
 DOWNLOAD_STATUS_PATH = "/cover_download/status"
+EXISTING_COVERS_PATH = "/cover_download/existing"
 # 前端固定请求的图数据文件名；--data 参数可把其他文件映射到这个名字
 DATA_ALIAS = "graph.json"
 # SSRF 防护：只允许转发 mcmod 封面域名（老封面在 www.mcmod.cn/pages/class/images/cover/）
@@ -55,6 +58,7 @@ COVER_SIZE = 300
 REQUEST_TIMEOUT = 15
 ROOT_DIR = Path(__file__).resolve().parent
 COVERS_DIR = ROOT_DIR / "covers"
+STATIC_FALLBACK_BASE = "https://stargraph.xiey.work"
 
 # clean 模式：一次性标志，下次页面加载时前端清空封面缓存
 _CLEAN_CACHE = False
@@ -86,43 +90,50 @@ def _download_cover_one(item):
     target = COVERS_DIR / f"{key}.jpg"
     if target.exists() and target.stat().st_size > 0:
         return key, "skipped"
-    temp = COVERS_DIR / f".{key}.{uuid.uuid4().hex}.tmp"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Referer": REFERER})
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-            data = resp.read()
-        if len(data) < 100:
-            return key, "failed"
-        temp.write_bytes(data)
-        temp.replace(target)
-        return key, "downloaded"
-    except Exception:
+    # MC CDN 在部分 Python/OpenSSL 环境会出现 SSL EOF；回退到已部署的静态封面，
+    # 仍然保存到本地 covers，不使用浏览器反代。
+    sources = [url, f"{STATIC_FALLBACK_BASE}/covers/{key}.jpg"]
+    for source in sources:
+        temp = COVERS_DIR / f".{key}.{uuid.uuid4().hex}.tmp"
         try:
-            temp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return key, "failed"
+            req = urllib.request.Request(source, headers={"User-Agent": USER_AGENT, "Referer": REFERER})
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                data = resp.read()
+            if len(data) < 100 or (content_type and not content_type.startswith("image/")):
+                raise ValueError("not an image")
+            temp.write_bytes(data)
+            temp.replace(target)
+            return key, "downloaded"
+        except Exception:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return key, "failed"
 
 
-def _run_cover_download(job_id, nodes):
-    with _DOWNLOAD_LOCK:
-        job = _DOWNLOAD_JOBS[job_id]
-    def done(result):
-        key, status = result
-        with _DOWNLOAD_LOCK:
-            job["done"] += 1
-            job[status] += 1
+def _existing_cover_keys():
+    keys = []
+    if COVERS_DIR.exists():
+        for file in COVERS_DIR.glob("*.jpg"):
+            if re.fullmatch(r"\d+", file.stem) and file.is_file() and file.stat().st_size > 0:
+                keys.append(file.stem)
+    return sorted(keys, key=lambda value: int(value))
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for result in pool.map(_download_cover_one, nodes):
-            done(result)
 
+def _write_cover_manifest(nodes):
+    """按当前已落盘文件写清单；单个图片文件在下载完成时就已原子保存。"""
     items = {}
     for item in nodes:
         key = str(item["key"])
         target = COVERS_DIR / f"{key}.jpg"
         if target.exists() and target.stat().st_size > 0:
-            items[key] = {"path": f"covers/{key}.jpg", "orig": f"covers/{key}.jpg", "bytes": target.stat().st_size}
+            items[key] = {
+                "path": f"covers/{key}.jpg",
+                "orig": f"covers/{key}.jpg",
+                "bytes": target.stat().st_size,
+            }
     manifest = {
         "schema": 1,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -134,6 +145,81 @@ def _run_cover_download(job_id, nodes):
     temp_manifest = COVERS_DIR / f".manifest.{uuid.uuid4().hex}.tmp"
     temp_manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     temp_manifest.replace(COVERS_DIR / "manifest.json")
+
+
+def _record_download_result(job, result, manifest_nodes):
+    key = str(result.get("key", ""))
+    status = result.get("status", "failed")
+    with _DOWNLOAD_LOCK:
+        job["done"] += 1
+        job[status] += 1
+        done_count = job["done"]
+        if status in ("downloaded", "skipped"):
+            job["ready_keys"].append(key)
+    # 图片已逐个原子落盘；manifest 按小批次 checkpoint，支持中途恢复。
+    if done_count % 16 == 0 or done_count == job["total"]:
+        _write_cover_manifest(manifest_nodes)
+
+
+def _run_node_cover_download(job, nodes, manifest_nodes):
+    node_bin = shutil.which("node")
+    if not node_bin:
+        return False
+    COVERS_DIR.mkdir(parents=True, exist_ok=True)
+    input_path = COVERS_DIR / f".download.{job['id']}.json"
+    input_path.write_text(json.dumps(nodes, ensure_ascii=False), encoding="utf-8")
+    script_path = ROOT_DIR / "scripts" / "download-covers-local.mjs"
+    try:
+        process = subprocess.Popen(
+            [node_bin, str(script_path), str(input_path), str(COVERS_DIR)],
+            cwd=str(ROOT_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        for line in process.stdout or ():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "progress":
+                _record_download_result(job, event, manifest_nodes)
+        return process.wait() == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            input_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _run_cover_download(job_id, nodes, manifest_nodes):
+    with _DOWNLOAD_LOCK:
+        job = _DOWNLOAD_JOBS[job_id]
+    if not nodes:
+        _write_cover_manifest(manifest_nodes)
+        with _DOWNLOAD_LOCK:
+            job["status"] = "done"
+        return
+    if _run_node_cover_download(job, nodes, manifest_nodes):
+        _write_cover_manifest(manifest_nodes)
+        with _DOWNLOAD_LOCK:
+            job["status"] = "done"
+        return
+
+    # Node 不可用时保留 Python 兜底下载器。
+    def done(result):
+        key, status = result
+        _record_download_result(job, {"key": key, "status": status}, manifest_nodes)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_download_cover_one, item) for item in nodes]
+        for future in as_completed(futures):
+            done(future.result())
+    _write_cover_manifest(manifest_nodes)
     with _DOWNLOAD_LOCK:
         job["status"] = "done"
 
@@ -169,6 +255,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._handle_clean()
         elif parsed.path == DOWNLOAD_STATUS_PATH:
             self._handle_download_status(parsed)
+        elif parsed.path == EXISTING_COVERS_PATH:
+            self._handle_existing_covers()
         elif _DATA_FILE and parsed.path == "/" + DATA_ALIAS:
             self._handle_data()
         else:
@@ -203,23 +291,47 @@ class Handler(SimpleHTTPRequestHandler):
             if not nodes:
                 self._send_json(400, {"error": "no cover nodes"})
                 return
+            existing = set(_existing_cover_keys())
+            pending = [node for node in nodes if str(node["key"]) not in existing]
             job_id = uuid.uuid4().hex
-            job = {"id": job_id, "status": "running", "total": len(nodes), "done": 0, "downloaded": 0, "skipped": 0, "failed": 0}
+            job = {
+                "id": job_id,
+                "status": "running",
+                "total": len(nodes),
+                "done": len(existing.intersection({str(node["key"]) for node in nodes})),
+                "downloaded": 0,
+                "skipped": len(existing.intersection({str(node["key"]) for node in nodes})),
+                "failed": 0,
+                "ready_keys": sorted(existing.intersection({str(node["key"]) for node in nodes}), key=lambda value: int(value)),
+            }
             with _DOWNLOAD_LOCK:
                 _DOWNLOAD_JOBS[job_id] = job
-            threading.Thread(target=_run_cover_download, args=(job_id, nodes), daemon=True).start()
+            threading.Thread(target=_run_cover_download, args=(job_id, pending, nodes), daemon=True).start()
             self._send_json(202, job)
         except Exception as error:
             self._send_json(400, {"error": str(error)})
 
+    def _handle_existing_covers(self):
+        keys = _existing_cover_keys()
+        # 启动下载前先把已有文件同步到清单，避免 manifest 落后于 covers 目录。
+        _write_cover_manifest([{"key": key} for key in keys])
+        self._send_json(200, {"count": len(keys), "keys": keys})
+
     def _handle_download_status(self, parsed):
         query = urllib.parse.parse_qs(parsed.query)
         job_id = query.get("id", [""])[0]
+        try:
+            since = max(0, int(query.get("since", ["0"])[0]))
+        except ValueError:
+            since = 0
         with _DOWNLOAD_LOCK:
             job = dict(_DOWNLOAD_JOBS.get(job_id, {}))
+            ready = list(job.pop("ready_keys", [])) if job else []
         if not job:
             self._send_json(404, {"error": "job not found"})
             return
+        job["ready_keys"] = ready[since:]
+        job["ready_cursor"] = len(ready)
         self._send_json(200, job)
 
     def _handle_health(self):
@@ -261,8 +373,12 @@ class Handler(SimpleHTTPRequestHandler):
         """转发封面图片：校验 host → urllib 抓取 → 字节流回传。"""
         qs = urllib.parse.parse_qs(parsed.query)
         url = qs.get("url", [""])[0]
+        key = qs.get("key", [""])[0]
         if not url:
             self.send_error(400, "url param required")
+            return
+        if key and not re.fullmatch(r"\d+", key):
+            self.send_error(400, "invalid key")
             return
         if not self._is_allowed(url):
             self.send_error(403, "host not allowed")
@@ -273,6 +389,15 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
                 data = resp.read()
+                if key and len(data) >= 100:
+                    COVERS_DIR.mkdir(parents=True, exist_ok=True)
+                    target = COVERS_DIR / f"{key}.jpg"
+                    temp = COVERS_DIR / f".{key}.{uuid.uuid4().hex}.tmp"
+                    try:
+                        temp.write_bytes(data)
+                        temp.replace(target)
+                    except OSError:
+                        temp.unlink(missing_ok=True)
                 self.send_response(200)
                 self.send_header("Content-Type", resp.headers.get("Content-Type", "image/jpeg"))
                 self.send_header("Content-Length", str(len(data)))

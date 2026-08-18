@@ -8115,6 +8115,43 @@ async function loadGraph(source = null) {
   if (!res.ok) throw new Error("\u52A0\u8F7D graph.json \u5931\u8D25: " + res.status);
   return res.json();
 }
+function normalizeCoverUrl(value) {
+  let url = String(value || "").trim();
+  if (url.startsWith("//")) url = "https:" + url;
+  return url;
+}
+async function loadExistingLocalCovers(source) {
+  try {
+    const res = await fetch(`${source.base}/cover_download/existing`, { mode: "cors", cache: "no-store" });
+    if (!res.ok) throw new Error(`existing covers: ${res.status}`);
+    const data = await res.json();
+    const keys = Array.isArray(data.keys) ? data.keys.map(String) : [];
+    const map = new Map(keys.map((key) => [key, {
+      thumb: `${source.base}/covers/${key}.jpg`,
+      orig: `${source.base}/covers/${key}.jpg`
+    }]));
+    return { count: keys.length, keys, map };
+  } catch {
+    const map = await loadCoverManifest(source.base);
+    return { count: map.size, keys: [...map.keys()], map };
+  }
+}
+function buildLocalCoverMap(data, source, existingKeys = /* @__PURE__ */ new Set()) {
+  const map = /* @__PURE__ */ new Map();
+  for (const node of data.nodes || []) {
+    if (node.type !== "core" || !node.cover_url) continue;
+    const key = String(node.key);
+    if (existingKeys.has(key)) {
+      const local = `${source.base}/covers/${key}.jpg`;
+      map.set(key, { thumb: local, orig: local });
+      continue;
+    }
+    const url = normalizeCoverUrl(node.cover_url);
+    const proxy = `${source.base}/cover_proxy?key=${encodeURIComponent(key)}&url=${encodeURIComponent(url)}`;
+    map.set(key, { thumb: proxy, orig: proxy });
+  }
+  return map;
+}
 async function detectLocalServer() {
   const origins = [];
   if ((location.hostname === "127.0.0.1" || location.hostname === "localhost") && location.origin !== "null") {
@@ -8187,7 +8224,9 @@ function coverPaths(node, coverMap) {
 var coverNetworkTail = Promise.resolve();
 function loadCoverImageSource(source) {
   const url = new URL(source, document.baseURI).href;
-  const controlled = !!navigator.serviceWorker?.controller && new URL(url, document.baseURI).origin === location.origin;
+  const parsed = new URL(url, document.baseURI);
+  const isLocalProxy = parsed.pathname === "/cover_proxy";
+  const controlled = !!navigator.serviceWorker?.controller && parsed.origin === location.origin && !isLocalProxy;
   return (async () => {
     if (!controlled) {
       const response = await fetchCoverResponse(url);
@@ -8383,67 +8422,6 @@ async function encodePNG(width, height, getScanlines) {
   parts.push(pngChunk("IEND", new Uint8Array(0)));
   return new Blob(parts, { type: "image/png" });
 }
-var coverDownloadToast = null;
-function updateCoverDownloadProgress(job) {
-  let container = document.getElementById("toast-container");
-  if (!container) {
-    container = document.createElement("div");
-    container.id = "toast-container";
-    container.setAttribute("aria-live", "polite");
-    document.body.appendChild(container);
-  }
-  if (!coverDownloadToast) {
-    coverDownloadToast = document.createElement("div");
-    coverDownloadToast.className = "toast toast-progress toast-success toast-visible";
-    coverDownloadToast.innerHTML = '<div class="toast-progress-text"></div><div class="toast-progress-track"><div class="toast-progress-fill"></div></div>';
-    container.appendChild(coverDownloadToast);
-  }
-  const total = Math.max(1, Number(job.total) || 1);
-  const done = Math.min(total, Number(job.done) || 0);
-  const pct = Math.round(done / total * 100);
-  coverDownloadToast.querySelector(".toast-progress-text").textContent = `\u6B63\u5728\u4E0B\u8F7D\u672C\u5730\u5C01\u9762 ${done} / ${total}\uFF08${pct}%\uFF09`;
-  coverDownloadToast.querySelector(".toast-progress-fill").style.width = `${pct}%`;
-}
-function finishCoverDownloadProgress(message, kind = "success") {
-  if (!coverDownloadToast) return;
-  coverDownloadToast.className = `toast toast-progress toast-${kind} toast-visible`;
-  coverDownloadToast.querySelector(".toast-progress-text").textContent = message;
-  coverDownloadToast.querySelector(".toast-progress-fill").style.width = "100%";
-  const toast = coverDownloadToast;
-  coverDownloadToast = null;
-  setTimeout(() => {
-    toast.classList.remove("toast-visible");
-    setTimeout(() => toast.remove(), 300);
-  }, 1800);
-}
-async function downloadLocalCovers(data, source) {
-  const nodes = (data.nodes || []).filter((node) => node.type === "core" && node.cover_url).map((node) => ({ key: String(node.key), cover_url: node.cover_url }));
-  if (!nodes.length) return { total: 0, done: 0, downloaded: 0, skipped: 0, failed: 0 };
-  const response = await fetch(`${source.base}/cover_download/start`, {
-    method: "POST",
-    mode: "cors",
-    cache: "no-store",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ nodes })
-  });
-  if (!response.ok) throw new Error(`\u542F\u52A8\u5C01\u9762\u4E0B\u8F7D\u5931\u8D25\uFF1A${response.status}`);
-  const started = await response.json();
-  updateCoverDownloadProgress(started);
-  let job = started;
-  while (job.status === "running") {
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    const status = await fetch(`${source.base}/cover_download/status?id=${encodeURIComponent(started.id)}`, {
-      mode: "cors",
-      cache: "no-store"
-    });
-    if (!status.ok) throw new Error(`\u8BFB\u53D6\u5C01\u9762\u4E0B\u8F7D\u8FDB\u5EA6\u5931\u8D25\uFF1A${status.status}`);
-    job = await status.json();
-    updateCoverDownloadProgress(job);
-  }
-  if (job.status !== "done") throw new Error("\u672C\u5730\u5C01\u9762\u4E0B\u8F7D\u5931\u8D25");
-  finishCoverDownloadProgress(`\u672C\u5730\u5C01\u9762\u5B8C\u6210\uFF1A${job.downloaded} \u4E0B\u8F7D\uFF0C${job.skipped} \u5DF2\u5B58\u5728\uFF0C${job.failed} \u5931\u8D25`);
-  return job;
-}
 function showToast(message, kind = "warning") {
   let container = document.getElementById("toast-container");
   if (!container) {
@@ -8539,29 +8517,8 @@ function main() {
         coverMap = await loadCoverManifest();
       }
       if (!coverMap) {
-        const existingLocalCovers = await loadCoverManifest(localServer.base);
-        const shouldDownload = window.confirm(
-          `\u5DF2\u8FDE\u63A5\u672C\u5730 server.py\u3002
-\u662F\u5426\u4E0B\u8F7D/\u8865\u5168\u5C01\u9762\u5230 server.py \u540C\u76EE\u5F55\u7684 covers \u6587\u4EF6\u5939\uFF1F
-
-\u5DF2\u6709 ${existingLocalCovers.size} \u5F20\u672C\u5730\u5C01\u9762\u3002`
-        );
-        if (shouldDownload) {
-          try {
-            await downloadLocalCovers(data, localServer);
-            coverMap = await loadCoverManifest(localServer.base);
-          } catch (error) {
-            finishCoverDownloadProgress("\u672C\u5730\u5C01\u9762\u4E0B\u8F7D\u5931\u8D25\uFF0C\u7EE7\u7EED\u52A0\u8F7D\u56FE\u6570\u636E\u3002", "warning");
-            showToast("\u672C\u5730\u5C01\u9762\u4E0B\u8F7D\u5931\u8D25\uFF0C\u7EE7\u7EED\u52A0\u8F7D\u56FE\u6570\u636E\u3002", "warning");
-            coverMap = existingLocalCovers;
-          }
-        } else {
-          coverMap = existingLocalCovers;
-          showToast(
-            coverMap.size ? "\u5DF2\u8DF3\u8FC7\u4E0B\u8F7D\uFF0C\u4F7F\u7528\u5DF2\u6709\u672C\u5730\u5C01\u9762\u3002" : "\u5DF2\u8DF3\u8FC7\u4E0B\u8F7D\uFF0C\u672C\u5730\u6CA1\u6709\u5C01\u9762\uFF0C\u7EE7\u7EED\u52A0\u8F7D\u56FE\u6570\u636E\u3002",
-            coverMap.size ? "success" : "warning"
-          );
-        }
+        const existingLocal = await loadExistingLocalCovers(localServer);
+        coverMap = buildLocalCoverMap(data, localServer, new Set(existingLocal.keys));
       }
     } else {
       showToast("\u672A\u8FDE\u63A5\u672C\u5730 server.py\uFF0C\u4F7F\u7528\u5728\u7EBF\u9759\u6001\u6570\u636E\u3002", "warning");
@@ -8667,8 +8624,8 @@ function main() {
       );
       renderer.refresh();
     }
-    function queueCoverImageUpdate(key, objectUrl) {
-      pendingCoverUpdates.set(key, objectUrl);
+    function queueCoverImageUpdate(key, imageSource) {
+      pendingCoverUpdates.set(key, imageSource);
       if (coverUpdateFrame === null) {
         coverUpdateFrame = requestAnimationFrame(flushCoverImageUpdates);
       }
