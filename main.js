@@ -209,6 +209,151 @@ function buildLocalCoverMap(data, source, existingKeys = new Set()) {
   return map;
 }
 
+const UPSTREAM_COVER_DB = "mcmod-graph-covers";
+const UPSTREAM_COVER_STORE = "covers";
+const UPSTREAM_COVER_CONCURRENCY = 20;
+const UPSTREAM_COVER_INTERVAL_MS = 200;
+const UPSTREAM_COVER_RETRIES = 2;
+
+function openUpstreamCoverDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(UPSTREAM_COVER_DB, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(UPSTREAM_COVER_STORE)) {
+        request.result.createObjectStore(UPSTREAM_COVER_STORE);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function upstreamCoverGet(db, key) {
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(UPSTREAM_COVER_STORE, "readonly").objectStore(UPSTREAM_COVER_STORE).get(key);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function upstreamCoverPut(db, key, blob) {
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(UPSTREAM_COVER_STORE, "readwrite").objectStore(UPSTREAM_COVER_STORE).put(blob, key);
+    request.onsuccess = resolve;
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function upstreamCoverClear(db) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(UPSTREAM_COVER_STORE, "readwrite");
+    tx.objectStore(UPSTREAM_COVER_STORE).clear();
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadUpstreamCachedCovers(db, items) {
+  const map = new Map();
+  for (const item of items) {
+    const blob = await upstreamCoverGet(db, item.key).catch(() => null);
+    if (blob) map.set(String(item.key), URL.createObjectURL(blob));
+  }
+  return map;
+}
+
+async function downloadUpstreamCovers(db, items, onProgress) {
+  let cursor = 0;
+  let done = 0;
+  let failed = 0;
+  const failedItems = [];
+  async function worker() {
+    while (cursor < items.length) {
+      const item = items[cursor++];
+      let ok = false;
+      for (let attempt = 0; attempt <= UPSTREAM_COVER_RETRIES && !ok; attempt++) {
+        try {
+          const response = await fetch(`${item.proxyBase}/cover_proxy?url=${encodeURIComponent(item.url)}`, { cache: "no-store" });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          await upstreamCoverPut(db, item.key, await response.blob());
+          ok = true;
+        } catch {
+          if (attempt < UPSTREAM_COVER_RETRIES) await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+        }
+      }
+      if (!ok) { failed += 1; failedItems.push(item); }
+      done += 1;
+      if (onProgress) onProgress(done, items.length, failed);
+      await new Promise((resolve) => setTimeout(resolve, UPSTREAM_COVER_INTERVAL_MS));
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(UPSTREAM_COVER_CONCURRENCY, Math.max(1, items.length)) }, worker));
+  return { failed, failedItems };
+}
+
+function showUpstreamCoverModal(db, items, cachedMap) {
+  return new Promise((resolve) => {
+    const modal = document.createElement("div");
+    modal.className = "cover-modal";
+    modal.innerHTML = `
+      <div class="cover-box" role="dialog" aria-modal="true">
+        <div class="cover-head"><span class="cover-title"></span><button class="cover-close" type="button">×</button></div>
+        <div class="cover-desc"></div>
+        <div class="cover-progress hidden"><div class="cover-track"><div class="cover-fill"></div></div><div class="cover-label"></div></div>
+        <div class="cover-actions"><button class="cover-btn primary" type="button"></button><button class="cover-btn ghost hidden" type="button"></button></div>
+      </div>`;
+    document.body.appendChild(modal);
+    const title = modal.querySelector(".cover-title");
+    const desc = modal.querySelector(".cover-desc");
+    const progress = modal.querySelector(".cover-progress");
+    const fill = modal.querySelector(".cover-fill");
+    const label = modal.querySelector(".cover-label");
+    const primary = modal.querySelector(".cover-btn.primary");
+    const retry = modal.querySelector(".cover-btn.ghost");
+    const close = modal.querySelector(".cover-close");
+    const pending = items.filter((item) => !cachedMap.has(String(item.key)));
+    let failedItems = [];
+    let state = "confirm";
+    const finish = () => { modal.remove(); resolve(cachedMap); };
+    const render = () => {
+      progress.classList.toggle("hidden", state !== "downloading");
+      retry.classList.toggle("hidden", state !== "failed");
+      close.classList.toggle("hidden", state !== "confirm");
+      if (state === "confirm") { title.textContent = "下载封面"; desc.textContent = `上游模式需要缓存 ${pending.length} 张封面到浏览器 IndexedDB。`; primary.textContent = "确定下载"; }
+      if (state === "downloading") { title.textContent = "正在下载封面"; desc.textContent = "下载完成后进入星图。"; primary.classList.add("hidden"); }
+      if (state === "failed") { title.textContent = "部分封面下载失败"; desc.textContent = `${failedItems.length} 张失败，可重试或进入图。`; primary.textContent = "进入图"; primary.classList.remove("hidden"); retry.textContent = "重试失败项"; }
+    };
+    const start = async (list) => {
+      state = "downloading"; primary.classList.add("hidden"); render();
+      const result = await downloadUpstreamCovers(db, list, (done, total, failed) => {
+        fill.style.width = `${Math.round(done / Math.max(1, total) * 100)}%`;
+        label.textContent = `已下载 ${done} / ${total} · 失败 ${failed}`;
+      });
+      failedItems = result.failedItems;
+      if (failedItems.length) { state = "failed"; primary.classList.remove("hidden"); render(); }
+      else finish();
+    };
+    primary.addEventListener("click", () => state === "confirm" ? start(pending) : finish());
+    retry.addEventListener("click", () => start(failedItems));
+    close.addEventListener("click", () => { state = "failed"; failedItems = pending; render(); });
+    render();
+  });
+}
+
+async function loadUpstreamCoverMap(data, source) {
+  const items = (data.nodes || []).filter((node) => node.type === "core" && node.cover_url).map((node) => ({
+    key: String(node.key), url: normalizeCoverUrl(node.cover_url), proxyBase: source.base,
+  }));
+  const db = await openUpstreamCoverDB();
+  try {
+    const clean = await fetch(`${source.base}/clean`, { cache: "no-store" }).then((res) => res.ok ? res.json() : { clean: false }).catch(() => ({ clean: false }));
+    if (clean.clean) await upstreamCoverClear(db);
+  } catch { /* ignore clean probe */ }
+  const cached = await loadUpstreamCachedCovers(db, items);
+  if (cached.size < items.length) await showUpstreamCoverModal(db, items, cached);
+  return cached;
+}
+
 async function detectLocalServer() {
   const origins = [];
   if ((location.hostname === "127.0.0.1" || location.hostname === "localhost") && location.origin !== "null") {
@@ -354,7 +499,7 @@ async function cleanupLegacyServiceWorker() {
   }
 }
 
-function buildGraph(data, coverMap) {
+function buildGraph(data, coverMap, eagerImages = false) {
   const graph = new Graph({ multi: true });
   const labelIndex = new Map(); // lowercase name -> [keys]
   const degMap = new Map();
@@ -375,8 +520,8 @@ function buildGraph(data, coverMap) {
       kind: n.type,
       // 初始只保留封面 URL；节点进入视口并由调度器加载成功后才切换 image。
       // 已加载节点不会被切回 circle，因此离开/重新进入视口不会重复请求。
-      type: "circle",
-      image: null,
+      type: eagerImages && cover ? "image" : "circle",
+      image: eagerImages && cover ? cover.thumb : null,
       thumb: cover ? cover.thumb : null,
       imageSrc: cover ? cover.orig : null, // 原图（导出大图用）
       localCover: !!(cover && cover.local),
@@ -711,6 +856,7 @@ function main() {
     const localServer = localServerOverride || await detectLocalServer();
     let data;
     let coverMap;
+    let eagerImages = false;
     let localDownloadContext = null;
     if (localServer) {
       showToast("已连接本地 server.py，使用本地图数据。", "success");
@@ -725,8 +871,10 @@ function main() {
       }
       if (!coverMap) {
         if (localServer.mode === "upstream") {
-          // 上游模式：纯反代，不读取/写入本地 covers，也不启动批量下载。
-          coverMap = buildLocalCoverMap(data, localServer);
+          // 上游模式：IndexedDB + 反代一次性准备 Blob URL，再进入图。
+          const blobMap = await loadUpstreamCoverMap(data, localServer);
+          coverMap = new Map([...blobMap].map(([key, blobUrl]) => [key, { thumb: blobUrl, orig: blobUrl }]));
+          eagerImages = true;
         } else {
           const existingLocal = await loadExistingLocalCovers(localServer);
           coverMap = buildLocalCoverMap(data, localServer, new Set(existingLocal.keys));
@@ -747,7 +895,7 @@ function main() {
       : "未找到封面，使用纯色节点……", coverMap.size + " 张封面已就绪");
     await new Promise((r) => setTimeout(r, 30));
 
-    const built = buildGraph(data, coverMap);
+    const built = buildGraph(data, coverMap, eagerImages);
     graph = built.graph;
     searchIndex = buildSearch(data);
     allNodes = [...data.nodes].sort((a, b) => (b.views || 0) - (a.views || 0));
