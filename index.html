@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NeoForge 1.21.1 生态关系图</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="container"></div>
+  <div id="status">
+    <div class="status-box">
+      <div id="status-text">加载中……</div>
+      <div id="progress-track"><div id="progress-fill"></div></div>
+      <div id="progress-label"></div>
+    </div>
+  </div>
+  <div id="tooltip" class="hidden"></div>
+  <div id="context-menu" class="hidden"></div>
+  <div id="panel">
+    <div class="panel-header">
+      <span class="panel-title">NeoForge 1.21.1 生态关系图</span>
+      <button id="panel-toggle" title="收起侧边栏">«</button>
+    </div>
+    <div class="panel-body">
+      <div class="lod-control">
+        <div class="lod-header">
+          <span class="lod-label">节点 LoD 强度</span>
+          <span class="lod-value" id="lod-value">100%</span>
+        </div>
+        <input type="range" id="lod-slider" min="0" max="100" step="1" value="100">
+      </div>
+      <div class="lod-control">
+        <div class="lod-header">
+          <span class="lod-label">边 LoD 强度</span>
+          <span class="lod-value" id="edge-lod-value">100%</span>
+        </div>
+        <input type="range" id="edge-lod-slider" min="0" max="100" step="1" value="100">
+      </div>
+      <div class="controls">
+        <label><input type="checkbox" id="edge-dependency" checked> 依赖</label>
+        <label><input type="checkbox" id="edge-interaction" checked> 联动</label>
+        <label><input type="checkbox" id="show-labels" checked> 标签</label>
+      </div>
+      <div class="search">
+        <input type="text" id="search-input" placeholder="搜索模组名…" autocomplete="off">
+        <div id="search-results" class="hidden">
+          <ul id="search-list"></ul>
+          <div id="search-pagination"></div>
+        </div>
+      </div>
+      <div class="export-control">
+        <div class="export-label">导出 PNG</div>
+        <div class="export-row">
+          <input type="number" id="export-width" value="65536" min="64" step="64">
+          <span class="export-x">×</span>
+          <input type="number" id="export-height" value="65536" min="64" step="64">
+        </div>
+        <button id="export-button">下载渲染图</button>
+        <div class="export-warning hidden" id="export-warning">
+          尺寸 ≥ 16384 将使用分块导出，耗时较长、文件较大。
+        </div>
+      </div>
+    </div>
+    <div class="panel-footer">
+      <div>作者：Infinitive</div>
+      <div>开源协议：MIT</div>
+    </div>
+  </div>
+  <script type="module" src="main.bundle.js"></script>
+</body>
+</html>
