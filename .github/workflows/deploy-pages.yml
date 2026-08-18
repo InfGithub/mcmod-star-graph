@@ -116,7 +116,7 @@ jobs:
       - name: Assemble static artifact
         run: |
           mkdir -p dist
-          cp index.html style.css graph.json main.bundle.js sw.js dist/
+          cp index.html style.css graph.json main.bundle.js dist/
           touch dist/.nojekyll
           cp -r covers dist/
 

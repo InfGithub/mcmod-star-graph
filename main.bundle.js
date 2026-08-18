@@ -8073,10 +8073,10 @@ var HIGHLIGHT_NODE_COLOR = "#ffd700";
 var HIGHLIGHT_EDGE_RGB = [255, 215, 0];
 var HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1);
 var COVER_MANIFEST_URL = "covers/manifest.json";
-var SERVICE_COVER_CACHE_NAME = "star-graph-covers-v5";
 var COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
 var COVER_LOAD_CONCURRENCY = 24;
 var COVER_LOAD_RETRIES = 2;
+var COVER_NETWORK_INTERVAL_MS = 150;
 function communityColor(community, type) {
   if (type === "external") return EXTERNAL_COLOR;
   if (community < 0) return ISOLATED_COLOR;
@@ -8218,6 +8218,18 @@ function coverPaths(node, coverMap) {
   return coverMap.get(String(node.key)) || null;
 }
 var coverNetworkTail = Promise.resolve();
+var nextCoverNetworkTime = 0;
+function runCoverNetworkTask(task) {
+  const run = coverNetworkTail.then(async () => {
+    const wait = Math.max(0, nextCoverNetworkTime - performance.now());
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    nextCoverNetworkTime = performance.now() + COVER_NETWORK_INTERVAL_MS;
+    return task();
+  });
+  coverNetworkTail = run.catch(() => {
+  });
+  return run;
+}
 function waitForImageSource(source) {
   return new Promise((resolve, reject) => {
     const image = new Image();
@@ -8228,74 +8240,20 @@ function waitForImageSource(source) {
     image.src = source;
   });
 }
-async function loadCoverImageSource(source, cacheUrl = "") {
+async function loadCoverImageSource(source) {
   const url = new URL(source, document.baseURI).href;
   const isLocalProxy = new URL(url).pathname === "/cover_proxy";
-  if (cacheUrl && "caches" in window) {
-    const cache = await caches.open(SERVICE_COVER_CACHE_NAME).catch(() => null);
-    const cacheRequest = new Request(cacheUrl, { method: "GET" });
-    const cached = cache ? await cache.match(cacheRequest).catch(() => null) : null;
-    if (!isLocalProxy && cached && cached.ok) {
-      if (navigator.serviceWorker?.controller) {
-        await waitForImageSource(cacheUrl);
-        return cacheUrl;
-      }
-      const cachedObjectUrl = URL.createObjectURL(await cached.blob());
-      try {
-        await waitForImageSource(cachedObjectUrl);
-        return cachedObjectUrl;
-      } catch (error) {
-        URL.revokeObjectURL(cachedObjectUrl);
-        throw error;
-      }
-    }
-    let response;
-    try {
-      response = await fetchCoverResponse(url);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    } catch (error) {
-      if (cached && cached.ok) {
-        if (navigator.serviceWorker?.controller) {
-          await waitForImageSource(cacheUrl);
-          return cacheUrl;
-        }
-        const cachedObjectUrl = URL.createObjectURL(await cached.blob());
-        await waitForImageSource(cachedObjectUrl);
-        return cachedObjectUrl;
-      }
-      throw error;
-    }
-    const copy = response.clone();
-    const blob = await response.blob();
-    let stored = false;
-    if (cache) {
-      try {
-        await cache.put(cacheRequest, copy);
-        stored = true;
-      } catch {
-        stored = false;
-      }
-    }
-    if (navigator.serviceWorker?.controller && stored) {
-      await waitForImageSource(cacheUrl);
-      return cacheUrl;
-    }
-    const objectUrl = URL.createObjectURL(blob);
-    try {
-      await waitForImageSource(objectUrl);
-      return objectUrl;
-    } catch (error) {
-      URL.revokeObjectURL(objectUrl);
-      throw error;
-    }
+  if (isLocalProxy) {
+    await runCoverNetworkTask(() => waitForImageSource(url));
+    return url;
   }
   await waitForImageSource(url);
   return url;
 }
-async function loadCoverObjectUrlWithRetry(source, cacheUrl = "") {
+async function loadCoverObjectUrlWithRetry(source) {
   for (let attempt = 0; attempt <= COVER_LOAD_RETRIES; attempt++) {
     try {
-      return await loadCoverImageSource(source, cacheUrl);
+      return await loadCoverImageSource(source);
     } catch (error) {
       if (attempt >= COVER_LOAD_RETRIES) throw error;
       await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
@@ -8303,13 +8261,14 @@ async function loadCoverObjectUrlWithRetry(source, cacheUrl = "") {
   }
   return null;
 }
-async function ensureServiceWorker() {
+async function cleanupLegacyServiceWorker() {
   if (!("serviceWorker" in navigator)) return;
   try {
-    const registration = await navigator.serviceWorker.register("./sw.js", { scope: "./" });
-    await navigator.serviceWorker.ready;
-    if (!navigator.serviceWorker.controller && registration.active) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(registrations.map((registration) => registration.unregister()));
+    if ("caches" in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.filter((key) => key.startsWith("star-graph-covers-")).map((key) => caches.delete(key)));
     }
   } catch {
   }
@@ -8339,7 +8298,6 @@ function buildGraph(data, coverMap) {
       thumb: cover ? cover.thumb : null,
       imageSrc: cover ? cover.orig : null,
       // 原图（导出大图用）
-      cacheUrl: cover ? cover.cacheUrl : null,
       views: n.views,
       favorites: n.favorites,
       category: n.category,
@@ -8787,7 +8745,7 @@ function main() {
         if (state.status !== "queued") continue;
         state.status = "loading";
         activeCoverLoads += 1;
-        loadCoverObjectUrlWithRetry(item.src, item.cacheUrl).then((imageSource) => {
+        loadCoverObjectUrlWithRetry(item.src).then((imageSource) => {
           if (!imageSource) throw new Error("empty image");
           state.status = "ready";
           state.objectUrl = imageSource;
@@ -8822,7 +8780,7 @@ function main() {
         state.priority = (insideViewport ? 0 : 1e9) + centerDistance;
         if (state.status === "idle") {
           state.status = "queued";
-          coverQueue.push({ key, src: attrs.thumb, cacheUrl: attrs.cacheUrl || "" });
+          coverQueue.push({ key, src: attrs.thumb });
         }
       });
       for (const [key, state] of coverStates) {
@@ -9782,10 +9740,7 @@ function main() {
       }
     }
   }
-  detectLocalServer().then(async (localServer) => {
-    if (!localServer) await ensureServiceWorker();
-    return boot(localServer);
-  }).catch((err) => {
+  cleanupLegacyServiceWorker().then(() => boot()).catch((err) => {
     statusText.textContent = "\u51FA\u9519\u4E86\uFF1A" + err.message;
     progressLabel.textContent = "";
     console.error("[\u9519\u8BEF]", err);

@@ -121,7 +121,6 @@ const HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1.0);
 // 封面：CI 预生成到 covers/ 并以清单分发（纯前端静态加载，浏览器 HTTP 缓存）。
 // 展示用 96px 缩略图（covers/small/）用于图上渲染，原图保留供导出。
 const COVER_MANIFEST_URL = "covers/manifest.json";
-const SERVICE_COVER_CACHE_NAME = "star-graph-covers-v5";
 const COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
 const COVER_LOAD_CONCURRENCY = 24; // 缓存解码并发；真正联网仍由网络队列串行控制
 const COVER_LOAD_RETRIES = 2;
@@ -290,8 +289,8 @@ function coverPaths(node, coverMap) {
   return coverMap.get(String(node.key)) || null;
 }
 
-// 图片加载：Service Worker 负责 Cache Storage；页面只负责解码和调度。
-// SW 命中缓存时不走网络限速；未受 SW 控制的首屏使用本地兜底队列。
+// 图片加载：线上静态图使用浏览器自身缓存；本地模式的 proxy 请求由
+// main.js 串行调度，server.py 负责返回本地文件或下载并保存。
 let coverNetworkTail = Promise.resolve();
 let nextCoverNetworkTime = 0;
 
@@ -317,82 +316,22 @@ function waitForImageSource(source) {
   });
 }
 
-async function loadCoverImageSource(source, cacheUrl = "") {
+async function loadCoverImageSource(source) {
   const url = new URL(source, document.baseURI).href;
   const isLocalProxy = new URL(url).pathname === "/cover_proxy";
-  if (cacheUrl && "caches" in window) {
-    const cache = await caches.open(SERVICE_COVER_CACHE_NAME).catch(() => null);
-    const cacheRequest = new Request(cacheUrl, { method: "GET" });
-    const cached = cache ? await cache.match(cacheRequest).catch(() => null) : null;
-
-    // 本地 proxy 是权威入口：即使前端有旧的 SW 缓存，也先触发 server.py。
-    // server.py 会优先返回已保存的本地文件，不会再次访问上游 CDN。
-    if (!isLocalProxy && cached && cached.ok) {
-      if (navigator.serviceWorker?.controller) {
-        await waitForImageSource(cacheUrl);
-        return cacheUrl;
-      }
-      const cachedObjectUrl = URL.createObjectURL(await cached.blob());
-      try {
-        await waitForImageSource(cachedObjectUrl);
-        return cachedObjectUrl;
-      } catch (error) {
-        URL.revokeObjectURL(cachedObjectUrl);
-        throw error;
-      }
-    }
-
-    let response;
-    try {
-      response = await fetchCoverResponse(url);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    } catch (error) {
-      // 本地 server 临时不可用时，才回退到前端 SW 缓存。
-      if (cached && cached.ok) {
-        if (navigator.serviceWorker?.controller) {
-          await waitForImageSource(cacheUrl);
-          return cacheUrl;
-        }
-        const cachedObjectUrl = URL.createObjectURL(await cached.blob());
-        await waitForImageSource(cachedObjectUrl);
-        return cachedObjectUrl;
-      }
-      throw error;
-    }
-
-    const copy = response.clone();
-    const blob = await response.blob();
-    let stored = false;
-    if (cache) {
-      try {
-        await cache.put(cacheRequest, copy);
-        stored = true;
-      } catch {
-        stored = false;
-      }
-    }
-    if (navigator.serviceWorker?.controller && stored) {
-      await waitForImageSource(cacheUrl);
-      return cacheUrl;
-    }
-    const objectUrl = URL.createObjectURL(blob);
-    try {
-      await waitForImageSource(objectUrl);
-      return objectUrl;
-    } catch (error) {
-      URL.revokeObjectURL(objectUrl);
-      throw error;
-    }
+  if (isLocalProxy) {
+    // 本地反代逐个请求并留出间隔；线上静态图片不经过这个限速队列。
+    await runCoverNetworkTask(() => waitForImageSource(url));
+    return url;
   }
-
   await waitForImageSource(url);
   return url;
 }
 
-async function loadCoverObjectUrlWithRetry(source, cacheUrl = "") {
+async function loadCoverObjectUrlWithRetry(source) {
   for (let attempt = 0; attempt <= COVER_LOAD_RETRIES; attempt++) {
     try {
-      return await loadCoverImageSource(source, cacheUrl);
+      return await loadCoverImageSource(source);
     } catch (error) {
       if (attempt >= COVER_LOAD_RETRIES) throw error;
       await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
@@ -401,17 +340,17 @@ async function loadCoverObjectUrlWithRetry(source, cacheUrl = "") {
   return null;
 }
 
-async function ensureServiceWorker() {
+async function cleanupLegacyServiceWorker() {
   if (!("serviceWorker" in navigator)) return;
   try {
-    const registration = await navigator.serviceWorker.register("./sw.js", { scope: "./" });
-    await navigator.serviceWorker.ready;
-    // clients.claim() 通常会立即接管；给浏览器一个事件循环完成 controller 更新。
-    if (!navigator.serviceWorker.controller && registration.active) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(registrations.map((registration) => registration.unregister()));
+    if ("caches" in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.filter((key) => key.startsWith("star-graph-covers-")).map((key) => caches.delete(key)));
     }
   } catch {
-    // SW 不可用时继续使用 main.js 的网络队列兜底。
+    // 清理失败不影响正常图片加载。
   }
 }
 
@@ -440,7 +379,6 @@ function buildGraph(data, coverMap) {
       image: null,
       thumb: cover ? cover.thumb : null,
       imageSrc: cover ? cover.orig : null, // 原图（导出大图用）
-      cacheUrl: cover ? cover.cacheUrl : null,
       views: n.views,
       favorites: n.favorites,
       category: n.category,
@@ -938,7 +876,7 @@ function main() {
         if (state.status !== "queued") continue;
         state.status = "loading";
         activeCoverLoads += 1;
-        loadCoverObjectUrlWithRetry(item.src, item.cacheUrl)
+        loadCoverObjectUrlWithRetry(item.src)
           .then((imageSource) => {
             if (!imageSource) throw new Error("empty image");
             state.status = "ready";
@@ -981,7 +919,7 @@ function main() {
         state.priority = (insideViewport ? 0 : 1e9) + centerDistance;
         if (state.status === "idle") {
           state.status = "queued";
-          coverQueue.push({ key, src: attrs.thumb, cacheUrl: attrs.cacheUrl || "" });
+          coverQueue.push({ key, src: attrs.thumb });
         }
       });
 
@@ -2072,12 +2010,8 @@ function main() {
     }
   }
 
-  detectLocalServer()
-    .then(async (localServer) => {
-      // 本地模式下图片统一走 server.py /cover_proxy，避免线上 SW 改写这条链路。
-      if (!localServer) await ensureServiceWorker();
-      return boot(localServer);
-    })
+  cleanupLegacyServiceWorker()
+    .then(() => boot())
     .catch((err) => {
       statusText.textContent = "出错了：" + err.message;
       progressLabel.textContent = "";
