@@ -8445,14 +8445,18 @@ function main() {
     let coverDirty = false;
     const COVER_MARGIN = 240;
     const COVER_MIN_SCREEN_RADIUS = 6;
+    const COVER_PRELOAD_TOP = 400;
+    const preloadKeys = new Set(
+      graph.nodes().map((key) => [key, graph.getNodeAttribute(key, "in_degree") || 0]).sort((a, b) => b[1] - a[1]).slice(0, COVER_PRELOAD_TOP).map(([key]) => key)
+    );
     function computeCoverVisibility() {
       const st = cam.getState();
       if (!st) return;
       const w = container.clientWidth;
       const h = container.clientHeight;
-      const next = /* @__PURE__ */ new Set();
+      const next = new Set(preloadKeys);
       graph.forEachNode((key, attrs) => {
-        if (!attrs.thumb) return;
+        if (preloadKeys.has(key) || !attrs.thumb) return;
         if (attrs.size * st.ratio < COVER_MIN_SCREEN_RADIUS) return;
         const p = renderer.graphToViewport({ x: attrs.x, y: attrs.y });
         if (p.x >= -COVER_MARGIN && p.x <= w + COVER_MARGIN && p.y >= -COVER_MARGIN && p.y <= h + COVER_MARGIN) {

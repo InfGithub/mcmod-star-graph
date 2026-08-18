@@ -544,21 +544,33 @@ function main() {
     const cam = renderer.getCamera();
 
     // ===== 封面视口懒加载 =====
-    // 只有进入视口（含余量）的节点才持有 image 纹理（用 96px 缩略图），
+    // 只有进入视口（含余量）且屏幕半径达标的节点才持有 image 纹理（96px 缩略图），
     // 其余节点画纯色圆；纹理内存只随可见节点数走，与总封面数无关。
+    // 默认视图 sigma 归一化后全图都在视口内、节点普遍过小，若不处理首屏几乎全是
+    // 纯色圆——因此给影响力最大的节点做“头部预载”，首屏即可见封面。
     let coverVisibleKeys = new Set();
     let coverDirty = false;
     const COVER_MARGIN = 240;
-    const COVER_MIN_SCREEN_RADIUS = 6; // 节点屏幕半径小于该值不加载封面（全览时全图适配、节点过小）
+    const COVER_MIN_SCREEN_RADIUS = 6; // 屏幕半径小于该值不加载封面（远距/全览）
+    const COVER_PRELOAD_TOP = 400; // 枢纽节点（按被依赖数）无条件预载封面
+
+    // 启动时按 in_degree 取头部节点（预载集合固定不变）
+    const preloadKeys = new Set(
+      graph.nodes()
+        .map((key) => [key, graph.getNodeAttribute(key, "in_degree") || 0])
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, COVER_PRELOAD_TOP)
+        .map(([key]) => key),
+    );
 
     function computeCoverVisibility() {
       const st = cam.getState();
       if (!st) return;
       const w = container.clientWidth;
       const h = container.clientHeight;
-      const next = new Set();
+      const next = new Set(preloadKeys); // 头部节点无条件在列
       graph.forEachNode((key, attrs) => {
-        if (!attrs.thumb) return;
+        if (preloadKeys.has(key) || !attrs.thumb) return;
         // 屏幕尺寸不足的节点（全览/远距）不建封面纹理
         if (attrs.size * st.ratio < COVER_MIN_SCREEN_RADIUS) return;
         const p = renderer.graphToViewport({ x: attrs.x, y: attrs.y });
