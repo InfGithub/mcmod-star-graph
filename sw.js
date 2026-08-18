@@ -1,4 +1,4 @@
-const CACHE_NAME = "star-graph-covers-v4";
+const CACHE_NAME = "star-graph-covers-v5";
 const COVER_PREFIX = "/covers/";
 const NETWORK_INTERVAL_MS = 150;
 let networkTail = Promise.resolve();
@@ -23,7 +23,8 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const request = event.request;
   const url = new URL(request.url);
-  const isCover = url.pathname.startsWith(COVER_PREFIX) && !url.pathname.endsWith(".json");
+  const isCover = (url.pathname.startsWith(COVER_PREFIX) && !url.pathname.endsWith(".json")) ||
+    url.pathname.startsWith(LOCAL_CACHE_PREFIX);
   if (request.method !== "GET" || url.origin !== self.location.origin || !isCover) return;
   event.respondWith(cacheFirstCover(request));
 });

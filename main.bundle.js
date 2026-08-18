@@ -8073,6 +8073,7 @@ var HIGHLIGHT_NODE_COLOR = "#ffd700";
 var HIGHLIGHT_EDGE_RGB = [255, 215, 0];
 var HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1);
 var COVER_MANIFEST_URL = "covers/manifest.json";
+var SERVICE_COVER_CACHE_NAME = "star-graph-covers-v5";
 var COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
 var COVER_LOAD_CONCURRENCY = 24;
 var COVER_LOAD_RETRIES = 2;
@@ -8136,16 +8137,11 @@ async function loadExistingLocalCovers(source) {
     return { count: map.size, keys: [...map.keys()], map };
   }
 }
-function buildLocalCoverMap(data, source, existingKeys = /* @__PURE__ */ new Set()) {
+function buildLocalCoverMap(data, source) {
   const map = /* @__PURE__ */ new Map();
   for (const node of data.nodes || []) {
     if (node.type !== "core" || !node.cover_url) continue;
     const key = String(node.key);
-    if (existingKeys.has(key)) {
-      const local = `${source.base}/covers/${key}.jpg`;
-      map.set(key, { thumb: local, orig: local });
-      continue;
-    }
     const url = normalizeCoverUrl(node.cover_url);
     const proxy = `${source.base}/cover_proxy?key=${encodeURIComponent(key)}&url=${encodeURIComponent(url)}`;
     map.set(key, { thumb: proxy, orig: proxy });
@@ -8222,32 +8218,84 @@ function coverPaths(node, coverMap) {
   return coverMap.get(String(node.key)) || null;
 }
 var coverNetworkTail = Promise.resolve();
-function loadCoverImageSource(source) {
-  const url = new URL(source, document.baseURI).href;
-  const parsed = new URL(url, document.baseURI);
-  const isLocalProxy = parsed.pathname === "/cover_proxy";
-  const controlled = !!navigator.serviceWorker?.controller && parsed.origin === location.origin && !isLocalProxy;
-  return (async () => {
-    if (!controlled) {
-      const response = await fetchCoverResponse(url);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      await response.blob();
-    }
-    await new Promise((resolve, reject) => {
-      const image = new Image();
-      image.crossOrigin = "anonymous";
-      image.decoding = "async";
-      image.onload = resolve;
-      image.onerror = () => reject(new Error("image decode failed"));
-      image.src = url;
-    });
-    return url;
-  })();
+function waitForImageSource(source) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.crossOrigin = "anonymous";
+    image.decoding = "async";
+    image.onload = resolve;
+    image.onerror = () => reject(new Error("image decode failed"));
+    image.src = source;
+  });
 }
-async function loadCoverObjectUrlWithRetry(source) {
+async function loadCoverImageSource(source, cacheUrl = "") {
+  const url = new URL(source, document.baseURI).href;
+  const isLocalProxy = new URL(url).pathname === "/cover_proxy";
+  if (cacheUrl && "caches" in window) {
+    const cache = await caches.open(SERVICE_COVER_CACHE_NAME).catch(() => null);
+    const cacheRequest = new Request(cacheUrl, { method: "GET" });
+    const cached = cache ? await cache.match(cacheRequest).catch(() => null) : null;
+    if (!isLocalProxy && cached && cached.ok) {
+      if (navigator.serviceWorker?.controller) {
+        await waitForImageSource(cacheUrl);
+        return cacheUrl;
+      }
+      const cachedObjectUrl = URL.createObjectURL(await cached.blob());
+      try {
+        await waitForImageSource(cachedObjectUrl);
+        return cachedObjectUrl;
+      } catch (error) {
+        URL.revokeObjectURL(cachedObjectUrl);
+        throw error;
+      }
+    }
+    let response;
+    try {
+      response = await fetchCoverResponse(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      if (cached && cached.ok) {
+        if (navigator.serviceWorker?.controller) {
+          await waitForImageSource(cacheUrl);
+          return cacheUrl;
+        }
+        const cachedObjectUrl = URL.createObjectURL(await cached.blob());
+        await waitForImageSource(cachedObjectUrl);
+        return cachedObjectUrl;
+      }
+      throw error;
+    }
+    const copy = response.clone();
+    const blob = await response.blob();
+    let stored = false;
+    if (cache) {
+      try {
+        await cache.put(cacheRequest, copy);
+        stored = true;
+      } catch {
+        stored = false;
+      }
+    }
+    if (navigator.serviceWorker?.controller && stored) {
+      await waitForImageSource(cacheUrl);
+      return cacheUrl;
+    }
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      await waitForImageSource(objectUrl);
+      return objectUrl;
+    } catch (error) {
+      URL.revokeObjectURL(objectUrl);
+      throw error;
+    }
+  }
+  await waitForImageSource(url);
+  return url;
+}
+async function loadCoverObjectUrlWithRetry(source, cacheUrl = "") {
   for (let attempt = 0; attempt <= COVER_LOAD_RETRIES; attempt++) {
     try {
-      return await loadCoverImageSource(source);
+      return await loadCoverImageSource(source, cacheUrl);
     } catch (error) {
       if (attempt >= COVER_LOAD_RETRIES) throw error;
       await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
@@ -8291,6 +8339,7 @@ function buildGraph(data, coverMap) {
       thumb: cover ? cover.thumb : null,
       imageSrc: cover ? cover.orig : null,
       // 原图（导出大图用）
+      cacheUrl: cover ? cover.cacheUrl : null,
       views: n.views,
       favorites: n.favorites,
       category: n.category,
@@ -8422,6 +8471,97 @@ async function encodePNG(width, height, getScanlines) {
   parts.push(pngChunk("IEND", new Uint8Array(0)));
   return new Blob(parts, { type: "image/png" });
 }
+var coverDownloadToast = null;
+function updateCoverDownloadProgress(job) {
+  let container = document.getElementById("toast-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "toast-container";
+    container.setAttribute("aria-live", "polite");
+    document.body.appendChild(container);
+  }
+  if (!coverDownloadToast) {
+    coverDownloadToast = document.createElement("div");
+    coverDownloadToast.className = "toast toast-progress toast-success toast-visible";
+    coverDownloadToast.innerHTML = '<div class="toast-progress-text"></div><div class="toast-progress-track"><div class="toast-progress-fill"></div></div>';
+    container.appendChild(coverDownloadToast);
+  }
+  const total = Math.max(1, Number(job.total) || 1);
+  const done = Math.min(total, Number(job.done) || 0);
+  const pct = Math.round(done / total * 100);
+  const downloaded = Number(job.downloaded) || 0;
+  const skipped = Number(job.skipped) || 0;
+  const failed = Number(job.failed) || 0;
+  coverDownloadToast.querySelector(".toast-progress-text").textContent = `\u6B63\u5728\u4FDD\u5B58\u672C\u5730\u5C01\u9762 ${done} / ${total}\uFF08${pct}%\uFF09 \xB7 \u6210\u529F ${downloaded} \xB7 \u5DF2\u5B58\u5728 ${skipped} \xB7 \u5931\u8D25 ${failed}`;
+  coverDownloadToast.querySelector(".toast-progress-fill").style.width = `${pct}%`;
+}
+function finishCoverDownloadProgress(message, kind = "success") {
+  if (!coverDownloadToast) return;
+  coverDownloadToast.className = `toast toast-progress toast-${kind} toast-visible`;
+  coverDownloadToast.querySelector(".toast-progress-text").textContent = message;
+  coverDownloadToast.querySelector(".toast-progress-fill").style.width = "100%";
+  const toast = coverDownloadToast;
+  coverDownloadToast = null;
+  setTimeout(() => {
+    toast.classList.remove("toast-visible");
+    setTimeout(() => toast.remove(), 300);
+  }, 1800);
+}
+function askLocalCoverDownload(existingCount, totalCount) {
+  return new Promise((resolve) => {
+    const modal = document.createElement("div");
+    modal.className = "cover-modal";
+    modal.innerHTML = `
+      <div class="cover-box" role="dialog" aria-modal="true" aria-labelledby="cover-download-title">
+        <div class="cover-head">
+          <div class="cover-title" id="cover-download-title">\u4FDD\u5B58\u672C\u5730\u5C01\u9762</div>
+          <button class="cover-close" type="button" aria-label="\u5173\u95ED">\xD7</button>
+        </div>
+        <div class="cover-desc">
+          \u5DF2\u8FDE\u63A5\u672C\u5730 server.py\u3002\u7126\u70B9\u8282\u70B9\u4F1A\u7EE7\u7EED\u901A\u8FC7\u53CD\u4EE3\u61D2\u52A0\u8F7D\uFF0C\u6210\u529F\u52A0\u8F7D\u7684\u5C01\u9762\u4F1A\u81EA\u52A8\u4FDD\u5B58\u5230\u672C\u5730\u3002<br>
+          \u662F\u5426\u540C\u65F6\u540E\u53F0\u4FDD\u5B58\u5168\u90E8\u5C01\u9762\uFF1F\u5DF2\u6709 ${existingCount} \u5F20\uFF0C\u6700\u591A\u5904\u7406 ${totalCount} \u5F20\u3002\u4E0B\u8F7D\u4E0D\u4F1A\u963B\u585E\u8282\u70B9\u56FE\u3002
+        </div>
+        <div class="cover-actions">
+          <button class="cover-btn ghost" data-action="cancel" type="button">\u6682\u4E0D\u4FDD\u5B58</button>
+          <button class="cover-btn primary" data-action="download" type="button">\u540E\u53F0\u4FDD\u5B58</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    const close = (value) => {
+      modal.remove();
+      resolve(value);
+    };
+    modal.querySelector("[data-action=cancel]").addEventListener("click", () => close(false));
+    modal.querySelector("[data-action=download]").addEventListener("click", () => close(true));
+    modal.querySelector(".cover-close").addEventListener("click", () => close(false));
+  });
+}
+async function downloadLocalCovers(data, source, orderedNodes = null) {
+  const nodes = (orderedNodes || data.nodes || []).filter((node) => node.type === "core" && node.cover_url).map((node) => ({ key: String(node.key), cover_url: node.cover_url }));
+  if (!nodes.length) return;
+  const response = await fetch(`${source.base}/cover_download/start`, {
+    method: "POST",
+    mode: "cors",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nodes })
+  });
+  if (!response.ok) throw new Error(`\u542F\u52A8\u672C\u5730\u4FDD\u5B58\u5931\u8D25\uFF1A${response.status}`);
+  const started = await response.json();
+  updateCoverDownloadProgress(started);
+  let job = started;
+  let cursor = Number(started.ready_cursor) || 0;
+  while (job.status === "running") {
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const status = await fetch(`${source.base}/cover_download/status?id=${encodeURIComponent(started.id)}&since=${cursor}`, { mode: "cors", cache: "no-store" });
+    if (!status.ok) throw new Error(`\u8BFB\u53D6\u672C\u5730\u4FDD\u5B58\u8FDB\u5EA6\u5931\u8D25\uFF1A${status.status}`);
+    job = await status.json();
+    cursor = Number(job.ready_cursor) || cursor;
+    updateCoverDownloadProgress(job);
+  }
+  if (job.status !== "done") throw new Error("\u672C\u5730\u4FDD\u5B58\u5931\u8D25");
+  finishCoverDownloadProgress(`\u672C\u5730\u5C01\u9762\u4FDD\u5B58\u5B8C\u6210\uFF1A${job.downloaded} \u65B0\u589E\uFF0C${job.skipped} \u5DF2\u5B58\u5728\uFF0C${job.failed} \u5931\u8D25`);
+}
 function showToast(message, kind = "warning") {
   let container = document.getElementById("toast-container");
   if (!container) {
@@ -8500,11 +8640,11 @@ function main() {
       if (statusEl.style.display !== "none") statusEl.style.display = "none";
     }, 700);
   }
-  async function boot() {
-    setProgress(0, "\u68C0\u6D4B\u672C\u5730 server.py\u2026\u2026", "127.0.0.1:1119");
-    const localServer = await detectLocalServer();
+  async function boot(localServerOverride = null) {
+    const localServer = localServerOverride || await detectLocalServer();
     let data;
     let coverMap;
+    let localDownloadContext = null;
     if (localServer) {
       showToast("\u5DF2\u8FDE\u63A5\u672C\u5730 server.py\uFF0C\u4F7F\u7528\u672C\u5730\u56FE\u6570\u636E\u3002", "success");
       setProgress(5, "\u52A0\u8F7D\u672C\u5730\u56FE\u6570\u636E\u2026\u2026", localServer.base + "/graph.json");
@@ -8518,7 +8658,8 @@ function main() {
       }
       if (!coverMap) {
         const existingLocal = await loadExistingLocalCovers(localServer);
-        coverMap = buildLocalCoverMap(data, localServer, new Set(existingLocal.keys));
+        coverMap = buildLocalCoverMap(data, localServer);
+        localDownloadContext = { data, source: localServer, existingCount: existingLocal.count };
       }
     } else {
       showToast("\u672A\u8FDE\u63A5\u672C\u5730 server.py\uFF0C\u4F7F\u7528\u5728\u7EBF\u9759\u6001\u6570\u636E\u3002", "warning");
@@ -8646,7 +8787,7 @@ function main() {
         if (state.status !== "queued") continue;
         state.status = "loading";
         activeCoverLoads += 1;
-        loadCoverObjectUrlWithRetry(item.src).then((imageSource) => {
+        loadCoverObjectUrlWithRetry(item.src, item.cacheUrl).then((imageSource) => {
           if (!imageSource) throw new Error("empty image");
           state.status = "ready";
           state.objectUrl = imageSource;
@@ -8681,7 +8822,7 @@ function main() {
         state.priority = (insideViewport ? 0 : 1e9) + centerDistance;
         if (state.status === "idle") {
           state.status = "queued";
-          coverQueue.push({ key, src: attrs.thumb });
+          coverQueue.push({ key, src: attrs.thumb, cacheUrl: attrs.cacheUrl || "" });
         }
       });
       for (const [key, state] of coverStates) {
@@ -8725,6 +8866,30 @@ function main() {
     await new Promise((r) => setTimeout(r, 700));
     startFade();
     finishLoading();
+    if (localDownloadContext) {
+      const context = localDownloadContext;
+      setTimeout(async () => {
+        const total = (context.data.nodes || []).filter((node) => node.type === "core" && node.cover_url).length;
+        if (!await askLocalCoverDownload(context.existingCount, total)) return;
+        try {
+          const centerX = container.clientWidth / 2;
+          const centerY = container.clientHeight / 2;
+          const orderedNodes = [...context.data.nodes].sort((a, b) => {
+            const pa = renderer.graphToViewport({ x: a.x, y: a.y });
+            const pb = renderer.graphToViewport({ x: b.x, y: b.y });
+            const ia = pa.x >= 0 && pa.x <= container.clientWidth && pa.y >= 0 && pa.y <= container.clientHeight;
+            const ib = pb.x >= 0 && pb.x <= container.clientWidth && pb.y >= 0 && pb.y <= container.clientHeight;
+            const da = Math.hypot(pa.x - centerX, pa.y - centerY);
+            const db = Math.hypot(pb.x - centerX, pb.y - centerY);
+            return (ia ? 0 : 1e9) + da - ((ib ? 0 : 1e9) + db);
+          });
+          await downloadLocalCovers(context.data, context.source, orderedNodes);
+        } catch (error) {
+          finishCoverDownloadProgress("\u672C\u5730\u4FDD\u5B58\u5931\u8D25\uFF0C\u7126\u70B9\u53CD\u4EE3\u52A0\u8F7D\u4ECD\u53EF\u7EE7\u7EED\u3002", "warning");
+          showToast("\u672C\u5730\u5C01\u9762\u540E\u53F0\u4FDD\u5B58\u5931\u8D25\uFF0C\u7126\u70B9\u53CD\u4EE3\u52A0\u8F7D\u4ECD\u53EF\u7EE7\u7EED\u3002", "warning");
+        }
+      }, 0);
+    }
   }
   function bindEvents() {
     renderer.on("enterNode", ({ node }) => {
@@ -9617,7 +9782,10 @@ function main() {
       }
     }
   }
-  ensureServiceWorker().then(() => boot()).catch((err) => {
+  detectLocalServer().then(async (localServer) => {
+    if (!localServer) await ensureServiceWorker();
+    return boot(localServer);
+  }).catch((err) => {
     statusText.textContent = "\u51FA\u9519\u4E86\uFF1A" + err.message;
     progressLabel.textContent = "";
     console.error("[\u9519\u8BEF]", err);

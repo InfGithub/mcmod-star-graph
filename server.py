@@ -66,6 +66,8 @@ _CLEAN_CACHE = False
 _DATA_FILE = None
 _DOWNLOAD_JOBS = {}
 _DOWNLOAD_LOCK = threading.Lock()
+_COVER_LOCKS = {}
+_COVER_LOCKS_GUARD = threading.Lock()
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
@@ -81,37 +83,47 @@ def _normalize_cover_url(value):
     return re.sub(r"@\d+x\d+\.jpg$", f"@{COVER_SIZE}x{COVER_SIZE}.jpg", url)
 
 
-def _download_cover_one(item):
-    key = str(item["key"])
-    url = _normalize_cover_url(item.get("cover_url"))
-    if not re.fullmatch(r"\d+", key) or not Handler._is_allowed(url):
-        return key, "failed"
-    COVERS_DIR.mkdir(parents=True, exist_ok=True)
-    target = COVERS_DIR / f"{key}.jpg"
-    if target.exists() and target.stat().st_size > 0:
-        return key, "skipped"
-    # MC CDN 在部分 Python/OpenSSL 环境会出现 SSL EOF；回退到已部署的静态封面，
-    # 仍然保存到本地 covers，不使用浏览器反代。
-    sources = [url, f"{STATIC_FALLBACK_BASE}/covers/{key}.jpg"]
-    for source in sources:
-        temp = COVERS_DIR / f".{key}.{uuid.uuid4().hex}.tmp"
-        try:
-            req = urllib.request.Request(source, headers={"User-Agent": USER_AGENT, "Referer": REFERER})
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                content_type = resp.headers.get("Content-Type", "")
-                data = resp.read()
-            if len(data) < 100 or (content_type and not content_type.startswith("image/")):
-                raise ValueError("not an image")
-            temp.write_bytes(data)
-            temp.replace(target)
-            return key, "downloaded"
-        except Exception:
-            try:
-                temp.unlink(missing_ok=True)
-            except OSError:
-                pass
-    return key, "failed"
+def _cover_lock(key):
+    with _COVER_LOCKS_GUARD:
+        return _COVER_LOCKS.setdefault(str(key), threading.Lock())
 
+
+def _download_cover_one(item):
+    key = str(item.get("key", ""))
+    with _cover_lock(key):
+        return _download_cover_one_unlocked(item)
+
+
+def _download_cover_one_unlocked(item):
+        key = str(item["key"])
+        url = _normalize_cover_url(item.get("cover_url"))
+        if not re.fullmatch(r"\d+", key) or not Handler._is_allowed(url):
+            return key, "failed"
+        COVERS_DIR.mkdir(parents=True, exist_ok=True)
+        target = COVERS_DIR / f"{key}.jpg"
+        if target.exists() and target.stat().st_size > 0:
+            return key, "skipped"
+        # MC CDN 在部分 Python/OpenSSL 环境会出现 SSL EOF；回退到已部署的静态封面，
+        # 仍然保存到本地 covers，不使用浏览器反代。
+        sources = [url, f"{STATIC_FALLBACK_BASE}/covers/{key}.jpg"]
+        for source in sources:
+            temp = COVERS_DIR / f".{key}.{uuid.uuid4().hex}.tmp"
+            try:
+                req = urllib.request.Request(source, headers={"User-Agent": USER_AGENT, "Referer": REFERER})
+                with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                    content_type = resp.headers.get("Content-Type", "")
+                    data = resp.read()
+                if len(data) < 100 or (content_type and not content_type.startswith("image/")):
+                    raise ValueError("not an image")
+                temp.write_bytes(data)
+                temp.replace(target)
+                return key, "downloaded"
+            except Exception:
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return key, "failed"
 
 def _existing_cover_keys():
     keys = []
@@ -222,6 +234,11 @@ def _run_cover_download(job_id, nodes, manifest_nodes):
     _write_cover_manifest(manifest_nodes)
     with _DOWNLOAD_LOCK:
         job["status"] = "done"
+
+
+class _NullLock:
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc, tb): return False
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -370,7 +387,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_proxy(self, parsed):
-        """转发封面图片：校验 host → urllib 抓取 → 字节流回传。"""
+        """焦点懒加载反代：返回图片的同时按 key 原子保存到本地 covers。"""
         qs = urllib.parse.parse_qs(parsed.query)
         url = qs.get("url", [""])[0]
         key = qs.get("key", [""])[0]
@@ -383,33 +400,44 @@ class Handler(SimpleHTTPRequestHandler):
         if not self._is_allowed(url):
             self.send_error(403, "host not allowed")
             return
-        # 按 COVER_SIZE 构造缩略图（@170x115.jpg → @300x300.jpg；无后缀的老封面原样转发）
-        url = re.sub(r"@\d+x\d+\.jpg$", "@{}x{}.jpg".format(COVER_SIZE, COVER_SIZE), url)
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Referer": REFERER})
-        try:
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                data = resp.read()
-                if key and len(data) >= 100:
-                    COVERS_DIR.mkdir(parents=True, exist_ok=True)
-                    target = COVERS_DIR / f"{key}.jpg"
-                    temp = COVERS_DIR / f".{key}.{uuid.uuid4().hex}.tmp"
+        url = _normalize_cover_url(url)
+        target = COVERS_DIR / f"{key}.jpg" if key else None
+        content_type = "image/jpeg"
+        data = None
+        with _cover_lock(key) if key else _NullLock():
+            if target and target.exists() and target.stat().st_size > 0:
+                data = target.read_bytes()
+            else:
+                sources = [url]
+                if key:
+                    sources.append(f"{STATIC_FALLBACK_BASE}/covers/{key}.jpg")
+                for source in sources:
                     try:
-                        temp.write_bytes(data)
-                        temp.replace(target)
-                    except OSError:
-                        temp.unlink(missing_ok=True)
-                self.send_response(200)
-                self.send_header("Content-Type", resp.headers.get("Content-Type", "image/jpeg"))
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(data)
-        except urllib.error.HTTPError as e:
-            print(f"[ERROR] cover proxy: {url} -> HTTP {e.code}")
-            self.send_error(e.code)
-        except Exception as e:
-            print(f"[ERROR] cover proxy: {url} -> {e}")
-            self.send_error(502, "proxy fetch failed")
+                        req = urllib.request.Request(source, headers={"User-Agent": USER_AGENT, "Referer": REFERER})
+                        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                            candidate = resp.read()
+                            candidate_type = resp.headers.get("Content-Type", "image/jpeg")
+                        if len(candidate) < 100 or (candidate_type and not candidate_type.startswith("image/")):
+                            continue
+                        data = candidate
+                        content_type = candidate_type
+                        if target:
+                            COVERS_DIR.mkdir(parents=True, exist_ok=True)
+                            temp = COVERS_DIR / f".{key}.{uuid.uuid4().hex}.tmp"
+                            temp.write_bytes(data)
+                            temp.replace(target)
+                        break
+                    except Exception:
+                        continue
+        if data is None:
+            self.send_error(502, "cover download failed")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
     @staticmethod
     def _is_allowed(url: str) -> bool:

@@ -121,6 +121,7 @@ const HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1.0);
 // 封面：CI 预生成到 covers/ 并以清单分发（纯前端静态加载，浏览器 HTTP 缓存）。
 // 展示用 96px 缩略图（covers/small/）用于图上渲染，原图保留供导出。
 const COVER_MANIFEST_URL = "covers/manifest.json";
+const SERVICE_COVER_CACHE_NAME = "star-graph-covers-v5";
 const COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
 const COVER_LOAD_CONCURRENCY = 24; // 缓存解码并发；真正联网仍由网络队列串行控制
 const COVER_LOAD_RETRIES = 2;
@@ -196,18 +197,14 @@ async function loadExistingLocalCovers(source) {
   }
 }
 
-function buildLocalCoverMap(data, source, existingKeys = new Set()) {
+function buildLocalCoverMap(data, source) {
   const map = new Map();
   for (const node of data.nodes || []) {
     if (node.type !== "core" || !node.cover_url) continue;
     const key = String(node.key);
-    if (existingKeys.has(key)) {
-      const local = `${source.base}/covers/${key}.jpg`;
-      map.set(key, { thumb: local, orig: local });
-      continue;
-    }
     const url = normalizeCoverUrl(node.cover_url);
     const proxy = `${source.base}/cover_proxy?key=${encodeURIComponent(key)}&url=${encodeURIComponent(url)}`;
+    // 本地模式统一走 proxy；proxy 内部决定返回 covers/<key>.jpg 还是下载上游。
     map.set(key, { thumb: proxy, orig: proxy });
   }
   return map;
@@ -309,36 +306,93 @@ function runCoverNetworkTask(task) {
   return run;
 }
 
-function loadCoverImageSource(source) {
-  const url = new URL(source, document.baseURI).href;
-  const parsed = new URL(url, document.baseURI);
-  const isLocalProxy = parsed.pathname === "/cover_proxy";
-  const controlled = !!navigator.serviceWorker?.controller &&
-    parsed.origin === location.origin && !isLocalProxy;
-
-  return (async () => {
-    if (!controlled) {
-      const response = await fetchCoverResponse(url);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      // 兜底 fetch 先走完网络队列，再让 Image 复用浏览器 HTTP cache 解码。
-      await response.blob();
-    }
-    await new Promise((resolve, reject) => {
-      const image = new Image();
-      image.crossOrigin = "anonymous";
-      image.decoding = "async";
-      image.onload = resolve;
-      image.onerror = () => reject(new Error("image decode failed"));
-      image.src = url;
-    });
-    return url;
-  })();
+function waitForImageSource(source) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.crossOrigin = "anonymous";
+    image.decoding = "async";
+    image.onload = resolve;
+    image.onerror = () => reject(new Error("image decode failed"));
+    image.src = source;
+  });
 }
 
-async function loadCoverObjectUrlWithRetry(source) {
+async function loadCoverImageSource(source, cacheUrl = "") {
+  const url = new URL(source, document.baseURI).href;
+  const isLocalProxy = new URL(url).pathname === "/cover_proxy";
+  if (cacheUrl && "caches" in window) {
+    const cache = await caches.open(SERVICE_COVER_CACHE_NAME).catch(() => null);
+    const cacheRequest = new Request(cacheUrl, { method: "GET" });
+    const cached = cache ? await cache.match(cacheRequest).catch(() => null) : null;
+
+    // 本地 proxy 是权威入口：即使前端有旧的 SW 缓存，也先触发 server.py。
+    // server.py 会优先返回已保存的本地文件，不会再次访问上游 CDN。
+    if (!isLocalProxy && cached && cached.ok) {
+      if (navigator.serviceWorker?.controller) {
+        await waitForImageSource(cacheUrl);
+        return cacheUrl;
+      }
+      const cachedObjectUrl = URL.createObjectURL(await cached.blob());
+      try {
+        await waitForImageSource(cachedObjectUrl);
+        return cachedObjectUrl;
+      } catch (error) {
+        URL.revokeObjectURL(cachedObjectUrl);
+        throw error;
+      }
+    }
+
+    let response;
+    try {
+      response = await fetchCoverResponse(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      // 本地 server 临时不可用时，才回退到前端 SW 缓存。
+      if (cached && cached.ok) {
+        if (navigator.serviceWorker?.controller) {
+          await waitForImageSource(cacheUrl);
+          return cacheUrl;
+        }
+        const cachedObjectUrl = URL.createObjectURL(await cached.blob());
+        await waitForImageSource(cachedObjectUrl);
+        return cachedObjectUrl;
+      }
+      throw error;
+    }
+
+    const copy = response.clone();
+    const blob = await response.blob();
+    let stored = false;
+    if (cache) {
+      try {
+        await cache.put(cacheRequest, copy);
+        stored = true;
+      } catch {
+        stored = false;
+      }
+    }
+    if (navigator.serviceWorker?.controller && stored) {
+      await waitForImageSource(cacheUrl);
+      return cacheUrl;
+    }
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      await waitForImageSource(objectUrl);
+      return objectUrl;
+    } catch (error) {
+      URL.revokeObjectURL(objectUrl);
+      throw error;
+    }
+  }
+
+  await waitForImageSource(url);
+  return url;
+}
+
+async function loadCoverObjectUrlWithRetry(source, cacheUrl = "") {
   for (let attempt = 0; attempt <= COVER_LOAD_RETRIES; attempt++) {
     try {
-      return await loadCoverImageSource(source);
+      return await loadCoverImageSource(source, cacheUrl);
     } catch (error) {
       if (attempt >= COVER_LOAD_RETRIES) throw error;
       await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
@@ -386,6 +440,7 @@ function buildGraph(data, coverMap) {
       image: null,
       thumb: cover ? cover.thumb : null,
       imageSrc: cover ? cover.orig : null, // 原图（导出大图用）
+      cacheUrl: cover ? cover.cacheUrl : null,
       views: n.views,
       favorites: n.favorites,
       category: n.category,
@@ -535,6 +590,100 @@ async function encodePNG(width, height, getScanlines) {
   return new Blob(parts, { type: "image/png" });
 }
 
+let coverDownloadToast = null;
+
+function updateCoverDownloadProgress(job) {
+  let container = document.getElementById("toast-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "toast-container";
+    container.setAttribute("aria-live", "polite");
+    document.body.appendChild(container);
+  }
+  if (!coverDownloadToast) {
+    coverDownloadToast = document.createElement("div");
+    coverDownloadToast.className = "toast toast-progress toast-success toast-visible";
+    coverDownloadToast.innerHTML = '<div class="toast-progress-text"></div><div class="toast-progress-track"><div class="toast-progress-fill"></div></div>';
+    container.appendChild(coverDownloadToast);
+  }
+  const total = Math.max(1, Number(job.total) || 1);
+  const done = Math.min(total, Number(job.done) || 0);
+  const pct = Math.round((done / total) * 100);
+  const downloaded = Number(job.downloaded) || 0;
+  const skipped = Number(job.skipped) || 0;
+  const failed = Number(job.failed) || 0;
+  coverDownloadToast.querySelector(".toast-progress-text").textContent =
+    `正在保存本地封面 ${done} / ${total}（${pct}%） · 成功 ${downloaded} · 已存在 ${skipped} · 失败 ${failed}`;
+  coverDownloadToast.querySelector(".toast-progress-fill").style.width = `${pct}%`;
+}
+
+function finishCoverDownloadProgress(message, kind = "success") {
+  if (!coverDownloadToast) return;
+  coverDownloadToast.className = `toast toast-progress toast-${kind} toast-visible`;
+  coverDownloadToast.querySelector(".toast-progress-text").textContent = message;
+  coverDownloadToast.querySelector(".toast-progress-fill").style.width = "100%";
+  const toast = coverDownloadToast;
+  coverDownloadToast = null;
+  setTimeout(() => {
+    toast.classList.remove("toast-visible");
+    setTimeout(() => toast.remove(), 300);
+  }, 1800);
+}
+
+function askLocalCoverDownload(existingCount, totalCount) {
+  return new Promise((resolve) => {
+    const modal = document.createElement("div");
+    modal.className = "cover-modal";
+    modal.innerHTML = `
+      <div class="cover-box" role="dialog" aria-modal="true" aria-labelledby="cover-download-title">
+        <div class="cover-head">
+          <div class="cover-title" id="cover-download-title">保存本地封面</div>
+          <button class="cover-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="cover-desc">
+          已连接本地 server.py。焦点节点会继续通过反代懒加载，成功加载的封面会自动保存到本地。<br>
+          是否同时后台保存全部封面？已有 ${existingCount} 张，最多处理 ${totalCount} 张。下载不会阻塞节点图。
+        </div>
+        <div class="cover-actions">
+          <button class="cover-btn ghost" data-action="cancel" type="button">暂不保存</button>
+          <button class="cover-btn primary" data-action="download" type="button">后台保存</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    const close = (value) => { modal.remove(); resolve(value); };
+    modal.querySelector("[data-action=cancel]").addEventListener("click", () => close(false));
+    modal.querySelector("[data-action=download]").addEventListener("click", () => close(true));
+    modal.querySelector(".cover-close").addEventListener("click", () => close(false));
+  });
+}
+
+async function downloadLocalCovers(data, source, orderedNodes = null) {
+  const nodes = (orderedNodes || data.nodes || [])
+    .filter((node) => node.type === "core" && node.cover_url)
+    .map((node) => ({ key: String(node.key), cover_url: node.cover_url }));
+  if (!nodes.length) return;
+  const response = await fetch(`${source.base}/cover_download/start`, {
+    method: "POST", mode: "cors", cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nodes }),
+  });
+  if (!response.ok) throw new Error(`启动本地保存失败：${response.status}`);
+  const started = await response.json();
+  updateCoverDownloadProgress(started);
+  let job = started;
+  let cursor = Number(started.ready_cursor) || 0;
+  while (job.status === "running") {
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const status = await fetch(`${source.base}/cover_download/status?id=${encodeURIComponent(started.id)}&since=${cursor}`, { mode: "cors", cache: "no-store" });
+    if (!status.ok) throw new Error(`读取本地保存进度失败：${status.status}`);
+    job = await status.json();
+    cursor = Number(job.ready_cursor) || cursor;
+    updateCoverDownloadProgress(job);
+  }
+  if (job.status !== "done") throw new Error("本地保存失败");
+  finishCoverDownloadProgress(`本地封面保存完成：${job.downloaded} 新增，${job.skipped} 已存在，${job.failed} 失败`);
+}
+
 function showToast(message, kind = "warning") {
   let container = document.getElementById("toast-container");
   if (!container) {
@@ -619,11 +768,11 @@ function main() {
     }, 700);
   }
 
-  async function boot() {
-    setProgress(0, "检测本地 server.py……", "127.0.0.1:1119");
-    const localServer = await detectLocalServer();
+  async function boot(localServerOverride = null) {
+    const localServer = localServerOverride || await detectLocalServer();
     let data;
     let coverMap;
+    let localDownloadContext = null;
     if (localServer) {
       showToast("已连接本地 server.py，使用本地图数据。", "success");
       setProgress(5, "加载本地图数据……", localServer.base + "/graph.json");
@@ -637,7 +786,8 @@ function main() {
       }
       if (!coverMap) {
         const existingLocal = await loadExistingLocalCovers(localServer);
-        coverMap = buildLocalCoverMap(data, localServer, new Set(existingLocal.keys));
+        coverMap = buildLocalCoverMap(data, localServer);
+        localDownloadContext = { data, source: localServer, existingCount: existingLocal.count };
       }
     } else {
       showToast("未连接本地 server.py，使用在线静态数据。", "warning");
@@ -788,7 +938,7 @@ function main() {
         if (state.status !== "queued") continue;
         state.status = "loading";
         activeCoverLoads += 1;
-        loadCoverObjectUrlWithRetry(item.src)
+        loadCoverObjectUrlWithRetry(item.src, item.cacheUrl)
           .then((imageSource) => {
             if (!imageSource) throw new Error("empty image");
             state.status = "ready";
@@ -831,7 +981,7 @@ function main() {
         state.priority = (insideViewport ? 0 : 1e9) + centerDistance;
         if (state.status === "idle") {
           state.status = "queued";
-          coverQueue.push({ key, src: attrs.thumb });
+          coverQueue.push({ key, src: attrs.thumb, cacheUrl: attrs.cacheUrl || "" });
         }
       });
 
@@ -882,6 +1032,30 @@ function main() {
     startFade();
     finishLoading();
 
+    if (localDownloadContext) {
+      const context = localDownloadContext;
+      setTimeout(async () => {
+        const total = (context.data.nodes || []).filter((node) => node.type === "core" && node.cover_url).length;
+        if (!await askLocalCoverDownload(context.existingCount, total)) return;
+        try {
+          const centerX = container.clientWidth / 2;
+          const centerY = container.clientHeight / 2;
+          const orderedNodes = [...context.data.nodes].sort((a, b) => {
+            const pa = renderer.graphToViewport({ x: a.x, y: a.y });
+            const pb = renderer.graphToViewport({ x: b.x, y: b.y });
+            const ia = pa.x >= 0 && pa.x <= container.clientWidth && pa.y >= 0 && pa.y <= container.clientHeight;
+            const ib = pb.x >= 0 && pb.x <= container.clientWidth && pb.y >= 0 && pb.y <= container.clientHeight;
+            const da = Math.hypot(pa.x - centerX, pa.y - centerY);
+            const db = Math.hypot(pb.x - centerX, pb.y - centerY);
+            return (ia ? 0 : 1e9) + da - ((ib ? 0 : 1e9) + db);
+          });
+          await downloadLocalCovers(context.data, context.source, orderedNodes);
+        } catch (error) {
+          finishCoverDownloadProgress("本地保存失败，焦点反代加载仍可继续。", "warning");
+          showToast("本地封面后台保存失败，焦点反代加载仍可继续。", "warning");
+        }
+      }, 0);
+    }
   }
 
   function bindEvents() {
@@ -1898,11 +2072,17 @@ function main() {
     }
   }
 
-  ensureServiceWorker().then(() => boot()).catch((err) => {
-    statusText.textContent = "出错了：" + err.message;
-    progressLabel.textContent = "";
-    console.error("[错误]", err);
-  });
+  detectLocalServer()
+    .then(async (localServer) => {
+      // 本地模式下图片统一走 server.py /cover_proxy，避免线上 SW 改写这条链路。
+      if (!localServer) await ensureServiceWorker();
+      return boot(localServer);
+    })
+    .catch((err) => {
+      statusText.textContent = "出错了：" + err.message;
+      progressLabel.textContent = "";
+      console.error("[错误]", err);
+    });
 }
 
 main();
