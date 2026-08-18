@@ -8076,6 +8076,7 @@ var COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
 var COVER_CACHE_NAME = "star-graph-covers-v1";
 var COVER_LOAD_CONCURRENCY = 8;
 var COVER_LOAD_RETRIES = 2;
+var COVER_NETWORK_INTERVAL_MS = 150;
 function communityColor(community, type) {
   if (type === "external") return EXTERNAL_COLOR;
   if (community < 0) return ISOLATED_COLOR;
@@ -8147,6 +8148,19 @@ function coverPaths(node, coverMap) {
   return coverMap.get(String(node.key)) || null;
 }
 var coverCachePromise = null;
+var coverNetworkTail = Promise.resolve();
+var nextCoverNetworkTime = 0;
+function runCoverNetworkTask(task) {
+  const run = coverNetworkTail.then(async () => {
+    const wait = Math.max(0, nextCoverNetworkTime - performance.now());
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    nextCoverNetworkTime = performance.now() + COVER_NETWORK_INTERVAL_MS;
+    return task();
+  });
+  coverNetworkTail = run.catch(() => {
+  });
+  return run;
+}
 function getCoverCache() {
   if (!("caches" in window)) return Promise.resolve(null);
   if (!coverCachePromise) {
@@ -8172,21 +8186,23 @@ async function loadCoverObjectUrl(source) {
   if (cache) {
     const cached = await cache.match(url).catch(() => null);
     if (cached && cached.ok) {
-      const objectUrl2 = await decodeCoverBlob(await cached.blob());
-      if (objectUrl2) return objectUrl2;
+      const objectUrl = await decodeCoverBlob(await cached.blob());
+      if (objectUrl) return { objectUrl, fromCache: true };
       await cache.delete(url).catch(() => {
       });
     }
   }
-  const response = await fetch(url, { cache: "force-cache" });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const copy = response.clone();
-  const blob = await response.blob();
-  if (cache) await cache.put(url, copy).catch(() => {
+  return runCoverNetworkTask(async () => {
+    const response = await fetch(url, { cache: "force-cache" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const copy = response.clone();
+    const blob = await response.blob();
+    if (cache) await cache.put(url, copy).catch(() => {
+    });
+    const objectUrl = await decodeCoverBlob(blob);
+    if (!objectUrl) throw new Error("invalid image");
+    return { objectUrl, fromCache: false };
   });
-  const objectUrl = await decodeCoverBlob(blob);
-  if (!objectUrl) throw new Error("invalid image");
-  return objectUrl;
 }
 async function loadCoverObjectUrlWithRetry(source) {
   for (let attempt = 0; attempt <= COVER_LOAD_RETRIES; attempt++) {
@@ -8517,7 +8533,8 @@ function main() {
         if (state.status !== "queued") continue;
         state.status = "loading";
         activeCoverLoads += 1;
-        loadCoverObjectUrlWithRetry(item.src).then((objectUrl) => {
+        loadCoverObjectUrlWithRetry(item.src).then((result) => {
+          const objectUrl = result && result.objectUrl;
           if (!objectUrl) throw new Error("empty image");
           state.status = "ready";
           state.objectUrl = objectUrl;
@@ -8539,20 +8556,22 @@ function main() {
       const w = container.clientWidth;
       const h = container.clientHeight;
       const margin = 320;
+      if (w <= 0 || h <= 0) return;
       const visible = /* @__PURE__ */ new Set();
       graph.forEachNode((key, attrs) => {
         if (!attrs.thumb || attrs.type === "image") return;
         const state = coverState(key);
         if (state.status === "ready" || state.status === "failed" || state.status === "loading") return;
         const point = renderer.graphToViewport({ x: attrs.x, y: attrs.y });
-        const inside = point.x >= -margin && point.x <= w + margin && point.y >= -margin && point.y <= h + margin;
-        if (!inside) return;
-        visible.add(key);
-        const dx = point.x < 0 ? -point.x : point.x > w ? point.x - w : 0;
-        const dy = point.y < 0 ? -point.y : point.y > h ? point.y - h : 0;
-        const distance = Math.sqrt(dx * dx + dy * dy);
+        const withinMargin = point.x >= -margin && point.x <= w + margin && point.y >= -margin && point.y <= h + margin;
+        if (!withinMargin) return;
         const screenSize = renderer.scaleSize(attrs.size);
-        state.priority = (point.x >= 0 && point.x <= w && point.y >= 0 && point.y <= h ? 0 : 1) * 1e9 + distance * 100 - screenSize;
+        if (!Number.isFinite(screenSize) || screenSize < 6) return;
+        if (nodeAlpha.get(key) === 0) return;
+        visible.add(key);
+        const centerDistance = Math.hypot(point.x - w / 2, point.y - h / 2);
+        const insideViewport = point.x >= 0 && point.x <= w && point.y >= 0 && point.y <= h;
+        state.priority = (insideViewport ? 0 : 1e9) + centerDistance;
         if (state.status === "idle") {
           state.status = "queued";
           coverQueue.push({ key, src: attrs.thumb });

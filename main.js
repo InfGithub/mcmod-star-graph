@@ -124,6 +124,7 @@ const COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
 const COVER_CACHE_NAME = "star-graph-covers-v1";
 const COVER_LOAD_CONCURRENCY = 8; // 仅限制网络并发，不限制最终加载数量
 const COVER_LOAD_RETRIES = 2;
+const COVER_NETWORK_INTERVAL_MS = 150; // 仅网络请求之间的间隔；缓存命中不等待
 
 function communityColor(community, type) {
   if (type === "external") return EXTERNAL_COLOR;
@@ -214,6 +215,21 @@ function coverPaths(node, coverMap) {
 // 图片缓存：Cache Storage 优先，浏览器 HTTP cache 作为第二层缓存。
 // object URL 在当前页面生命周期内保持不变，节点离开/重新进入视口不会重下。
 let coverCachePromise = null;
+let coverNetworkTail = Promise.resolve();
+let nextCoverNetworkTime = 0;
+
+// 缓存命中不进入这个队列；只有真正需要联网的图片才会在这里串行执行。
+function runCoverNetworkTask(task) {
+  const run = coverNetworkTail.then(async () => {
+    const wait = Math.max(0, nextCoverNetworkTime - performance.now());
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    nextCoverNetworkTime = performance.now() + COVER_NETWORK_INTERVAL_MS;
+    return task();
+  });
+  coverNetworkTail = run.catch(() => {});
+  return run;
+}
+
 function getCoverCache() {
   if (!("caches" in window)) return Promise.resolve(null);
   if (!coverCachePromise) {
@@ -244,20 +260,23 @@ async function loadCoverObjectUrl(source) {
     const cached = await cache.match(url).catch(() => null);
     if (cached && cached.ok) {
       const objectUrl = await decodeCoverBlob(await cached.blob());
-      if (objectUrl) return objectUrl;
+      if (objectUrl) return { objectUrl, fromCache: true };
       await cache.delete(url).catch(() => {});
     }
   }
 
   // Cache Storage 未命中时再走浏览器 HTTP cache / 网络。
-  const response = await fetch(url, { cache: "force-cache" });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const copy = response.clone();
-  const blob = await response.blob();
-  if (cache) await cache.put(url, copy).catch(() => {});
-  const objectUrl = await decodeCoverBlob(blob);
-  if (!objectUrl) throw new Error("invalid image");
-  return objectUrl;
+  // 网络请求严格串行，并在请求开始之间留出固定间隔；缓存命中不会进入队列。
+  return runCoverNetworkTask(async () => {
+    const response = await fetch(url, { cache: "force-cache" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const copy = response.clone();
+    const blob = await response.blob();
+    if (cache) await cache.put(url, copy).catch(() => {});
+    const objectUrl = await decodeCoverBlob(blob);
+    if (!objectUrl) throw new Error("invalid image");
+    return { objectUrl, fromCache: false };
+  });
 }
 
 async function loadCoverObjectUrlWithRetry(source) {
@@ -634,7 +653,8 @@ function main() {
         state.status = "loading";
         activeCoverLoads += 1;
         loadCoverObjectUrlWithRetry(item.src)
-          .then((objectUrl) => {
+          .then((result) => {
+            const objectUrl = result && result.objectUrl;
             if (!objectUrl) throw new Error("empty image");
             state.status = "ready";
             state.objectUrl = objectUrl;
@@ -660,23 +680,25 @@ function main() {
       const w = container.clientWidth;
       const h = container.clientHeight;
       const margin = 320;
+      if (w <= 0 || h <= 0) return;
       const visible = new Set();
       graph.forEachNode((key, attrs) => {
         if (!attrs.thumb || attrs.type === "image") return;
         const state = coverState(key);
         if (state.status === "ready" || state.status === "failed" || state.status === "loading") return;
         const point = renderer.graphToViewport({ x: attrs.x, y: attrs.y });
-        const inside = point.x >= -margin && point.x <= w + margin &&
+        const withinMargin = point.x >= -margin && point.x <= w + margin &&
           point.y >= -margin && point.y <= h + margin;
-        if (!inside) return;
-        visible.add(key);
-        const dx = point.x < 0 ? -point.x : point.x > w ? point.x - w : 0;
-        const dy = point.y < 0 ? -point.y : point.y > h ? point.y - h : 0;
-        const distance = Math.sqrt(dx * dx + dy * dy);
+        if (!withinMargin) return;
+        // 节点太小或当前被 LoD 隐藏时不联网；放大/重新出现后会再次排队。
         const screenSize = renderer.scaleSize(attrs.size);
-        // 屏幕内节点优先，其次按距离和屏幕尺寸排序；没有总数上限。
-        state.priority = (point.x >= 0 && point.x <= w && point.y >= 0 && point.y <= h ? 0 : 1) * 1e9
-          + distance * 100 - screenSize;
+        if (!Number.isFinite(screenSize) || screenSize < 6) return;
+        if (nodeAlpha.get(key) === 0) return;
+        visible.add(key);
+        const centerDistance = Math.hypot(point.x - w / 2, point.y - h / 2);
+        const insideViewport = point.x >= 0 && point.x <= w && point.y >= 0 && point.y <= h;
+        // 以屏幕中心为优先级；屏幕内节点永远优先于屏幕外预取节点。
+        state.priority = (insideViewport ? 0 : 1e9) + centerDistance;
         if (state.status === "idle") {
           state.status = "queued";
           coverQueue.push({ key, src: attrs.thumb });
