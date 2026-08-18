@@ -1,0 +1,73 @@
+name: Deploy static site to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 每周从上游 Releases 拉最新数据包重新部署，数据更新无需本仓库改动
+    - cron: "30 2 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 仓库只做渲染，图数据从上游 InfGithub/mcmod-star-graph 的 Releases 抓取，
+      # 不依赖仓库内文件；抓到的最新数据包直接进发布产物。
+      - name: Fetch latest graph data from upstream releases
+        id: fetch-data
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          API="repos/InfGithub/mcmod-star-graph/releases/latest"
+          tag="$(gh api "$API" --jq '.tag_name')"
+          asset="$(gh api "$API" --jq '[.assets[] | select(.name | startswith("graph-") and endswith(".json")) | .name][0] // ""')"
+          if [ -z "$asset" ]; then
+            echo "::error::上游最新 release 没有 graph-*.json 资产 (tag=$tag)"
+            exit 1
+          fi
+          mkdir -p dist
+          curl -fL --retry 3 -o dist/graph.json \
+            "https://github.com/InfGithub/mcmod-star-graph/releases/download/${tag}/${asset}"
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+          echo "fetched $asset (tag $tag)"
+
+      - name: Assemble static artifact
+        run: |
+          cp index.html style.css main.bundle.js dist/
+          touch dist/.nojekyll
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          token: ${{ secrets.PAGES_TOKEN || github.token }}
+          enablement: ${{ secrets.PAGES_TOKEN != '' }}
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
