@@ -8073,8 +8073,7 @@ var HIGHLIGHT_EDGE_RGB = [255, 215, 0];
 var HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1);
 var COVER_MANIFEST_URL = "covers/manifest.json";
 var COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
-var COVER_CACHE_NAME = "star-graph-covers-v2";
-var COVER_LOAD_CONCURRENCY = 8;
+var COVER_LOAD_CONCURRENCY = 24;
 var COVER_LOAD_RETRIES = 2;
 var COVER_NETWORK_INTERVAL_MS = 150;
 function communityColor(community, type) {
@@ -8147,7 +8146,6 @@ async function loadCoverManifest() {
 function coverPaths(node, coverMap) {
   return coverMap.get(String(node.key)) || null;
 }
-var coverCachePromise = null;
 var coverNetworkTail = Promise.resolve();
 var nextCoverNetworkTime = 0;
 function runCoverNetworkTask(task) {
@@ -8161,13 +8159,6 @@ function runCoverNetworkTask(task) {
   });
   return run;
 }
-function getCoverCache() {
-  if (!("caches" in window)) return Promise.resolve(null);
-  if (!coverCachePromise) {
-    coverCachePromise = caches.open(COVER_CACHE_NAME).catch(() => null);
-  }
-  return coverCachePromise;
-}
 function decodeCoverBlob(blob) {
   return new Promise((resolve) => {
     const objectUrl = URL.createObjectURL(blob);
@@ -8180,17 +8171,10 @@ function decodeCoverBlob(blob) {
     image.src = objectUrl;
   });
 }
-async function loadCoverObjectUrl(source) {
-  const url = new URL(source, document.baseURI).href;
-  const cache = await getCoverCache();
-  if (cache) {
-    const cached = await cache.match(url).catch(() => null);
-    if (cached && cached.ok) {
-      const objectUrl = await decodeCoverBlob(await cached.blob());
-      if (objectUrl) return { objectUrl, fromCache: true };
-      await cache.delete(url).catch(() => {
-      });
-    }
+async function fetchCoverResponse(url) {
+  const controlled = !!navigator.serviceWorker?.controller;
+  if (controlled) {
+    return fetch(url, { cache: "no-store" });
   }
   return runCoverNetworkTask(async () => {
     let response = await fetch(url, { cache: "force-cache" });
@@ -8199,15 +8183,16 @@ async function loadCoverObjectUrl(source) {
       nextCoverNetworkTime = performance.now() + COVER_NETWORK_INTERVAL_MS;
       response = await fetch(url, { cache: "no-store" });
     }
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const copy = response.clone();
-    const blob = await response.blob();
-    if (cache) await cache.put(url, copy).catch(() => {
-    });
-    const objectUrl = await decodeCoverBlob(blob);
-    if (!objectUrl) throw new Error("invalid image");
-    return { objectUrl, fromCache: false };
+    return response;
   });
+}
+async function loadCoverObjectUrl(source) {
+  const url = new URL(source, document.baseURI).href;
+  const response = await fetchCoverResponse(url);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const objectUrl = await decodeCoverBlob(await response.blob());
+  if (!objectUrl) throw new Error("invalid image");
+  return objectUrl;
 }
 async function loadCoverObjectUrlWithRetry(source) {
   for (let attempt = 0; attempt <= COVER_LOAD_RETRIES; attempt++) {
@@ -8219,6 +8204,17 @@ async function loadCoverObjectUrlWithRetry(source) {
     }
   }
   return null;
+}
+async function ensureServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    const registration = await navigator.serviceWorker.register("./sw.js", { scope: "./" });
+    await navigator.serviceWorker.ready;
+    if (!navigator.serviceWorker.controller && registration.active) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  } catch {
+  }
 }
 function buildGraph(data, coverMap) {
   const graph = new import_graphology.default({ multi: true });
@@ -8522,6 +8518,28 @@ function main() {
     const coverQueue = [];
     let activeCoverLoads = 0;
     let coverScheduleTimer = null;
+    const pendingCoverUpdates = /* @__PURE__ */ new Map();
+    let coverUpdateFrame = null;
+    function flushCoverImageUpdates() {
+      coverUpdateFrame = null;
+      if (!pendingCoverUpdates.size) return;
+      const updates = new Map(pendingCoverUpdates);
+      pendingCoverUpdates.clear();
+      graph.updateEachNodeAttributes(
+        (key, attrs) => {
+          const objectUrl = updates.get(key);
+          return objectUrl ? { ...attrs, image: objectUrl, type: "image" } : attrs;
+        },
+        { attributes: ["image", "type"] }
+      );
+      renderer.refresh();
+    }
+    function queueCoverImageUpdate(key, objectUrl) {
+      pendingCoverUpdates.set(key, objectUrl);
+      if (coverUpdateFrame === null) {
+        coverUpdateFrame = requestAnimationFrame(flushCoverImageUpdates);
+      }
+    }
     function coverState(key) {
       let state = coverStates.get(key);
       if (!state) {
@@ -8543,12 +8561,7 @@ function main() {
           if (!objectUrl) throw new Error("empty image");
           state.status = "ready";
           state.objectUrl = objectUrl;
-          graph.updateNodeAttributes(item.key, (attrs) => ({
-            ...attrs,
-            image: objectUrl,
-            type: "image"
-          }), { attributes: ["image", "type"] });
-          renderer.refresh();
+          queueCoverImageUpdate(item.key, objectUrl);
         }).catch(() => {
           state.status = "failed";
         }).finally(() => {
@@ -9515,7 +9528,7 @@ function main() {
       }
     }
   }
-  boot().catch((err) => {
+  ensureServiceWorker().then(() => boot()).catch((err) => {
     statusText.textContent = "\u51FA\u9519\u4E86\uFF1A" + err.message;
     progressLabel.textContent = "";
     console.error("[\u9519\u8BEF]", err);

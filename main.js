@@ -121,8 +121,7 @@ const HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1.0);
 // 展示用 96px 缩略图（covers/small/）用于图上渲染，原图保留供导出。
 const COVER_MANIFEST_URL = "covers/manifest.json";
 const COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
-const COVER_CACHE_NAME = "star-graph-covers-v2";
-const COVER_LOAD_CONCURRENCY = 8; // 仅限制网络并发，不限制最终加载数量
+const COVER_LOAD_CONCURRENCY = 24; // 缓存解码并发；真正联网仍由网络队列串行控制
 const COVER_LOAD_RETRIES = 2;
 const COVER_NETWORK_INTERVAL_MS = 150; // 仅网络请求之间的间隔；缓存命中不等待
 
@@ -212,13 +211,11 @@ function coverPaths(node, coverMap) {
   return coverMap.get(String(node.key)) || null;
 }
 
-// 图片缓存：Cache Storage 优先，浏览器 HTTP cache 作为第二层缓存。
-// object URL 在当前页面生命周期内保持不变，节点离开/重新进入视口不会重下。
-let coverCachePromise = null;
+// 图片加载：Service Worker 负责 Cache Storage；页面只负责解码和调度。
+// SW 命中缓存时不走网络限速；未受 SW 控制的首屏使用本地兜底队列。
 let coverNetworkTail = Promise.resolve();
 let nextCoverNetworkTime = 0;
 
-// 缓存命中不进入这个队列；只有真正需要联网的图片才会在这里串行执行。
 function runCoverNetworkTask(task) {
   const run = coverNetworkTail.then(async () => {
     const wait = Math.max(0, nextCoverNetworkTime - performance.now());
@@ -228,14 +225,6 @@ function runCoverNetworkTask(task) {
   });
   coverNetworkTail = run.catch(() => {});
   return run;
-}
-
-function getCoverCache() {
-  if (!("caches" in window)) return Promise.resolve(null);
-  if (!coverCachePromise) {
-    coverCachePromise = caches.open(COVER_CACHE_NAME).catch(() => null);
-  }
-  return coverCachePromise;
 }
 
 function decodeCoverBlob(blob) {
@@ -251,38 +240,32 @@ function decodeCoverBlob(blob) {
   });
 }
 
-async function loadCoverObjectUrl(source) {
-  const url = new URL(source, document.baseURI).href;
-  const cache = await getCoverCache();
-
-  // 先查持久化 Cache Storage；命中后完全不访问网络。
-  if (cache) {
-    const cached = await cache.match(url).catch(() => null);
-    if (cached && cached.ok) {
-      const objectUrl = await decodeCoverBlob(await cached.blob());
-      if (objectUrl) return { objectUrl, fromCache: true };
-      await cache.delete(url).catch(() => {});
-    }
+async function fetchCoverResponse(url) {
+  const controlled = !!navigator.serviceWorker?.controller;
+  if (controlled) {
+    // SW 先查 Cache Storage；只有 miss 才进入 SW 的串行网络队列。
+    return fetch(url, { cache: "no-store" });
   }
 
-  // Cache Storage 未命中时再走浏览器 HTTP cache / 网络。
-  // 网络请求严格串行，并在请求开始之间留出固定间隔；缓存命中不会进入队列。
+  // 首次安装 SW 尚未接管当前页面时的兜底，避免旧磁盘缓存 570 继续复用。
   return runCoverNetworkTask(async () => {
     let response = await fetch(url, { cache: "force-cache" });
-    // 丢弃浏览器磁盘缓存中的异常状态（例如 570），避免把旧的坏缓存继续使用。
     if (response.status === 570) {
       await new Promise((resolve) => setTimeout(resolve, COVER_NETWORK_INTERVAL_MS));
       nextCoverNetworkTime = performance.now() + COVER_NETWORK_INTERVAL_MS;
       response = await fetch(url, { cache: "no-store" });
     }
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const copy = response.clone();
-    const blob = await response.blob();
-    if (cache) await cache.put(url, copy).catch(() => {});
-    const objectUrl = await decodeCoverBlob(blob);
-    if (!objectUrl) throw new Error("invalid image");
-    return { objectUrl, fromCache: false };
+    return response;
   });
+}
+
+async function loadCoverObjectUrl(source) {
+  const url = new URL(source, document.baseURI).href;
+  const response = await fetchCoverResponse(url);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const objectUrl = await decodeCoverBlob(await response.blob());
+  if (!objectUrl) throw new Error("invalid image");
+  return objectUrl;
 }
 
 async function loadCoverObjectUrlWithRetry(source) {
@@ -295,6 +278,20 @@ async function loadCoverObjectUrlWithRetry(source) {
     }
   }
   return null;
+}
+
+async function ensureServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    const registration = await navigator.serviceWorker.register("./sw.js", { scope: "./" });
+    await navigator.serviceWorker.ready;
+    // clients.claim() 通常会立即接管；给浏览器一个事件循环完成 controller 更新。
+    if (!navigator.serviceWorker.controller && registration.active) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  } catch {
+    // SW 不可用时继续使用 main.js 的网络队列兜底。
+  }
 }
 
 function buildGraph(data, coverMap) {
@@ -640,6 +637,32 @@ function main() {
     const coverQueue = [];
     let activeCoverLoads = 0;
     let coverScheduleTimer = null;
+    const pendingCoverUpdates = new Map();
+    let coverUpdateFrame = null;
+
+    // 图片解码完成后只入队，按帧批量更新 Sigma，避免 7k 张图各触发一次
+    // graph 更新和 WebGL refresh，缓存命中时尤其能降低“排队很慢”的感觉。
+    function flushCoverImageUpdates() {
+      coverUpdateFrame = null;
+      if (!pendingCoverUpdates.size) return;
+      const updates = new Map(pendingCoverUpdates);
+      pendingCoverUpdates.clear();
+      graph.updateEachNodeAttributes(
+        (key, attrs) => {
+          const objectUrl = updates.get(key);
+          return objectUrl ? { ...attrs, image: objectUrl, type: "image" } : attrs;
+        },
+        { attributes: ["image", "type"] },
+      );
+      renderer.refresh();
+    }
+
+    function queueCoverImageUpdate(key, objectUrl) {
+      pendingCoverUpdates.set(key, objectUrl);
+      if (coverUpdateFrame === null) {
+        coverUpdateFrame = requestAnimationFrame(flushCoverImageUpdates);
+      }
+    }
 
     function coverState(key) {
       let state = coverStates.get(key);
@@ -664,12 +687,7 @@ function main() {
             if (!objectUrl) throw new Error("empty image");
             state.status = "ready";
             state.objectUrl = objectUrl;
-            graph.updateNodeAttributes(item.key, (attrs) => ({
-              ...attrs,
-              image: objectUrl,
-              type: "image",
-            }), { attributes: ["image", "type"] });
-            renderer.refresh();
+            queueCoverImageUpdate(item.key, objectUrl);
           })
           .catch(() => {
             // 失败只记状态，不向控制台输出重复堆栈；下次重新打开页面可重试。
@@ -1773,7 +1791,7 @@ function main() {
     }
   }
 
-  boot().catch((err) => {
+  ensureServiceWorker().then(() => boot()).catch((err) => {
     statusText.textContent = "出错了：" + err.message;
     progressLabel.textContent = "";
     console.error("[错误]", err);
