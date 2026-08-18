@@ -2,11 +2,11 @@
  * star_graph/main.js - NeoForge 1.21.1 生态关系图前端
  *
  * 基于 sigma.js v3 + graphology，数据来自 graph.json（GitHub Releases 分发）。
- * 封面通过 /cover_proxy 同源代理下载（绕过 CDN 防盗链），缓存到 IndexedDB，
- * 以 blob URL 渲染并用于 PNG 导出（避免 canvas 污染）。
+ * 封面由 CI 从 MC 百科预生成到 covers/，随站点静态发布；纯前端运行，
+ * 不依赖 python 后端（无需 /cover_proxy / IndexedDB）。
  *
  * 构建：npm run build（esbuild → main.bundle.js），需先 npm install。
- * 运行：python server.py，然后访问 http://127.0.0.1:1119/
+ * 运行：任意静态服务器（python -m http.server 1119 / GitHub Pages）。
  */
 import Graph from "graphology";
 import Sigma from "sigma";
@@ -117,13 +117,8 @@ const HIGHLIGHT_NODE_COLOR = "#ffd700"; // 六度分隔路径高亮色（节点�
 const HIGHLIGHT_EDGE_RGB = [255, 215, 0]; // 六度分隔路径高亮色（边）
 const HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1.0);
 
-// 封面：IndexedDB 缓存 + 强制下载门槛
-const COVER_DB_NAME = "mcmod-graph-covers";
-const COVER_STORE = "covers";
-const COVER_CONCURRENCY = 20;   // 并发下载数
-const COVER_INTERVAL_MS = 200;  // 每个 worker 完成一张后的固定间隔
-const COVER_RETRIES = 2;        // 每张失败后的额外重试次数
-const COVER_PROXY = "/cover_proxy?url="; // 同源代理（绕过 i.mcmod.cn 防盗链）
+// 封面：CI 预生成到 covers/ 并以清单分发（纯前端静态加载，浏览器 HTTP 缓存）
+const COVER_MANIFEST_URL = "covers/manifest.json";
 
 function communityColor(community, type) {
   if (type === "external") return EXTERNAL_COLOR;
@@ -171,320 +166,30 @@ async function loadGraph() {
   return res.json();
 }
 
-// ==================== 封面：IndexedDB 缓存 + 强制下载 ====================
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function openCoverDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(COVER_DB_NAME, 1);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(COVER_STORE)) {
-        db.createObjectStore(COVER_STORE); // key = class_id
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function idbGet(db, key) {
-  return new Promise((resolve, reject) => {
-    const req = db.transaction(COVER_STORE, "readonly").objectStore(COVER_STORE).get(key);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function idbPut(db, key, value) {
-  return new Promise((resolve, reject) => {
-    const req = db.transaction(COVER_STORE, "readwrite").objectStore(COVER_STORE).put(value, key);
-    req.onsuccess = () => resolve();
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function idbCount(db) {
-  return new Promise((resolve, reject) => {
-    const req = db.transaction(COVER_STORE, "readonly").objectStore(COVER_STORE).count();
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function idbClear(db) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(COVER_STORE, "readwrite");
-    tx.objectStore(COVER_STORE).clear();
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-// 协议补全（尺寸由后端 COVER_SIZE 控制，见 server.py）
-function normalizeCoverUrl(url) {
-  if (!url) return null;
-  let u = String(url).trim();
-  if (u.startsWith("//")) u = "https:" + u;
-  return u;
-}
-
-// 从 IndexedDB 读取全部已缓存封面 → blob URL map
-async function loadAllCovers(db, items) {
-  const map = new Map();
-  for (const item of items) {
-    try {
-      const blob = await idbGet(db, item.key);
-      if (blob) map.set(item.key, URL.createObjectURL(blob));
-    } catch (e) { /* 单条失败忽略 */ }
-  }
-  return map;
-}
-
-// 并发下载封面，每张重试 COVER_RETRIES 次；返回 { failed, failedKeys, errors }
-async function downloadCovers(db, items, onProgress) {
-  let idx = 0;
-  let done = 0;
-  let failed = 0;
-  const failedKeys = [];
-  const errors = [];
-
-  async function worker() {
-    while (idx < items.length) {
-      const i = idx++;
-      const item = items[i];
-      let ok = false;
-      let lastErr = "";
-      for (let attempt = 0; attempt <= COVER_RETRIES && !ok; attempt++) {
-        try {
-          const resp = await fetch(COVER_PROXY + encodeURIComponent(item.url));
-          if (!resp.ok) throw new Error("HTTP " + resp.status);
-          const blob = await resp.blob();
-          await idbPut(db, item.key, blob);
-          ok = true;
-        } catch (e) {
-          lastErr = String((e && e.message) || e);
-          if (!ok && attempt < COVER_RETRIES) {
-            await sleep(300 * (attempt + 1));
-          }
-        }
-      }
-      if (!ok) {
-        failed++;
-        failedKeys.push(item.key);
-        errors.push({ key: item.key, url: item.url, error: lastErr });
-        console.error("[错误] 封面下载失败", item.key, lastErr, item.url);
-      }
-      done++;
-      if (onProgress) onProgress(done, items.length, failed);
-      await sleep(COVER_INTERVAL_MS);
-    }
-  }
-
-  const workers = [];
-  for (let w = 0; w < COVER_CONCURRENCY; w++) workers.push(worker());
-  await Promise.all(workers);
-  return { failed, failedKeys, errors };
-}
-
-// 强制下载门槛 modal。resolve({ blobUrls }) 表示可进入星图。
-function showCoverModal(db, coverItems) {
-  return new Promise((resolve) => {
-    const coverByKey = new Map(coverItems.map((it) => [it.key, it.url]));
-
-    const modal = document.createElement("div");
-    modal.className = "cover-modal";
-    modal.innerHTML =
-      '<div class="cover-box">' +
-      '  <div class="cover-head">' +
-      '    <span class="cover-title"></span>' +
-      '    <button class="cover-close" title="拒绝下载">×</button>' +
-      "  </div>" +
-      '  <div class="cover-desc"></div>' +
-      '  <div class="cover-progress hidden">' +
-      '    <div class="cover-track"><div class="cover-fill"></div></div>' +
-      '    <div class="cover-label"></div>' +
-      "  </div>" +
-      '  <div class="cover-actions">' +
-      '    <button class="cover-btn primary"></button>' +
-      '    <button class="cover-btn ghost hidden"></button>' +
-      "  </div>" +
-      "</div>";
-    document.body.appendChild(modal);
-
-    const titleEl = modal.querySelector(".cover-title");
-    const descEl = modal.querySelector(".cover-desc");
-    const closeEl = modal.querySelector(".cover-close");
-    const progressEl = modal.querySelector(".cover-progress");
-    const fillEl = modal.querySelector(".cover-fill");
-    const labelEl = modal.querySelector(".cover-label");
-    const primaryBtn = modal.querySelector(".cover-btn.primary");
-    const ghostBtn = modal.querySelector(".cover-btn.ghost");
-
-    let state = "confirm";
-    let pending = coverItems.slice();
-    let doneCount = 0;
-    let failedCount = 0;
-    let failedKeys = [];
-    let failErrors = [];
-    let elapsedStart = 0;
-
-    const totalMB = Math.max(1, Math.round((coverItems.length * 0.02)));
-
-    function showState() {
-      closeEl.classList.toggle("hidden", state !== "confirm");
-      progressEl.classList.toggle("hidden", state !== "downloading");
-      ghostBtn.classList.toggle("hidden", state !== "failed");
-      if (state === "confirm") {
-        titleEl.textContent = "下载封面";
-        descEl.textContent =
-          "本图需要下载 " + coverItems.length + " 张模组封面（约 " + totalMB + " MB）才能正常使用。" +
-          "封面将缓存到浏览器本地，下次打开无需重复下载。";
-        primaryBtn.textContent = "确定下载";
-        primaryBtn.classList.remove("hidden");
-      } else if (state === "refuse") {
-        titleEl.textContent = "未下载封面";
-        descEl.textContent = "封面是本图的核心视觉元素，未下载无法使用。";
-        primaryBtn.textContent = "重新下载封面";
-        primaryBtn.classList.remove("hidden");
-      } else if (state === "downloading") {
-        titleEl.textContent = "正在下载封面";
-        descEl.textContent = "下载完成后自动进入星图。";
-        primaryBtn.classList.add("hidden");
-        updateProgress();
-      } else if (state === "failed") {
-        titleEl.textContent = "部分封面下载失败";
-        const reasons = Array.from(new Set(failErrors.map((e) => e.error))).slice(0, 3);
-        let desc =
-          failedCount + " 张封面未能下载（模组可能已删除或网络错误）。";
-        if (reasons.length) desc += "\n原因：" + reasons.join("；");
-        descEl.textContent = desc;
-        primaryBtn.textContent = "进入图";
-        primaryBtn.classList.remove("hidden");
-        ghostBtn.textContent = "重试下载";
-      }
-    }
-
-    function updateProgress() {
-      const total = pending.length;
-      const pct = total ? Math.round((doneCount / total) * 100) : 100;
-      fillEl.style.width = pct + "%";
-      const elapsed = (Date.now() - elapsedStart) / 1000;
-      const speed = doneCount / Math.max(1, elapsed);
-      const eta = speed > 0 ? formatDuration(((total - doneCount) / speed) * 1000) : "--";
-      let text = "已下载 " + doneCount + " / " + total + " (" + pct + "%)";
-      if (failedCount > 0) text += " · 失败 " + failedCount;
-      text += " · 剩余约 " + eta;
-      labelEl.textContent = text;
-    }
-
-    function finish(blobUrls) {
-      modal.remove();
-      resolve({ blobUrls });
-    }
-
-    async function startDownload(items) {
-      state = "downloading";
-      pending = items;
-      doneCount = 0;
-      failedCount = 0;
-      failedKeys = [];
-      elapsedStart = Date.now();
-      showState();
-
-      const result = await downloadCovers(db, items, (done, total, failed) => {
-        doneCount = done;
-        failedCount = failed;
-        updateProgress();
-      });
-      failedKeys = result.failedKeys;
-      failedCount = result.failed;
-      failErrors = result.errors;
-
-      if (result.failed > 0) {
-        state = "failed";
-        showState();
-      } else {
-        const blobUrls = await loadAllCovers(db, coverItems);
-        finish(blobUrls);
-      }
-    }
-
-    primaryBtn.addEventListener("click", async () => {
-      if (state === "confirm") {
-        startDownload(pending);
-      } else if (state === "refuse") {
-        startDownload(coverItems.slice());
-      } else if (state === "failed") {
-        const urls = await loadAllCovers(db, coverItems);
-        finish(urls);
-      }
-    });
-
-    ghostBtn.addEventListener("click", () => {
-      const retryItems = failedKeys.map((k) => ({ key: k, url: coverByKey.get(k) }));
-      startDownload(retryItems);
-    });
-
-    closeEl.addEventListener("click", () => {
-      if (state === "confirm") {
-        state = "refuse";
-        showState();
-      }
-    });
-
-    showState();
-  });
-}
-
-// 探测 clean 标志（python server.py clean）：true 时清空封面缓存（一次性）
-async function checkCleanFlag() {
+// ==================== 封面：CI 预生成 + 静态加载 ====================
+//
+// 纯前端运行：封面由 CI 从 MC 百科下载到 covers/ 并以 manifest.json 索引，
+// 随站点静态发布（浏览器 HTTP 缓存）；清单缺失时回退为纯色节点。
+async function loadCoverManifest() {
   try {
-    const resp = await fetch("/clean");
-    if (!resp.ok) return false;
-    const data = await resp.json();
-    return !!data.clean;
+    const res = await fetch(COVER_MANIFEST_URL);
+    if (!res.ok) return new Set();
+    const data = await res.json();
+    const keys = Array.isArray(data) ? data : data.keys;
+    return new Set(Array.isArray(keys) ? keys.map(String) : []);
   } catch (e) {
-    return false;
+    console.warn("[警告] 未找到静态封面清单，使用纯色节点", e);
+    return new Set();
   }
 }
 
-// 探测封面代理：ok=可用；missing=服务器存在但不支持代理(404)；unreachable=无服务器
-async function checkCoverProxy() {
-  try {
-    const resp = await fetch(COVER_PROXY);
-    // server.py 对无参请求返回 400，非法 host 返回 403——都是端点存在
-    return resp.status === 404 ? "missing" : "ok";
-  } catch (e) {
-    return "unreachable";
-  }
+function staticCoverPath(node, coverKeys) {
+  if (!coverKeys.has(String(node.key))) return null;
+  const path = node.cover || ("covers/" + node.key + ".jpg");
+  return String(path).replace(/^\/+/, "");
 }
 
-// 代理不可用时的提示页（不提供服务）
-function showProxyErrorModal(status) {
-  return new Promise((resolve) => {
-    const msg = status === "missing"
-      ? "当前服务器不支持封面代理。请使用 <b>python server.py</b> 启动本服务。"
-      : "无法连接本地服务器。请先运行 <b>python server.py</b>，然后访问 http://127.0.0.1:1119/";
-    const modal = document.createElement("div");
-    modal.className = "cover-modal";
-    modal.innerHTML =
-      '<div class="cover-box">' +
-      '  <div class="cover-head">' +
-      '    <span class="cover-title">无法下载封面</span>' +
-      "  </div>" +
-      '  <div class="cover-desc">' + msg + "</div>" +
-      '  <div class="cover-actions">' +
-      '    <button class="cover-btn primary">刷新页面</button>' +
-      "  </div>" +
-      "</div>";
-    document.body.appendChild(modal);
-    modal.querySelector(".cover-btn").addEventListener("click", () => location.reload());
-  });
-}
-
-function buildGraph(data, blobUrls) {
+function buildGraph(data, coverKeys) {
   const graph = new Graph({ multi: true });
   const labelIndex = new Map(); // lowercase name -> [keys]
   const degMap = new Map();
@@ -492,6 +197,7 @@ function buildGraph(data, blobUrls) {
   for (const n of data.nodes) {
     degMap.set(n.key, n.in_degree);
     const isCore = n.type === "core";
+    const coverUrl = isCore ? staticCoverPath(n, coverKeys) : null;
     graph.addNode(n.key, {
       x: typeof n.x === "number" ? n.x : Math.random() * 100,
       y: typeof n.y === "number" ? n.y : Math.random() * 100,
@@ -502,8 +208,8 @@ function buildGraph(data, blobUrls) {
       name_en: n.name_en,
       description: n.description,
       kind: n.type,
-      type: isCore ? "image" : "circle",
-      image: isCore ? (blobUrls.get(n.key) || null) : null,
+      type: coverUrl ? "image" : "circle",
+      image: coverUrl,
       views: n.views,
       favorites: n.favorites,
       category: n.category,
@@ -721,42 +427,17 @@ function main() {
   async function boot() {
     setProgress(0, "加载数据中……", "graph.json");
     const data = await loadGraph();
-    setProgress(10, "检查封面缓存……", "");
+    setProgress(10, "加载静态封面清单……", "covers/manifest.json");
     await new Promise((r) => setTimeout(r, 30));
 
-    // 封面清单（仅核心节点 + 有 URL 的）
-    const coverItems = [];
-    for (const n of data.nodes) {
-      if (n.type !== "core") continue;
-      const url = normalizeCoverUrl(n.cover_url);
-      if (url) coverItems.push({ key: n.key, url });
-    }
-
-    // 封面门槛：缓存齐全直接进；否则强制下载（拒绝不服务，失败可放行）
-    const db = await openCoverDB();
-    if (await checkCleanFlag()) {
-      await idbClear(db);
-      console.log("[信息] 已清理封面缓存（clean 模式）");
-    }
-    let blobUrls;
-    if (!coverItems.length) {
-      console.warn("[警告] graph.json 无封面 URL，节点将显示为纯色圆");
-      blobUrls = new Map();
-    } else if ((await idbCount(db)) >= coverItems.length) {
-      blobUrls = await loadAllCovers(db, coverItems);
-    } else {
-      const proxyStatus = await checkCoverProxy();
-      if (proxyStatus !== "ok") {
-        await showProxyErrorModal(proxyStatus);
-        return;
-      }
-      blobUrls = (await showCoverModal(db, coverItems)).blobUrls;
-    }
-
-    setProgress(20, "构建图结构……", "");
+    // 封面：CI 预生成后随站点静态发布；清单缺失时回退为纯色节点。
+    const coverKeys = await loadCoverManifest();
+    setProgress(20, coverKeys.size
+      ? "构建图结构……"
+      : "未找到封面，使用纯色节点……", coverKeys.size + " 张封面已就绪");
     await new Promise((r) => setTimeout(r, 30));
 
-    const built = buildGraph(data, blobUrls);
+    const built = buildGraph(data, coverKeys);
     graph = built.graph;
     searchIndex = buildSearch(data);
     allNodes = [...data.nodes].sort((a, b) => (b.views || 0) - (a.views || 0));

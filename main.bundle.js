@@ -2584,8 +2584,8 @@ var Program = /* @__PURE__ */ (function() {
       var program = loadProgram(gl, [vertexShader, fragmentShader]);
       var uniformLocations = {};
       def.UNIFORMS.forEach(function(uniformName) {
-        var location2 = gl.getUniformLocation(program, uniformName);
-        if (location2) uniformLocations[uniformName] = location2;
+        var location = gl.getUniformLocation(program, uniformName);
+        if (location) uniformLocations[uniformName] = location;
       });
       var attributeLocations = {};
       def.ATTRIBUTES.forEach(function(attr) {
@@ -2664,18 +2664,18 @@ var Program = /* @__PURE__ */ (function() {
     value: function bindAttribute(attr, program, offset, setDivisor) {
       var sizeFactor = SIZE_FACTOR_PER_ATTRIBUTE_TYPE[attr.type];
       if (typeof sizeFactor !== "number") throw new Error('Program.bind: yet unsupported attribute type "'.concat(attr.type, '"'));
-      var location2 = program.attributeLocations[attr.name];
+      var location = program.attributeLocations[attr.name];
       var gl = program.gl;
-      if (location2 !== -1) {
-        gl.enableVertexAttribArray(location2);
+      if (location !== -1) {
+        gl.enableVertexAttribArray(location);
         var stride = !this.isInstanced ? this.ATTRIBUTES_ITEMS_COUNT * Float32Array.BYTES_PER_ELEMENT : (setDivisor ? this.ATTRIBUTES_ITEMS_COUNT : getAttributesItemsCount(this.CONSTANT_ATTRIBUTES)) * Float32Array.BYTES_PER_ELEMENT;
-        gl.vertexAttribPointer(location2, attr.size, attr.type, attr.normalized || false, stride, offset);
+        gl.vertexAttribPointer(location, attr.size, attr.type, attr.normalized || false, stride, offset);
         if (this.isInstanced && setDivisor) {
           if (gl instanceof WebGL2RenderingContext) {
-            gl.vertexAttribDivisor(location2, 1);
+            gl.vertexAttribDivisor(location, 1);
           } else {
             var ext = gl.getExtension("ANGLE_instanced_arrays");
-            if (ext) ext.vertexAttribDivisorANGLE(location2, 1);
+            if (ext) ext.vertexAttribDivisorANGLE(location, 1);
           }
         }
       }
@@ -2684,16 +2684,16 @@ var Program = /* @__PURE__ */ (function() {
   }, {
     key: "unbindAttribute",
     value: function unbindAttribute(attr, program, unsetDivisor) {
-      var location2 = program.attributeLocations[attr.name];
+      var location = program.attributeLocations[attr.name];
       var gl = program.gl;
-      if (location2 !== -1) {
-        gl.disableVertexAttribArray(location2);
+      if (location !== -1) {
+        gl.disableVertexAttribArray(location);
         if (this.isInstanced && unsetDivisor) {
           if (gl instanceof WebGL2RenderingContext) {
-            gl.vertexAttribDivisor(location2, 0);
+            gl.vertexAttribDivisor(location, 0);
           } else {
             var ext = gl.getExtension("ANGLE_instanced_arrays");
-            if (ext) ext.vertexAttribDivisorANGLE(location2, 0);
+            if (ext) ext.vertexAttribDivisorANGLE(location, 0);
           }
         }
       }
@@ -8071,12 +8071,7 @@ var LABEL_FONT_SIZE = 14;
 var HIGHLIGHT_NODE_COLOR = "#ffd700";
 var HIGHLIGHT_EDGE_RGB = [255, 215, 0];
 var HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1);
-var COVER_DB_NAME = "mcmod-graph-covers";
-var COVER_STORE = "covers";
-var COVER_CONCURRENCY = 20;
-var COVER_INTERVAL_MS = 200;
-var COVER_RETRIES = 2;
-var COVER_PROXY = "/cover_proxy?url=";
+var COVER_MANIFEST_URL = "covers/manifest.json";
 function communityColor(community, type) {
   if (type === "external") return EXTERNAL_COLOR;
   if (community < 0) return ISOLATED_COLOR;
@@ -8115,259 +8110,31 @@ async function loadGraph() {
   if (!res.ok) throw new Error("\u52A0\u8F7D graph.json \u5931\u8D25: " + res.status);
   return res.json();
 }
-var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-function openCoverDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(COVER_DB_NAME, 1);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(COVER_STORE)) {
-        db.createObjectStore(COVER_STORE);
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-function idbGet(db, key) {
-  return new Promise((resolve, reject) => {
-    const req = db.transaction(COVER_STORE, "readonly").objectStore(COVER_STORE).get(key);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-function idbPut(db, key, value) {
-  return new Promise((resolve, reject) => {
-    const req = db.transaction(COVER_STORE, "readwrite").objectStore(COVER_STORE).put(value, key);
-    req.onsuccess = () => resolve();
-    req.onerror = () => reject(req.error);
-  });
-}
-function idbCount(db) {
-  return new Promise((resolve, reject) => {
-    const req = db.transaction(COVER_STORE, "readonly").objectStore(COVER_STORE).count();
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-function idbClear(db) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(COVER_STORE, "readwrite");
-    tx.objectStore(COVER_STORE).clear();
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-function normalizeCoverUrl(url) {
-  if (!url) return null;
-  let u = String(url).trim();
-  if (u.startsWith("//")) u = "https:" + u;
-  return u;
-}
-async function loadAllCovers(db, items) {
-  const map = /* @__PURE__ */ new Map();
-  for (const item of items) {
-    try {
-      const blob = await idbGet(db, item.key);
-      if (blob) map.set(item.key, URL.createObjectURL(blob));
-    } catch (e) {
-    }
-  }
-  return map;
-}
-async function downloadCovers(db, items, onProgress) {
-  let idx = 0;
-  let done = 0;
-  let failed = 0;
-  const failedKeys = [];
-  const errors = [];
-  async function worker() {
-    while (idx < items.length) {
-      const i = idx++;
-      const item = items[i];
-      let ok = false;
-      let lastErr = "";
-      for (let attempt = 0; attempt <= COVER_RETRIES && !ok; attempt++) {
-        try {
-          const resp = await fetch(COVER_PROXY + encodeURIComponent(item.url));
-          if (!resp.ok) throw new Error("HTTP " + resp.status);
-          const blob = await resp.blob();
-          await idbPut(db, item.key, blob);
-          ok = true;
-        } catch (e) {
-          lastErr = String(e && e.message || e);
-          if (!ok && attempt < COVER_RETRIES) {
-            await sleep(300 * (attempt + 1));
-          }
-        }
-      }
-      if (!ok) {
-        failed++;
-        failedKeys.push(item.key);
-        errors.push({ key: item.key, url: item.url, error: lastErr });
-        console.error("[\u9519\u8BEF] \u5C01\u9762\u4E0B\u8F7D\u5931\u8D25", item.key, lastErr, item.url);
-      }
-      done++;
-      if (onProgress) onProgress(done, items.length, failed);
-      await sleep(COVER_INTERVAL_MS);
-    }
-  }
-  const workers = [];
-  for (let w = 0; w < COVER_CONCURRENCY; w++) workers.push(worker());
-  await Promise.all(workers);
-  return { failed, failedKeys, errors };
-}
-function showCoverModal(db, coverItems) {
-  return new Promise((resolve) => {
-    const coverByKey = new Map(coverItems.map((it) => [it.key, it.url]));
-    const modal = document.createElement("div");
-    modal.className = "cover-modal";
-    modal.innerHTML = '<div class="cover-box">  <div class="cover-head">    <span class="cover-title"></span>    <button class="cover-close" title="\u62D2\u7EDD\u4E0B\u8F7D">\xD7</button>  </div>  <div class="cover-desc"></div>  <div class="cover-progress hidden">    <div class="cover-track"><div class="cover-fill"></div></div>    <div class="cover-label"></div>  </div>  <div class="cover-actions">    <button class="cover-btn primary"></button>    <button class="cover-btn ghost hidden"></button>  </div></div>';
-    document.body.appendChild(modal);
-    const titleEl = modal.querySelector(".cover-title");
-    const descEl = modal.querySelector(".cover-desc");
-    const closeEl = modal.querySelector(".cover-close");
-    const progressEl = modal.querySelector(".cover-progress");
-    const fillEl = modal.querySelector(".cover-fill");
-    const labelEl = modal.querySelector(".cover-label");
-    const primaryBtn = modal.querySelector(".cover-btn.primary");
-    const ghostBtn = modal.querySelector(".cover-btn.ghost");
-    let state = "confirm";
-    let pending = coverItems.slice();
-    let doneCount = 0;
-    let failedCount = 0;
-    let failedKeys = [];
-    let failErrors = [];
-    let elapsedStart = 0;
-    const totalMB = Math.max(1, Math.round(coverItems.length * 0.02));
-    function showState() {
-      closeEl.classList.toggle("hidden", state !== "confirm");
-      progressEl.classList.toggle("hidden", state !== "downloading");
-      ghostBtn.classList.toggle("hidden", state !== "failed");
-      if (state === "confirm") {
-        titleEl.textContent = "\u4E0B\u8F7D\u5C01\u9762";
-        descEl.textContent = "\u672C\u56FE\u9700\u8981\u4E0B\u8F7D " + coverItems.length + " \u5F20\u6A21\u7EC4\u5C01\u9762\uFF08\u7EA6 " + totalMB + " MB\uFF09\u624D\u80FD\u6B63\u5E38\u4F7F\u7528\u3002\u5C01\u9762\u5C06\u7F13\u5B58\u5230\u6D4F\u89C8\u5668\u672C\u5730\uFF0C\u4E0B\u6B21\u6253\u5F00\u65E0\u9700\u91CD\u590D\u4E0B\u8F7D\u3002";
-        primaryBtn.textContent = "\u786E\u5B9A\u4E0B\u8F7D";
-        primaryBtn.classList.remove("hidden");
-      } else if (state === "refuse") {
-        titleEl.textContent = "\u672A\u4E0B\u8F7D\u5C01\u9762";
-        descEl.textContent = "\u5C01\u9762\u662F\u672C\u56FE\u7684\u6838\u5FC3\u89C6\u89C9\u5143\u7D20\uFF0C\u672A\u4E0B\u8F7D\u65E0\u6CD5\u4F7F\u7528\u3002";
-        primaryBtn.textContent = "\u91CD\u65B0\u4E0B\u8F7D\u5C01\u9762";
-        primaryBtn.classList.remove("hidden");
-      } else if (state === "downloading") {
-        titleEl.textContent = "\u6B63\u5728\u4E0B\u8F7D\u5C01\u9762";
-        descEl.textContent = "\u4E0B\u8F7D\u5B8C\u6210\u540E\u81EA\u52A8\u8FDB\u5165\u661F\u56FE\u3002";
-        primaryBtn.classList.add("hidden");
-        updateProgress();
-      } else if (state === "failed") {
-        titleEl.textContent = "\u90E8\u5206\u5C01\u9762\u4E0B\u8F7D\u5931\u8D25";
-        const reasons = Array.from(new Set(failErrors.map((e) => e.error))).slice(0, 3);
-        let desc = failedCount + " \u5F20\u5C01\u9762\u672A\u80FD\u4E0B\u8F7D\uFF08\u6A21\u7EC4\u53EF\u80FD\u5DF2\u5220\u9664\u6216\u7F51\u7EDC\u9519\u8BEF\uFF09\u3002";
-        if (reasons.length) desc += "\n\u539F\u56E0\uFF1A" + reasons.join("\uFF1B");
-        descEl.textContent = desc;
-        primaryBtn.textContent = "\u8FDB\u5165\u56FE";
-        primaryBtn.classList.remove("hidden");
-        ghostBtn.textContent = "\u91CD\u8BD5\u4E0B\u8F7D";
-      }
-    }
-    function updateProgress() {
-      const total = pending.length;
-      const pct = total ? Math.round(doneCount / total * 100) : 100;
-      fillEl.style.width = pct + "%";
-      const elapsed = (Date.now() - elapsedStart) / 1e3;
-      const speed = doneCount / Math.max(1, elapsed);
-      const eta = speed > 0 ? formatDuration((total - doneCount) / speed * 1e3) : "--";
-      let text = "\u5DF2\u4E0B\u8F7D " + doneCount + " / " + total + " (" + pct + "%)";
-      if (failedCount > 0) text += " \xB7 \u5931\u8D25 " + failedCount;
-      text += " \xB7 \u5269\u4F59\u7EA6 " + eta;
-      labelEl.textContent = text;
-    }
-    function finish(blobUrls) {
-      modal.remove();
-      resolve({ blobUrls });
-    }
-    async function startDownload(items) {
-      state = "downloading";
-      pending = items;
-      doneCount = 0;
-      failedCount = 0;
-      failedKeys = [];
-      elapsedStart = Date.now();
-      showState();
-      const result = await downloadCovers(db, items, (done, total, failed) => {
-        doneCount = done;
-        failedCount = failed;
-        updateProgress();
-      });
-      failedKeys = result.failedKeys;
-      failedCount = result.failed;
-      failErrors = result.errors;
-      if (result.failed > 0) {
-        state = "failed";
-        showState();
-      } else {
-        const blobUrls = await loadAllCovers(db, coverItems);
-        finish(blobUrls);
-      }
-    }
-    primaryBtn.addEventListener("click", async () => {
-      if (state === "confirm") {
-        startDownload(pending);
-      } else if (state === "refuse") {
-        startDownload(coverItems.slice());
-      } else if (state === "failed") {
-        const urls = await loadAllCovers(db, coverItems);
-        finish(urls);
-      }
-    });
-    ghostBtn.addEventListener("click", () => {
-      const retryItems = failedKeys.map((k) => ({ key: k, url: coverByKey.get(k) }));
-      startDownload(retryItems);
-    });
-    closeEl.addEventListener("click", () => {
-      if (state === "confirm") {
-        state = "refuse";
-        showState();
-      }
-    });
-    showState();
-  });
-}
-async function checkCleanFlag() {
+async function loadCoverManifest() {
   try {
-    const resp = await fetch("/clean");
-    if (!resp.ok) return false;
-    const data = await resp.json();
-    return !!data.clean;
+    const res = await fetch(COVER_MANIFEST_URL);
+    if (!res.ok) return /* @__PURE__ */ new Set();
+    const data = await res.json();
+    const keys = Array.isArray(data) ? data : data.keys;
+    return new Set(Array.isArray(keys) ? keys.map(String) : []);
   } catch (e) {
-    return false;
+    console.warn("[\u8B66\u544A] \u672A\u627E\u5230\u9759\u6001\u5C01\u9762\u6E05\u5355\uFF0C\u4F7F\u7528\u7EAF\u8272\u8282\u70B9", e);
+    return /* @__PURE__ */ new Set();
   }
 }
-async function checkCoverProxy() {
-  try {
-    const resp = await fetch(COVER_PROXY);
-    return resp.status === 404 ? "missing" : "ok";
-  } catch (e) {
-    return "unreachable";
-  }
+function staticCoverPath(node, coverKeys) {
+  if (!coverKeys.has(String(node.key))) return null;
+  const path = node.cover || "covers/" + node.key + ".jpg";
+  return String(path).replace(/^\/+/, "");
 }
-function showProxyErrorModal(status) {
-  return new Promise((resolve) => {
-    const msg = status === "missing" ? "\u5F53\u524D\u670D\u52A1\u5668\u4E0D\u652F\u6301\u5C01\u9762\u4EE3\u7406\u3002\u8BF7\u4F7F\u7528 <b>python server.py</b> \u542F\u52A8\u672C\u670D\u52A1\u3002" : "\u65E0\u6CD5\u8FDE\u63A5\u672C\u5730\u670D\u52A1\u5668\u3002\u8BF7\u5148\u8FD0\u884C <b>python server.py</b>\uFF0C\u7136\u540E\u8BBF\u95EE http://127.0.0.1:1119/";
-    const modal = document.createElement("div");
-    modal.className = "cover-modal";
-    modal.innerHTML = '<div class="cover-box">  <div class="cover-head">    <span class="cover-title">\u65E0\u6CD5\u4E0B\u8F7D\u5C01\u9762</span>  </div>  <div class="cover-desc">' + msg + '</div>  <div class="cover-actions">    <button class="cover-btn primary">\u5237\u65B0\u9875\u9762</button>  </div></div>';
-    document.body.appendChild(modal);
-    modal.querySelector(".cover-btn").addEventListener("click", () => location.reload());
-  });
-}
-function buildGraph(data, blobUrls) {
+function buildGraph(data, coverKeys) {
   const graph = new import_graphology.default({ multi: true });
   const labelIndex = /* @__PURE__ */ new Map();
   const degMap = /* @__PURE__ */ new Map();
   for (const n of data.nodes) {
     degMap.set(n.key, n.in_degree);
     const isCore = n.type === "core";
+    const coverUrl = isCore ? staticCoverPath(n, coverKeys) : null;
     graph.addNode(n.key, {
       x: typeof n.x === "number" ? n.x : Math.random() * 100,
       y: typeof n.y === "number" ? n.y : Math.random() * 100,
@@ -8378,8 +8145,8 @@ function buildGraph(data, blobUrls) {
       name_en: n.name_en,
       description: n.description,
       kind: n.type,
-      type: isCore ? "image" : "circle",
-      image: isCore ? blobUrls.get(n.key) || null : null,
+      type: coverUrl ? "image" : "circle",
+      image: coverUrl,
       views: n.views,
       favorites: n.favorites,
       category: n.category,
@@ -8574,36 +8341,12 @@ function main() {
   async function boot() {
     setProgress(0, "\u52A0\u8F7D\u6570\u636E\u4E2D\u2026\u2026", "graph.json");
     const data = await loadGraph();
-    setProgress(10, "\u68C0\u67E5\u5C01\u9762\u7F13\u5B58\u2026\u2026", "");
+    setProgress(10, "\u52A0\u8F7D\u9759\u6001\u5C01\u9762\u6E05\u5355\u2026\u2026", "covers/manifest.json");
     await new Promise((r) => setTimeout(r, 30));
-    const coverItems = [];
-    for (const n of data.nodes) {
-      if (n.type !== "core") continue;
-      const url = normalizeCoverUrl(n.cover_url);
-      if (url) coverItems.push({ key: n.key, url });
-    }
-    const db = await openCoverDB();
-    if (await checkCleanFlag()) {
-      await idbClear(db);
-      console.log("[\u4FE1\u606F] \u5DF2\u6E05\u7406\u5C01\u9762\u7F13\u5B58\uFF08clean \u6A21\u5F0F\uFF09");
-    }
-    let blobUrls;
-    if (!coverItems.length) {
-      console.warn("[\u8B66\u544A] graph.json \u65E0\u5C01\u9762 URL\uFF0C\u8282\u70B9\u5C06\u663E\u793A\u4E3A\u7EAF\u8272\u5706");
-      blobUrls = /* @__PURE__ */ new Map();
-    } else if (await idbCount(db) >= coverItems.length) {
-      blobUrls = await loadAllCovers(db, coverItems);
-    } else {
-      const proxyStatus = await checkCoverProxy();
-      if (proxyStatus !== "ok") {
-        await showProxyErrorModal(proxyStatus);
-        return;
-      }
-      blobUrls = (await showCoverModal(db, coverItems)).blobUrls;
-    }
-    setProgress(20, "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026", "");
+    const coverKeys = await loadCoverManifest();
+    setProgress(20, coverKeys.size ? "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026" : "\u672A\u627E\u5230\u5C01\u9762\uFF0C\u4F7F\u7528\u7EAF\u8272\u8282\u70B9\u2026\u2026", coverKeys.size + " \u5F20\u5C01\u9762\u5DF2\u5C31\u7EEA");
     await new Promise((r) => setTimeout(r, 30));
-    const built = buildGraph(data, blobUrls);
+    const built = buildGraph(data, coverKeys);
     graph = built.graph;
     searchIndex = buildSearch(data);
     allNodes = [...data.nodes].sort((a, b) => (b.views || 0) - (a.views || 0));
