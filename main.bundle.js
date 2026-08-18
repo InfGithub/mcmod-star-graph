@@ -8073,7 +8073,7 @@ var HIGHLIGHT_EDGE_RGB = [255, 215, 0];
 var HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1);
 var COVER_MANIFEST_URL = "covers/manifest.json";
 var COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
-var COVER_CACHE_NAME = "star-graph-covers-v1";
+var COVER_CACHE_NAME = "star-graph-covers-v2";
 var COVER_LOAD_CONCURRENCY = 8;
 var COVER_LOAD_RETRIES = 2;
 var COVER_NETWORK_INTERVAL_MS = 150;
@@ -8193,7 +8193,12 @@ async function loadCoverObjectUrl(source) {
     }
   }
   return runCoverNetworkTask(async () => {
-    const response = await fetch(url, { cache: "force-cache" });
+    let response = await fetch(url, { cache: "force-cache" });
+    if (response.status === 570) {
+      await new Promise((resolve) => setTimeout(resolve, COVER_NETWORK_INTERVAL_MS));
+      nextCoverNetworkTime = performance.now() + COVER_NETWORK_INTERVAL_MS;
+      response = await fetch(url, { cache: "no-store" });
+    }
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const copy = response.clone();
     const blob = await response.blob();

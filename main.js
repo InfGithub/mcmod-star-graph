@@ -121,7 +121,7 @@ const HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1.0);
 // 展示用 96px 缩略图（covers/small/）用于图上渲染，原图保留供导出。
 const COVER_MANIFEST_URL = "covers/manifest.json";
 const COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
-const COVER_CACHE_NAME = "star-graph-covers-v1";
+const COVER_CACHE_NAME = "star-graph-covers-v2";
 const COVER_LOAD_CONCURRENCY = 8; // 仅限制网络并发，不限制最终加载数量
 const COVER_LOAD_RETRIES = 2;
 const COVER_NETWORK_INTERVAL_MS = 150; // 仅网络请求之间的间隔；缓存命中不等待
@@ -268,7 +268,13 @@ async function loadCoverObjectUrl(source) {
   // Cache Storage 未命中时再走浏览器 HTTP cache / 网络。
   // 网络请求严格串行，并在请求开始之间留出固定间隔；缓存命中不会进入队列。
   return runCoverNetworkTask(async () => {
-    const response = await fetch(url, { cache: "force-cache" });
+    let response = await fetch(url, { cache: "force-cache" });
+    // 丢弃浏览器磁盘缓存中的异常状态（例如 570），避免把旧的坏缓存继续使用。
+    if (response.status === 570) {
+      await new Promise((resolve) => setTimeout(resolve, COVER_NETWORK_INTERVAL_MS));
+      nextCoverNetworkTime = performance.now() + COVER_NETWORK_INTERVAL_MS;
+      response = await fetch(url, { cache: "no-store" });
+    }
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const copy = response.clone();
     const blob = await response.blob();
