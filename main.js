@@ -17,9 +17,11 @@ import { createNodeImageProgram } from "@sigma/node-image";
 // 因此颜色 RGB 必须先乘以 alpha，否则降低 alpha 会变成加色混合（变亮）而不是变透明。
 // 纹理强制 max 128px：封面以 128px 入图集（每图集约 961 张），
 // 避免封面多时图集数超 WebGL MAX_TEXTURE_IMAGE_UNITS(16)；导出用原始 blob 不受影响。
-class FadingNodeImageProgram extends createNodeImageProgram({
-  size: { mode: "max", value: 128 },
-}) {
+let FadingNodeImageProgram = null;
+try {
+  FadingNodeImageProgram = class FadingNodeImageProgram extends createNodeImageProgram({
+    size: { mode: "max", value: 128 },
+  }) {
   getDefinition() {
     const def = super.getDefinition();
     def.FRAGMENT_SHADER_SOURCE = def.FRAGMENT_SHADER_SOURCE
@@ -32,6 +34,9 @@ class FadingNodeImageProgram extends createNodeImageProgram({
       );
     return def;
   }
+  };
+} catch (e) {
+  console.warn("[警告] WebGL 初始化失败，封面纹理功能禁用（纯圆点模式）", e);
 }
 
 // 自定义节点标签绘制：支持 \n 换行（第一行名称，第二行 class id）。
@@ -113,8 +118,17 @@ function rgbaString(rgb, alpha) {
 const LOD_MAX_THRESHOLD = 50;
 const LOD_FULL_ZOOM_RATIO = 0.05;
 const LOD_THROTTLE_MS = 33;
-const NODE_LOD_MIN_VISIBLE = 300;
+const NODE_LOD_MIN_VISIBLE = 1000;
 const NODE_LOD_ENABLED = true;
+// sigma 3 相机 ratio：大 = 缩小(全图)，小 = 放大(细节)。
+// 封面纹理按需加载：ratio <= IMAGE_RATIO_MAX(初始视图及放大)才加载封面；
+// 放大越深上限越高，深度放大(ratio<=IMAGE_RATIO_DEEP)上限 5000。
+const IMAGE_RATIO_MAX = 1.0;
+const IMAGE_RATIO_DEEP = 0.08;
+const IMAGE_MAX_NODES = 500;
+const IMAGE_MAX_NODES_DEEP = 6000;
+// rank 靠后节点缩小时的淡化透明度（>0 表示可见但不消失）
+const NODE_DIM_ALPHA = 0.18;
 const NODE_DIAMETER_SCREEN_RATIO = 0.1; // 跳转后节点直径占屏幕宽度的比例
 const LABEL_FONT_SIZE = 14; // 导出标签字号（固定，不随节点/图幅变化）
 const HIGHLIGHT_NODE_COLOR = "#ffd700"; // 六度分隔路径高亮色（节点）
@@ -124,10 +138,13 @@ const HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1.0);
 // 封面：IndexedDB 缓存 + 强制下载门槛
 const COVER_DB_NAME = "mcmod-graph-covers";
 const COVER_STORE = "covers";
-const COVER_CONCURRENCY = 20;   // 并发下载数
+const COVER_CONCURRENCY = 4;    // 并发下载数(原20;高并发会打爆移动网络+触发 mcmod WAF)
 const COVER_INTERVAL_MS = 200;  // 每个 worker 完成一张后的固定间隔
 const COVER_RETRIES = 2;        // 每张失败后的额外重试次数
-const COVER_PROXY = "/cover_proxy?url="; // 同源代理（绕过 i.mcmod.cn 防盗链）
+const COVER_PROXY = "/cover_proxy?url="; // 旧代理（兼容保留）
+const COVER_BASE = "/cover/";            // 本地封面缓存：GET /cover/<key>
+const STATUS_PATH = "/api/cache/status";   // 本地缓存统计
+const IMPORT_PATH = "/api/cache/import/";  // 迁移写入：POST /api/cache/import/<key>
 
 function communityColor(community, type) {
   if (type === "external") return EXTERNAL_COLOR;
@@ -535,7 +552,84 @@ function showProxyErrorModal(status) {
   });
 }
 
-function buildGraph(data, blobUrls) {
+// 把 IndexedDB 里的封面存量迁移到 server 本地 covers/ 目录（一次性、幂等）。
+// 只补 server 本地缺失的项；单张失败不阻塞。之后封面不再依赖浏览器缓存。
+async function migrateCoversToLocal(db, coverItems) {
+  let status;
+  try {
+    const resp = await fetch(STATUS_PATH);
+    status = await resp.json();
+  } catch (e) {
+    console.warn("[警告] 无法获取本地封面缓存状态，跳过迁移", e);
+    return;
+  }
+  if (!status || status.cached >= status.total) return; // 本地已齐
+
+  // 只迁移真正缺失的 key（本地 covers/ 没有的），避免对已有封面重复 POST
+  const missingSet = new Set(status.missing || []);
+  const items = coverItems.filter((it) => missingSet.has(it.key));
+  const total = items.length;
+  if (!total) {
+    console.log("[信息] 本地缓存已完整，无需迁移");
+    return;
+  }
+
+  // 带 5s 超时的 POST，防止单次请求挂起拖死整个迁移
+  async function postBlob(key, blob) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    try {
+      const resp = await fetch(IMPORT_PATH + key, { method: "POST", body: blob, signal: ctrl.signal });
+      return resp.ok;
+    } catch (e) {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  let idx = 0;
+  let done = 0;
+  let migrated = 0;
+
+  async function worker() {
+    while (idx < total) {
+      const i = idx++;
+      const item = items[i];
+      try {
+        const entry = await idbGet(db, item.key);
+        if (entry && entry.blob) {
+          if (await postBlob(item.key, entry.blob)) migrated++;
+        }
+      } catch (e) { /* 单张失败不阻塞 */ }
+      done++;
+      if (done % 20 === 0) {
+        // 直接更新 DOM（setProgress 在 boot 闭包内，此处不可见）
+        const pct = 12 + Math.round((done / total) * 8);
+        document.getElementById("status-text").textContent = `迁移本地封面缓存 ${migrated}/${total}……`;
+        document.getElementById("progress-fill").style.width = Math.max(0, Math.min(100, pct)) + "%";
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+  }
+
+  const workers = [];
+  for (let w = 0; w < 4; w++) workers.push(worker());
+  await Promise.all(workers);
+  console.log(`[信息] 封面迁移完成：${migrated}/${total} 张写入本地 covers/`);
+  // 迁移后复查：仍缺失的封面（本地和 IndexedDB 都没有）等 mcmod 可用时
+  // 通过 /cover/<key> 按需自动补齐（未命中时 server 会代理下载并落盘）
+  try {
+    const resp = await fetch(STATUS_PATH);
+    const st = await resp.json();
+    const left = (st && st.total || 0) - (st && st.cached || 0);
+    if (left > 0) {
+      console.warn(`[警告] 本地仍缺 ${left} 张封面（mcmod 恢复后刷新页面，缺失封面会按需自动补齐）`);
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+function buildGraph(data) {
   const graph = new Graph({ multi: true });
   const labelIndex = new Map(); // lowercase name -> [keys]
   const degMap = new Map();
@@ -553,8 +647,8 @@ function buildGraph(data, blobUrls) {
       name_en: n.name_en,
       description: n.description,
       kind: n.type,
-      type: isCore ? "image" : "circle",
-      image: isCore ? (blobUrls.get(n.key) || null) : null,
+      type: "circle", // 默认 circle 轻量渲染；封面纹理按缩放/视口按需切换为 image（updateImageNodes）
+      image: isCore ? COVER_BASE + n.key : null,
       views: n.views,
       favorites: n.favorites,
       category: n.category,
@@ -573,9 +667,14 @@ function buildGraph(data, blobUrls) {
     }
   }
 
+  const seenEdges = new Set();
   for (const e of data.edges) {
-    const importance = Math.min(degMap.get(e.source) || 0, degMap.get(e.target) || 0);
+    // 去重：相同 source+target+kind 的重复边只保留一条（数据里存在 2800+ 重复对）
     const kind = e.type === "interaction" ? "interaction" : "dependency";
+    const dedupeKey = e.source + "\u0000" + e.target + "\u0000" + kind;
+    if (seenEdges.has(dedupeKey)) continue;
+    seenEdges.add(dedupeKey);
+    const importance = Math.min(degMap.get(e.source) || 0, degMap.get(e.target) || 0);
     const rgb = kind === "interaction" ? INTERACTION_EDGE_RGB : DEPENDENCY_EDGE_RGB;
     graph.addEdge(e.source, e.target, {
       size: 0.5,
@@ -751,8 +850,6 @@ function main() {
   let showInteraction = true;
   let highlightNodes = new Set();
   let highlightEdges = new Set();
-  // 导出用全量封面映射（与屏幕渲染的 image 属性解耦，导出不受纹理限制影响）
-  let coverBlobUrls = new Map();
 
   function setProgress(pct, text, label) {
     statusText.textContent = text;
@@ -788,39 +885,20 @@ function main() {
       if (url) coverItems.push({ key: n.key, url });
     }
 
-    // 封面：按 URL 校验缓存，缺失/变更的差异部分强制下载（拒绝不服务，失败可放行）
-    const db = await openCoverDB();
-    if (await checkCleanFlag()) {
-      await idbClear(db);
-      console.log("[信息] 已清理封面缓存（clean 模式）");
-    }
-    let blobUrls;
-    if (!coverItems.length) {
-      console.warn("[警告] graph.json 无封面 URL，节点将显示为纯色圆");
-      blobUrls = new Map();
+    // 封面缓存本地化：启动时把浏览器 IndexedDB 存量迁移到 server 本地 covers/，
+    // 之后封面由 server 按需代理并落盘，只下载缺失部分（增量）。
+    if (coverItems.length) {
+      const db = await openCoverDB();
+      await migrateCoversToLocal(db, coverItems);
     } else {
-      const proxyStatus = await checkCoverProxy();
-      if (proxyStatus !== "ok") {
-        await showProxyErrorModal(proxyStatus);
-        return;
-      }
-      const loaded = await loadAllCovers(db, coverItems);
-      blobUrls = loaded.blobUrls;
-      if (loaded.staleKeys.length) {
-        const byKey = new Map(coverItems.map((it) => [it.key, it.url]));
-        const downloadItems = loaded.staleKeys.map((k) => ({ key: k, url: byKey.get(k) }));
-        const result = await showCoverModal(db, downloadItems, coverItems);
-        blobUrls = result.blobUrls;
-      }
-      await purgeStaleKeys(db, coverItems);
+      console.warn("[警告] graph.json 无封面 URL，节点将显示为纯色圆");
     }
 
     setProgress(20, "构建图结构……", "");
     await new Promise((r) => setTimeout(r, 30));
 
-    const built = buildGraph(data, blobUrls);
+    const built = buildGraph(data);
     graph = built.graph;
-    coverBlobUrls = blobUrls;
     searchIndex = buildSearch(data);
     allNodes = [...data.nodes].sort((a, b) => (b.views || 0) - (a.views || 0));
     searchMatches = [...allNodes];
@@ -848,9 +926,9 @@ function main() {
       labelGridCellSize: 180,
       labelDensity: 0.4,
       defaultDrawNodeLabel: drawNodeLabel,
-      nodeProgramClasses: {
+      nodeProgramClasses: FadingNodeImageProgram ? {
         image: FadingNodeImageProgram,
-      },
+      } : {},
     });
 
     bindEvents();
@@ -910,6 +988,7 @@ function main() {
         lodThresholdValue = computeLodThreshold(state.ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
         nodeVisibleCount = computeVisibleNodeCount(state.ratio, nodeLodStrength);
         updateCulling(state);
+        updateImageNodes(state);
         startFade();
       };
       if (lodTimer) clearTimeout(lodTimer);
@@ -923,6 +1002,7 @@ function main() {
     lodThresholdValue = computeLodThreshold(cam.getState().ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
     nodeVisibleCount = computeVisibleNodeCount(cam.getState().ratio, nodeLodStrength);
     updateCulling(cam.getState());
+    updateImageNodes(cam.getState());
 
     // 触发首次渲染并等待封面纹理图集生成，避免加载页淡出后卡顿
     renderer.refresh();
@@ -1089,6 +1169,51 @@ function main() {
     culledEdges = next;
   }
 
+  // 封面纹理按需加载：放大到阈值以上时，只给视口内最大的前 IMAGE_MAX_NODES 个节点
+  // 切换为 image 类型（其余保持 circle），缩小时全部降回 circle，控制 WebGL 纹理压力。
+  // 封面纹理按需加载：初始视图及放大(ratio 小)时，视口内节点按 size 取前 N 切换为
+  // image 类型（其余保持 circle），缩小(ratio 大)全部降回 circle，控制 WebGL 纹理压力。
+  // N 随放大深度自适应：ratio=1→500，ratio<=0.08→5000。
+  function imageNodeLimit(ratio) {
+    if (ratio <= IMAGE_RATIO_DEEP) return IMAGE_MAX_NODES_DEEP;
+    const t = (IMAGE_RATIO_MAX - ratio) / (IMAGE_RATIO_MAX - IMAGE_RATIO_DEEP);
+    const k = Math.min(1, Math.max(0, t));
+    return Math.round(IMAGE_MAX_NODES + (IMAGE_MAX_NODES_DEEP - IMAGE_MAX_NODES) * k);
+  }
+
+  function updateImageNodes(cameraState) {
+    if (!FadingNodeImageProgram) return; // WebGL 不可用：保持纯圆点模式
+    const ratio = cameraState.ratio;
+    const rect = getViewRect(cameraState);
+    const wantImage = ratio <= IMAGE_RATIO_MAX;
+    let changed = false;
+    if (!wantImage) {
+      graph.forEachNode((node, attrs) => {
+        if (attrs.type === "image") {
+          graph.setNodeAttribute(node, "type", "circle");
+          changed = true;
+        }
+      });
+    } else {
+      const limit = imageNodeLimit(ratio);
+      const inView = [];
+      graph.forEachNode((node, attrs) => {
+        if (attrs.x < rect.minX || attrs.x > rect.maxX || attrs.y < rect.minY || attrs.y > rect.maxY) return;
+        inView.push([node, attrs.size || 1]);
+      });
+      inView.sort((a, b) => b[1] - a[1]);
+      const imageSet = new Set(inView.slice(0, Math.min(limit, inView.length)).map((p) => p[0]));
+      graph.forEachNode((node, attrs) => {
+        const want = imageSet.has(node) ? "image" : "circle";
+        if (attrs.type !== want) {
+          graph.setNodeAttribute(node, "type", want);
+          changed = true;
+        }
+      });
+    }
+    if (changed) renderer.refresh();
+  }
+
   function focusNode(key) {
     if (!renderer || !graph) return;
     const nd = renderer.getNodeDisplayData(key);
@@ -1130,14 +1255,15 @@ function main() {
   function edgeTarget(edge, attrs) {
     if (attrs.kind === "dependency" && !showDependency) return 0;
     if (attrs.kind === "interaction" && !showInteraction) return 0;
-    if ((attrs.importance || 0) < lodThresholdValue) return 0;
+    // 边始终显示（去掉按重要度隐藏），仅保留视口剔除
     if (culledEdges.has(edge)) return 0;
     return 1;
   }
 
   function nodeTarget(node, attrs) {
     if (!NODE_LOD_ENABLED) return 1;
-    return (attrs.rank ?? Infinity) < nodeVisibleCount ? 1 : 0;
+    // rank 靠后的节点缩小时淡化（保留可见轮廓）而非完全消失
+    return (attrs.rank ?? Infinity) < nodeVisibleCount ? 1 : NODE_DIM_ALPHA;
   }
 
   function fadeStep() {
@@ -1743,8 +1869,8 @@ function main() {
         const cx = item.cx, cy = item.cy, r = item.r;
 
         let img = null;
-        // 导出用独立的全量封面映射（coverBlobUrls），不依赖被封面 LoD 控制的 image 属性
-        const src = coverBlobUrls.get(attrs.key) || attrs.image;
+        // 导出直接使用节点 image（本地缓存 URL /cover/<key>）
+        const src = attrs.image;
         if (src) {
           img = new Image();
           img.src = src;

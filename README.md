@@ -19,7 +19,22 @@
 
 ## 用法
 
-### 服务器参数
+### 封面缓存（本地化）
+
+- 封面缓存存在项目根目录 `covers/`（key.jpg），**不依赖浏览器 IndexedDB**。
+- 首次启动：浏览器 IndexedDB 存量自动迁移到 `covers/`（幂等，只补缺失）。
+- 增量下载：`GET /cover/<key>` 本地命中直接返回；未命中才代理抓取 mcmod 并落盘。
+- 新数据缺的封面只需下载差异部分；换浏览器/清缓存不影响本地缓存。
+
+## 渲染优化（封面纹理按需加载）
+
+- 节点默认以 circle 轻量渲染，**不再一次性加载全部封面纹理**（旧版 1.1 万张纹理会把浏览器渲染进程压崩）。
+- 相机缩放驱动：缩小时全部圆点；放大后视口内节点按 size 取前 N 切换封面纹理，N 随缩放深度自适应（`IMAGE_RATIO_MIN`→500，`IMAGE_RATIO_DEEP`→`IMAGE_MAX_NODES_DEEP` 3000）。
+- 缩小不消失：rank 靠后节点淡化（`NODE_DIM_ALPHA`=0.18）而非完全隐藏。
+- 边去重：相同 source+target+kind 只保留一条（原数据含 4300+ 重复边）。
+- 常量均在 main.js 顶部。
+
+## 服务器参数
 
 ```bash
 python server.py [--data 文件] [端口] [host] [clean]

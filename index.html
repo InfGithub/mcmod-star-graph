@@ -75,6 +75,19 @@
       <div>开源协议：MIT</div>
     </div>
   </div>
+  <!-- 全局错误捕获：任何脚本异常直接显示到加载框，方便诊断“加载中卡死” -->
+  <script>
+    window.addEventListener("error", function (e) {
+      var el = document.getElementById("status-text");
+      if (el) el.textContent = "页面错误: " + (e.message || e.error || e.type || "未知");
+      var pl = document.getElementById("progress-label");
+      if (pl) pl.textContent = (e.filename || "") + ":" + (e.lineno || "");
+    });
+    window.addEventListener("unhandledrejection", function (e) {
+      var el = document.getElementById("status-text");
+      if (el) el.textContent = "异步错误: " + ((e.reason && (e.reason.message || e.reason)) || "未知");
+    });
+  </script>
   <script type="module" src="main.bundle.js"></script>
 </body>
 </html>
