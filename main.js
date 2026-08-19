@@ -127,8 +127,8 @@ const NODE_LOD_ENABLED = true;
 const IMAGE_RATIO_MAX = 0.95;
 const IMAGE_RATIO_DEEP = 0.08;
 // 封面最小屏幕有效尺寸（size/ratio）：低于此值降为圆点，实现按节点大小分级。
-// 数值越大，缩小时越早变圆点（5 = 明显更早更激进）。
-const COVER_MIN_SIZE_RATIO = 5;
+// 数值越大，缩小时越早变圆点。
+const COVER_MIN_SIZE_RATIO = 6;
 const IMAGE_MAX_NODES = 500;
 const IMAGE_MAX_NODES_DEEP = 6000;
 // rank 靠后节点缩小时的淡化透明度（>0 表示可见但不消失）
