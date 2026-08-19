@@ -123,7 +123,7 @@ const NODE_LOD_ENABLED = true;
 // sigma 3 相机 ratio：大 = 缩小(全图)，小 = 放大(细节)。
 // 封面纹理按需加载：ratio <= IMAGE_RATIO_MAX(初始视图及放大)才加载封面；
 // 放大越深上限越高，深度放大(ratio<=IMAGE_RATIO_DEEP)上限 5000。
-const IMAGE_RATIO_MAX = 1.0;
+const IMAGE_RATIO_MAX = 0.95; // 缩小到接近全图即降回圆点(初始视图特判显示封面)
 const IMAGE_RATIO_DEEP = 0.08;
 const IMAGE_MAX_NODES = 500;
 const IMAGE_MAX_NODES_DEEP = 6000;
@@ -1181,11 +1181,19 @@ function main() {
     return Math.round(IMAGE_MAX_NODES + (IMAGE_MAX_NODES_DEEP - IMAGE_MAX_NODES) * k);
   }
 
+  // 首次进入(加载完成)时全图也显示封面，之后用户一操作相机就按缩放规则切换
+  let imageFirstPass = true;
   function updateImageNodes(cameraState) {
     if (!FadingNodeImageProgram) return; // WebGL 不可用：保持纯圆点模式
     const ratio = cameraState.ratio;
     const rect = getViewRect(cameraState);
-    const wantImage = ratio <= IMAGE_RATIO_MAX;
+    let wantImage;
+    if (imageFirstPass) {
+      imageFirstPass = false;
+      wantImage = true; // 打开即有封面
+    } else {
+      wantImage = ratio < IMAGE_RATIO_MAX; // 缩小到接近全图即降回圆点
+    }
     let changed = false;
     if (!wantImage) {
       graph.forEachNode((node, attrs) => {

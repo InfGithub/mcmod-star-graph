@@ -8073,7 +8073,7 @@ var LOD_FULL_ZOOM_RATIO = 0.05;
 var LOD_THROTTLE_MS = 33;
 var NODE_LOD_MIN_VISIBLE = 1e3;
 var NODE_LOD_ENABLED = true;
-var IMAGE_RATIO_MAX = 1;
+var IMAGE_RATIO_MAX = 0.95;
 var IMAGE_RATIO_DEEP = 0.08;
 var IMAGE_MAX_NODES = 500;
 var IMAGE_MAX_NODES_DEEP = 6e3;
@@ -8723,11 +8723,18 @@ function main() {
     const k = Math.min(1, Math.max(0, t));
     return Math.round(IMAGE_MAX_NODES + (IMAGE_MAX_NODES_DEEP - IMAGE_MAX_NODES) * k);
   }
+  let imageFirstPass = true;
   function updateImageNodes(cameraState) {
     if (!FadingNodeImageProgram) return;
     const ratio = cameraState.ratio;
     const rect = getViewRect(cameraState);
-    const wantImage = ratio <= IMAGE_RATIO_MAX;
+    let wantImage;
+    if (imageFirstPass) {
+      imageFirstPass = false;
+      wantImage = true;
+    } else {
+      wantImage = ratio < IMAGE_RATIO_MAX;
+    }
     let changed = false;
     if (!wantImage) {
       graph.forEachNode((node, attrs) => {
