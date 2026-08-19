@@ -126,8 +126,9 @@ const NODE_LOD_ENABLED = true;
 // 放大越深上限越高，深度放大(ratio<=IMAGE_RATIO_DEEP)上限 6000。
 const IMAGE_RATIO_MAX = 0.95;
 const IMAGE_RATIO_DEEP = 0.08;
-// 封面最小屏幕有效尺寸（size/ratio）：低于此值降为圆点，实现按节点大小分级
-const COVER_MIN_SIZE_RATIO = 3;
+// 封面最小屏幕有效尺寸（size/ratio）：低于此值降为圆点，实现按节点大小分级。
+// 数值越大，缩小时越早变圆点（5 = 明显更早更激进）。
+const COVER_MIN_SIZE_RATIO = 5;
 const IMAGE_MAX_NODES = 500;
 const IMAGE_MAX_NODES_DEEP = 6000;
 // rank 靠后节点缩小时的淡化透明度（>0 表示可见但不消失）
@@ -1184,28 +1185,32 @@ function main() {
     return Math.round(IMAGE_MAX_NODES + (IMAGE_MAX_NODES_DEEP - IMAGE_MAX_NODES) * k);
   }
 
+  // 首屏特判：首次加载直接显示约 500 个最大封面（不按阈值过滤，打开即有图）；
+  // 用户一动相机后，按 COVER_MIN_SIZE_RATIO 分级切换（更早更激进地降圆点）。
+  let imageFirstPass = true;
   function updateImageNodes(cameraState) {
     if (!FadingNodeImageProgram) return; // WebGL 不可用：保持纯圆点模式
     const ratio = cameraState.ratio;
     const rect = getViewRect(cameraState);
     let changed = false;
 
-    // 1) 降级：屏幕有效尺寸（size/ratio）低于阈值的 image 节点 → circle。
-    //    缩小时小节点先降为圆点，大节点(size 大)保留封面更久——分级切换。
-    graph.forEachNode((node, attrs) => {
-      if (attrs.type === "image" && (attrs.size || 1) / ratio < COVER_MIN_SIZE_RATIO) {
-        graph.setNodeAttribute(node, "type", "circle");
-        changed = true;
-      }
-    });
+    if (!imageFirstPass) {
+      // 降级：屏幕有效尺寸（size/ratio）低于阈值的 image 节点 → circle。
+      // 缩小时小节点先降为圆点，大节点(size 大)保留封面更久——分级切换。
+      graph.forEachNode((node, attrs) => {
+        if (attrs.type === "image" && (attrs.size || 1) / ratio < COVER_MIN_SIZE_RATIO) {
+          graph.setNodeAttribute(node, "type", "circle");
+          changed = true;
+        }
+      });
+    }
 
-    // 2) 升级：视口内满足屏幕尺寸阈值的节点，按 size 取前 N 切换为 image。
-    //    首屏(全图)自然显示约 500 个最大的封面，放大后视口内全部切换。
+    // 升级：视口内节点按 size 取前 N 切换为 image（首屏不过滤阈值）。
     const limit = imageNodeLimit(ratio);
     const inView = [];
     graph.forEachNode((node, attrs) => {
       if (attrs.x < rect.minX || attrs.x > rect.maxX || attrs.y < rect.minY || attrs.y > rect.maxY) return;
-      if ((attrs.size || 1) / ratio < COVER_MIN_SIZE_RATIO) return; // 太小不切封面
+      if (!imageFirstPass && (attrs.size || 1) / ratio < COVER_MIN_SIZE_RATIO) return;
       inView.push([node, attrs.size || 1]);
     });
     inView.sort((a, b) => b[1] - a[1]);
@@ -1217,6 +1222,7 @@ function main() {
       }
     });
 
+    imageFirstPass = false;
     if (changed) renderer.refresh();
   }
 

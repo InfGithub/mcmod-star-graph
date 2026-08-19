@@ -8075,7 +8075,7 @@ var NODE_LOD_MIN_VISIBLE = 1e3;
 var NODE_LOD_ENABLED = true;
 var IMAGE_RATIO_MAX = 0.95;
 var IMAGE_RATIO_DEEP = 0.08;
-var COVER_MIN_SIZE_RATIO = 3;
+var COVER_MIN_SIZE_RATIO = 5;
 var IMAGE_MAX_NODES = 500;
 var IMAGE_MAX_NODES_DEEP = 6e3;
 var NODE_DIM_ALPHA = 0.18;
@@ -8724,22 +8724,25 @@ function main() {
     const k = Math.min(1, Math.max(0, t));
     return Math.round(IMAGE_MAX_NODES + (IMAGE_MAX_NODES_DEEP - IMAGE_MAX_NODES) * k);
   }
+  let imageFirstPass = true;
   function updateImageNodes(cameraState) {
     if (!FadingNodeImageProgram) return;
     const ratio = cameraState.ratio;
     const rect = getViewRect(cameraState);
     let changed = false;
-    graph.forEachNode((node, attrs) => {
-      if (attrs.type === "image" && (attrs.size || 1) / ratio < COVER_MIN_SIZE_RATIO) {
-        graph.setNodeAttribute(node, "type", "circle");
-        changed = true;
-      }
-    });
+    if (!imageFirstPass) {
+      graph.forEachNode((node, attrs) => {
+        if (attrs.type === "image" && (attrs.size || 1) / ratio < COVER_MIN_SIZE_RATIO) {
+          graph.setNodeAttribute(node, "type", "circle");
+          changed = true;
+        }
+      });
+    }
     const limit = imageNodeLimit(ratio);
     const inView = [];
     graph.forEachNode((node, attrs) => {
       if (attrs.x < rect.minX || attrs.x > rect.maxX || attrs.y < rect.minY || attrs.y > rect.maxY) return;
-      if ((attrs.size || 1) / ratio < COVER_MIN_SIZE_RATIO) return;
+      if (!imageFirstPass && (attrs.size || 1) / ratio < COVER_MIN_SIZE_RATIO) return;
       inView.push([node, attrs.size || 1]);
     });
     inView.sort((a, b) => b[1] - a[1]);
@@ -8750,6 +8753,7 @@ function main() {
         changed = true;
       }
     });
+    imageFirstPass = false;
     if (changed) renderer.refresh();
   }
   function focusNode(key) {
