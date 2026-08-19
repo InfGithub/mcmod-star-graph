@@ -121,10 +121,13 @@ const LOD_THROTTLE_MS = 33;
 const NODE_LOD_MIN_VISIBLE = 1000;
 const NODE_LOD_ENABLED = true;
 // sigma 3 相机 ratio：大 = 缩小(全图)，小 = 放大(细节)。
-// 封面纹理按需加载：ratio <= IMAGE_RATIO_MAX(初始视图及放大)才加载封面；
-// 放大越深上限越高，深度放大(ratio<=IMAGE_RATIO_DEEP)上限 5000。
-const IMAGE_RATIO_MAX = 0.95; // 缩小到接近全图即降回圆点(初始视图特判显示封面)
+// 封面纹理按需加载 + 分级降级：节点屏幕有效尺寸 = size/ratio。
+// 低于 COVER_MIN_SIZE_RATIO 的节点不用封面（缩小时小节点先降为圆点，大节点保留更久）；
+// 放大越深上限越高，深度放大(ratio<=IMAGE_RATIO_DEEP)上限 6000。
+const IMAGE_RATIO_MAX = 0.95;
 const IMAGE_RATIO_DEEP = 0.08;
+// 封面最小屏幕有效尺寸（size/ratio）：低于此值降为圆点，实现按节点大小分级
+const COVER_MIN_SIZE_RATIO = 3;
 const IMAGE_MAX_NODES = 500;
 const IMAGE_MAX_NODES_DEEP = 6000;
 // rank 靠后节点缩小时的淡化透明度（>0 表示可见但不消失）
@@ -1181,44 +1184,39 @@ function main() {
     return Math.round(IMAGE_MAX_NODES + (IMAGE_MAX_NODES_DEEP - IMAGE_MAX_NODES) * k);
   }
 
-  // 首次进入(加载完成)时全图也显示封面，之后用户一操作相机就按缩放规则切换
-  let imageFirstPass = true;
   function updateImageNodes(cameraState) {
     if (!FadingNodeImageProgram) return; // WebGL 不可用：保持纯圆点模式
     const ratio = cameraState.ratio;
     const rect = getViewRect(cameraState);
-    let wantImage;
-    if (imageFirstPass) {
-      imageFirstPass = false;
-      wantImage = true; // 打开即有封面
-    } else {
-      wantImage = ratio < IMAGE_RATIO_MAX; // 缩小到接近全图即降回圆点
-    }
     let changed = false;
-    if (!wantImage) {
-      graph.forEachNode((node, attrs) => {
-        if (attrs.type === "image") {
-          graph.setNodeAttribute(node, "type", "circle");
-          changed = true;
-        }
-      });
-    } else {
-      const limit = imageNodeLimit(ratio);
-      const inView = [];
-      graph.forEachNode((node, attrs) => {
-        if (attrs.x < rect.minX || attrs.x > rect.maxX || attrs.y < rect.minY || attrs.y > rect.maxY) return;
-        inView.push([node, attrs.size || 1]);
-      });
-      inView.sort((a, b) => b[1] - a[1]);
-      const imageSet = new Set(inView.slice(0, Math.min(limit, inView.length)).map((p) => p[0]));
-      graph.forEachNode((node, attrs) => {
-        const want = imageSet.has(node) ? "image" : "circle";
-        if (attrs.type !== want) {
-          graph.setNodeAttribute(node, "type", want);
-          changed = true;
-        }
-      });
-    }
+
+    // 1) 降级：屏幕有效尺寸（size/ratio）低于阈值的 image 节点 → circle。
+    //    缩小时小节点先降为圆点，大节点(size 大)保留封面更久——分级切换。
+    graph.forEachNode((node, attrs) => {
+      if (attrs.type === "image" && (attrs.size || 1) / ratio < COVER_MIN_SIZE_RATIO) {
+        graph.setNodeAttribute(node, "type", "circle");
+        changed = true;
+      }
+    });
+
+    // 2) 升级：视口内满足屏幕尺寸阈值的节点，按 size 取前 N 切换为 image。
+    //    首屏(全图)自然显示约 500 个最大的封面，放大后视口内全部切换。
+    const limit = imageNodeLimit(ratio);
+    const inView = [];
+    graph.forEachNode((node, attrs) => {
+      if (attrs.x < rect.minX || attrs.x > rect.maxX || attrs.y < rect.minY || attrs.y > rect.maxY) return;
+      if ((attrs.size || 1) / ratio < COVER_MIN_SIZE_RATIO) return; // 太小不切封面
+      inView.push([node, attrs.size || 1]);
+    });
+    inView.sort((a, b) => b[1] - a[1]);
+    const imageSet = new Set(inView.slice(0, Math.min(limit, inView.length)).map((p) => p[0]));
+    graph.forEachNode((node, attrs) => {
+      if (imageSet.has(node) && attrs.type !== "image") {
+        graph.setNodeAttribute(node, "type", "image");
+        changed = true;
+      }
+    });
+
     if (changed) renderer.refresh();
   }
 
