@@ -28,6 +28,10 @@
         <label><input type="checkbox" id="edge-interaction" checked> 联动</label>
         <label><input type="checkbox" id="show-labels" checked> 标签</label>
       </div>
+      <div class="controls author-only">
+        <label><input type="checkbox" id="show-teams" checked> 团队</label>
+        <label><input type="checkbox" id="show-authors" checked> 普通作者</label>
+      </div>
       <div class="search">
         <input type="text" id="search-input" placeholder="搜索模组名…" autocomplete="off">
         <div id="search-filters"></div>
@@ -37,15 +41,16 @@
         </div>
       </div>
       <div class="export-control">
-        <div class="export-label">导出 PNG</div>
+        <div class="export-label">导出图片</div>
         <div class="export-row">
           <input type="number" id="export-width" value="65536" min="64" step="64">
           <span class="export-x">×</span>
           <input type="number" id="export-height" value="65536" min="64" step="64">
         </div>
+        <label class="export-opt"><input type="checkbox" id="export-single-png"> 同时导出单张 PNG</label>
         <button id="export-button">下载渲染图</button>
         <div class="export-warning hidden" id="export-warning">
-          尺寸 ≥ 16384 将使用分块导出，耗时较长、文件较大。
+          尺寸 ≥ 16384 将使用瓦片导出，耗时较长、文件较大。
         </div>
       </div>
     </div>

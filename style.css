@@ -346,6 +346,16 @@ html, body {
   border-color: var(--accent);
 }
 
+.export-opt {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
 .export-x {
   color: var(--text-secondary);
 }

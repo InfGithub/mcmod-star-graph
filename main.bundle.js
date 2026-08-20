@@ -8068,6 +8068,7 @@ var TEAM_MIXED_EDGE_RGB = [255, 99, 71];
 var INDIVIDUAL_EDGE_RGB = [173, 216, 230];
 var MEMBER_EDGE_RGB = [180, 255, 180];
 var MEMBER_EDGE_ALPHA = 0.1;
+var MEMBER_EDGE_SIZE = 0.8;
 var MEMBER_SIZE_WEIGHT = 50;
 function premulRgba(rgb, alpha) {
   return "rgba(" + Math.round(rgb[0] * alpha) + "," + Math.round(rgb[1] * alpha) + "," + Math.round(rgb[2] * alpha) + "," + alpha.toFixed(4) + ")";
@@ -8078,15 +8079,18 @@ function rgbaString(rgb, alpha) {
 var LOD_THROTTLE_MS = 33;
 var NODE_DIAMETER_SCREEN_RATIO = 0.1;
 var LABEL_FONT_SIZE = 14;
+var EXPORT_TILE = 512;
+var MIN_LEVEL_SIZE = 1024;
 var HIGHLIGHT_NODE_COLOR = "#ffd700";
 var HIGHLIGHT_EDGE_RGB = [255, 215, 0];
 var HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1);
 var COVER_DB_NAME = "mcmod-graph-covers";
 var COVER_STORE = "covers";
-var COVER_CONCURRENCY = 20;
-var COVER_INTERVAL_MS = 200;
+var COVER_CONCURRENCY = 6;
+var COVER_INTERVAL_MS = 20;
 var COVER_RETRIES = 2;
 var COVER_PROXY = "/cover_proxy?url=";
+var COVER_SIZE = 300;
 var COVER_HI_RES_THRESHOLD = 20;
 var GRAPH_MODE = "mod";
 function communityColor(community, type, teamCommunity) {
@@ -8195,10 +8199,33 @@ function formatDuration(ms) {
   const r = s % 60;
   return m + "m" + r + "s";
 }
-async function loadGraph() {
+async function loadGraph(onProgress) {
   const res = await fetch(GRAPH_URL);
   if (!res.ok) throw new Error("\u52A0\u8F7D graph.json \u5931\u8D25: " + res.status);
-  return res.json();
+  const total = Number(res.headers.get("Content-Length")) || 0;
+  const reader = res.body.getReader();
+  const chunks = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (onProgress && total) onProgress(received, total);
+  }
+  let text;
+  if (chunks.length === 1) {
+    text = new TextDecoder("utf-8").decode(chunks[0]);
+  } else {
+    const buf = new Uint8Array(received);
+    let off = 0;
+    for (const c of chunks) {
+      buf.set(c, off);
+      off += c.length;
+    }
+    text = new TextDecoder("utf-8").decode(buf);
+  }
+  return JSON.parse(text);
 }
 function renderMetaPanel(meta) {
   const el = document.getElementById("panel-meta");
@@ -8253,14 +8280,27 @@ function debounce(fn, ms) {
 }
 function openCoverDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(COVER_DB_NAME, 2);
+    const req = indexedDB.open(COVER_DB_NAME, 3);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains(COVER_STORE)) {
         db.createObjectStore(COVER_STORE);
-      } else {
-        req.transaction.objectStore(COVER_STORE).clear();
+        return;
       }
+      const store = req.transaction.objectStore(COVER_STORE);
+      if (req.oldVersion < 2) {
+        store.clear();
+        return;
+      }
+      const cursorReq = store.openCursor();
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        if (!cursor) return;
+        const url = cursor.value && cursor.value.url ? normalizeCoverUrl(cursor.value.url) : null;
+        if (url) store.put({ blob: cursor.value.blob }, url);
+        cursor.delete();
+        cursor.continue();
+      };
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -8285,61 +8325,36 @@ function normalizeCoverUrl(url) {
   if (!url) return null;
   let u = String(url).trim();
   if (u.startsWith("//")) u = "https:" + u;
-  return u;
+  return u.replace(/@\d+x\d+\.jpg$/, "@" + COVER_SIZE + "x" + COVER_SIZE + ".jpg");
 }
-async function loadAllCovers(db, items) {
+async function loadAllCovers(db, wantUrls, onProgress) {
   const blobUrls = /* @__PURE__ */ new Map();
   const staleKeys = [];
-  const want = new Map(items.map((it) => [String(it.key), it.url]));
+  const want = new Set(wantUrls.map(String));
   const tx = db.transaction(COVER_STORE, "readonly");
   const store = tx.objectStore(COVER_STORE);
   const req = store.openCursor();
+  let visited = 0;
   req.onsuccess = () => {
     const cursor = req.result;
     if (!cursor) return;
-    const url = want.get(String(cursor.key));
-    if (url !== void 0) {
+    visited++;
+    if (want.has(String(cursor.key))) {
       const entry = cursor.value;
-      if (entry && entry.url === url && entry.blob) {
-        blobUrls.set(cursor.key, URL.createObjectURL(entry.blob));
-      } else {
-        staleKeys.push(cursor.key);
-      }
+      if (entry && entry.blob) blobUrls.set(String(cursor.key), URL.createObjectURL(entry.blob));
     }
+    if (onProgress && visited % 500 === 0) onProgress(visited, wantUrls.length);
     cursor.continue();
   };
   await new Promise((resolve, reject) => {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
-  const found = /* @__PURE__ */ new Set();
-  for (const k of blobUrls.keys()) found.add(String(k));
-  for (const k of staleKeys) found.add(String(k));
-  for (const it of items) {
-    if (!found.has(String(it.key))) staleKeys.push(it.key);
+  if (onProgress) onProgress(wantUrls.length, wantUrls.length);
+  for (const u of want) {
+    if (!blobUrls.has(u)) staleKeys.push(u);
   }
   return { blobUrls, staleKeys };
-}
-function purgeStaleKeys(db, items) {
-  return new Promise((resolve, reject) => {
-    const keep = new Set(items.map((it) => it.key));
-    const deletedKeys = [];
-    const tx = db.transaction(COVER_STORE, "readwrite");
-    const store = tx.objectStore(COVER_STORE);
-    const req = store.openCursor();
-    req.onsuccess = () => {
-      const cursor = req.result;
-      if (cursor) {
-        if (!keep.has(cursor.key)) {
-          deletedKeys.push(cursor.key);
-          cursor.delete();
-        }
-        cursor.continue();
-      }
-    };
-    tx.oncomplete = () => resolve(deletedKeys);
-    tx.onerror = () => reject(tx.error);
-  });
 }
 async function downloadCovers(db, items, onProgress) {
   let idx = 0;
@@ -8359,8 +8374,8 @@ async function downloadCovers(db, items, onProgress) {
           const resp = await fetch(COVER_PROXY + encodeURIComponent(item.url) + "&ua=" + encodeURIComponent(navigator.userAgent));
           if (!resp.ok) throw new Error("HTTP " + resp.status);
           const blob = await resp.blob();
-          await idbPut(db, item.key, { url: item.url, blob });
-          blobUrls.set(item.key, URL.createObjectURL(blob));
+          await idbPut(db, item.url, { blob });
+          blobUrls.set(item.url, URL.createObjectURL(blob));
           ok = true;
         } catch (e) {
           lastErr = String(e && e.message || e);
@@ -8371,9 +8386,9 @@ async function downloadCovers(db, items, onProgress) {
       }
       if (!ok) {
         failed++;
-        failedKeys.push(item.key);
-        errors.push({ key: item.key, url: item.url, error: lastErr });
-        console.error("[\u9519\u8BEF] \u5C01\u9762\u4E0B\u8F7D\u5931\u8D25", item.key, lastErr, item.url);
+        failedKeys.push(item.url);
+        errors.push({ url: item.url, error: lastErr });
+        console.error("[\u9519\u8BEF] \u5C01\u9762\u4E0B\u8F7D\u5931\u8D25", item.url, lastErr);
       }
       done++;
       if (onProgress) onProgress(done, items.length, failed);
@@ -8385,9 +8400,8 @@ async function downloadCovers(db, items, onProgress) {
   await Promise.all(workers);
   return { failed, failedKeys, errors, blobUrls };
 }
-function showCoverModal(db, downloadItems, existingBlobUrls) {
+function showCoverModal(db, downloadItems, existingBlobUrls, onGlobalProgress) {
   return new Promise((resolve) => {
-    const coverByKey = new Map(downloadItems.map((it) => [it.key, it.url]));
     const modal = document.createElement("div");
     modal.className = "cover-modal";
     modal.innerHTML = '<div class="cover-box">  <div class="cover-head">    <span class="cover-title"></span>    <button class="cover-close" title="\u62D2\u7EDD\u4E0B\u8F7D">\xD7</button>  </div>  <div class="cover-desc"></div>  <div class="cover-warn hidden"></div>  <div class="cover-progress hidden">    <div class="cover-track"><div class="cover-fill"></div></div>    <div class="cover-label"></div>  </div>  <div class="cover-actions">    <button class="cover-btn primary"></button>    <button class="cover-btn ghost hidden"></button>  </div></div>';
@@ -8415,7 +8429,7 @@ function showCoverModal(db, downloadItems, existingBlobUrls) {
       ghostBtn.classList.toggle("hidden", state !== "failed");
       if (state === "confirm") {
         titleEl.textContent = "\u4E0B\u8F7D\u5C01\u9762";
-        descEl.textContent = "\u672C\u56FE\u9700\u8981\u4E0B\u8F7D " + downloadItems.length + " \u5F20\u6A21\u7EC4\u5C01\u9762\u624D\u80FD\u6B63\u5E38\u4F7F\u7528\u3002\u5C01\u9762\u5C06\u7F13\u5B58\u5230\u6D4F\u89C8\u5668\u672C\u5730\uFF0C\u4E0B\u6B21\u6253\u5F00\u65E0\u9700\u91CD\u590D\u4E0B\u8F7D\u3002";
+        descEl.textContent = GRAPH_MODE === "author" ? "\u672C\u56FE\u9700\u8981\u4E0B\u8F7D " + downloadItems.length + " \u4F4D\u4F5C\u8005\u7684\u5934\u50CF\u624D\u80FD\u6B63\u5E38\u4F7F\u7528\u3002\u5934\u50CF\u5C06\u7F13\u5B58\u5230\u6D4F\u89C8\u5668\u672C\u5730\uFF0C\u4E0B\u6B21\u6253\u5F00\u65E0\u9700\u91CD\u590D\u4E0B\u8F7D\u3002" : "\u672C\u56FE\u9700\u8981\u4E0B\u8F7D " + downloadItems.length + " \u5F20\u6A21\u7EC4\u5C01\u9762\u624D\u80FD\u6B63\u5E38\u4F7F\u7528\u3002\u5C01\u9762\u5C06\u7F13\u5B58\u5230\u6D4F\u89C8\u5668\u672C\u5730\uFF0C\u4E0B\u6B21\u6253\u5F00\u65E0\u9700\u91CD\u590D\u4E0B\u8F7D\u3002";
         warnEl.textContent = "\u8B66\u544A\uFF1A\u5C06\u4EE5 " + COVER_CONCURRENCY + " \u5E76\u53D1\u91CF\u4E0B\u8F7D " + downloadItems.length + " \u5F20\u5C01\u9762\u3002\u9AD8\u9891\u8BF7\u6C42\u53EF\u80FD\u89E6\u53D1 mcmod \u98CE\u63A7\uFF0C\u5E76\u5360\u7528\u7F51\u7EDC\u8D44\u6E90\u3002\u70B9\u51FB\u201C\u786E\u5B9A\u4E0B\u8F7D\u201D\u5373\u89C6\u4E3A\u5DF2\u77E5\u6089\u5E76\u63A5\u53D7\u98CE\u9669\uFF0C\u540E\u679C\u81EA\u8D1F\u3002";
         warnEl.classList.remove("hidden");
         primaryBtn.textContent = "\u786E\u5B9A\u4E0B\u8F7D";
@@ -8455,6 +8469,7 @@ function showCoverModal(db, downloadItems, existingBlobUrls) {
       if (failedCount > 0) text += " \xB7 \u5931\u8D25 " + failedCount;
       text += " \xB7 \u5269\u4F59\u7EA6 " + eta;
       labelEl.textContent = text;
+      if (onGlobalProgress) onGlobalProgress(pct, "\u6B63\u5728\u4E0B\u8F7D\u5C01\u9762\u2026", text);
     }
     function finish(blobUrls) {
       modal.remove();
@@ -8494,8 +8509,7 @@ function showCoverModal(db, downloadItems, existingBlobUrls) {
       }
     });
     ghostBtn.addEventListener("click", () => {
-      const retryItems = failedKeys.map((k) => ({ key: k, url: coverByKey.get(k) }));
-      startDownload(retryItems);
+      startDownload(failedKeys.map((k) => ({ url: k })));
     });
     closeEl.addEventListener("click", () => {
       if (state === "confirm") {
@@ -8538,7 +8552,7 @@ async function prewarmCovers(items, blobUrls, onProgress) {
   const normal = /* @__PURE__ */ new Set();
   const hi = /* @__PURE__ */ new Set();
   for (const it of items) {
-    const src = blobUrls.get(it.key);
+    const src = blobUrls.get(it.url);
     if (!src) continue;
     (it.hiRes ? hi : normal).add(src);
   }
@@ -8550,10 +8564,13 @@ async function prewarmCovers(items, blobUrls, onProgress) {
   if (!total) return 0;
   const BATCH = 300;
   const BATCH_GAP = 40;
+  let registered = 0;
   for (const g of groups) {
     for (let i = 0; i < g.sources.length; i += BATCH) {
       const chunk = g.sources.slice(i, i + BATCH);
       for (const s of chunk) g.program.textureManager.registerImage(s);
+      registered += chunk.length;
+      if (onProgress) onProgress(registered, total, "\u6CE8\u518C");
       await sleep(BATCH_GAP);
     }
   }
@@ -8563,7 +8580,7 @@ async function prewarmCovers(items, blobUrls, onProgress) {
   let stable = 0;
   while (Date.now() < deadline) {
     const done = groups.reduce((sum, g) => sum + countOf(g), 0);
-    if (onProgress) onProgress(done, total);
+    if (onProgress) onProgress(done, total, "\u89E3\u7801");
     if (done >= total) return done;
     if (done === last) {
       if (++stable >= 4) return done;
@@ -8575,12 +8592,14 @@ async function prewarmCovers(items, blobUrls, onProgress) {
   }
   return groups.reduce((sum, g) => sum + countOf(g), 0);
 }
-function buildGraph(data, blobUrls) {
+async function buildGraph(data, blobUrls, onProgress) {
   const graph = new import_graphology.default({ multi: true });
   const labelIndex = /* @__PURE__ */ new Map();
   const degMap = /* @__PURE__ */ new Map();
   const teamFlag = /* @__PURE__ */ new Map();
-  for (const n of data.nodes) {
+  const nodeTotal = data.nodes.length;
+  for (let i = 0; i < nodeTotal; i++) {
+    const n = data.nodes[i];
     const deg = n.degree != null ? n.degree : n.in_degree || 0;
     const isTeam = !!n.is_team;
     degMap.set(n.key, deg);
@@ -8588,6 +8607,7 @@ function buildGraph(data, blobUrls) {
     const hasImage = n.type === "core" || n.type === "author";
     const sz = nodeSize(deg, n.type, isTeam, n.member_count);
     const hiRes = sz > COVER_HI_RES_THRESHOLD;
+    const cover = hasImage && n.cover_url ? blobUrls.get(normalizeCoverUrl(n.cover_url)) || null : null;
     graph.addNode(n.key, {
       x: typeof n.x === "number" ? n.x : Math.random() * 100,
       y: typeof n.y === "number" ? n.y : Math.random() * 100,
@@ -8599,7 +8619,7 @@ function buildGraph(data, blobUrls) {
       description: n.description,
       kind: n.type,
       type: hasImage ? hiRes ? "imageHi" : "image" : "circle",
-      image: hasImage ? blobUrls.get(n.key) || null : null,
+      image: cover,
       views: n.views,
       favorites: n.favorites,
       category: n.category,
@@ -8622,8 +8642,15 @@ function buildGraph(data, blobUrls) {
       if (!labelIndex.has(k)) labelIndex.set(k, []);
       labelIndex.get(k).push(n.key);
     }
+    if ((i + 1) % 2e3 === 0) {
+      if (onProgress) onProgress(i + 1, nodeTotal);
+      await sleep(0);
+    }
   }
-  for (const e of data.edges) {
+  if (onProgress) onProgress(nodeTotal, nodeTotal);
+  const edgeTotal = data.edges.length;
+  for (let i = 0; i < edgeTotal; i++) {
+    const e = data.edges[i];
     const importance = Math.min(degMap.get(e.source) || 0, degMap.get(e.target) || 0);
     const kind = e.type === "interaction" ? "interaction" : e.type === "cooperation" ? "cooperation" : e.type === "membership" ? "membership" : "dependency";
     let rgb;
@@ -8637,10 +8664,10 @@ function buildGraph(data, blobUrls) {
       rgb = kind === "interaction" ? INTERACTION_EDGE_RGB : DEPENDENCY_EDGE_RGB;
     }
     graph.addEdge(e.source, e.target, {
-      size: GRAPH_MODE === "author" ? kind === "membership" ? 0.4 : edgeSizeFor(e.weight) : 0.5,
+      size: GRAPH_MODE === "author" ? kind === "membership" ? MEMBER_EDGE_SIZE : edgeSizeFor(e.weight) : 0.5,
       color: premulRgba(rgb, kind === "membership" ? MEMBER_EDGE_ALPHA : EDGE_ALPHA),
       alpha: kind === "membership" ? MEMBER_EDGE_ALPHA : EDGE_ALPHA,
-      // 导出绘制用（与屏幕一致）
+      // 导出绘制用，与屏幕一致
       type: "line",
       kind,
       rgb,
@@ -8648,10 +8675,15 @@ function buildGraph(data, blobUrls) {
       weight: e.weight,
       group_name: e.group_name || ""
     });
+    if ((i + 1) % 5e3 === 0) {
+      if (onProgress) onProgress(i + 1, edgeTotal);
+      await sleep(0);
+    }
   }
+  if (onProgress) onProgress(edgeTotal, edgeTotal);
   return { graph, data, labelIndex };
 }
-function buildSearch(data) {
+async function buildSearch(data, onProgress) {
   const index = /* @__PURE__ */ new Map();
   const add = (term, n) => {
     if (!term) return;
@@ -8659,11 +8691,18 @@ function buildSearch(data) {
     if (!index.has(k)) index.set(k, /* @__PURE__ */ new Set());
     index.get(k).add(n);
   };
-  for (const n of data.nodes) {
+  const total = data.nodes.length;
+  for (let i = 0; i < total; i++) {
+    const n = data.nodes[i];
     add(n.label, n);
     add(n.name_en, n);
     add(n.key, n);
+    if ((i + 1) % 5e3 === 0) {
+      if (onProgress) onProgress(i + 1, total);
+      await sleep(0);
+    }
   }
+  if (onProgress) onProgress(total, total);
   return index;
 }
 function buildPagination(pageCount, current, onPage) {
@@ -8767,10 +8806,13 @@ function main() {
   const edgeDependency = document.getElementById("edge-dependency");
   const edgeInteraction = document.getElementById("edge-interaction");
   const showLabels = document.getElementById("show-labels");
+  const showTeamsEl = document.getElementById("show-teams");
+  const showAuthorsEl = document.getElementById("show-authors");
   const exportWidth = document.getElementById("export-width");
   const exportHeight = document.getElementById("export-height");
   const exportButton = document.getElementById("export-button");
   const exportWarning = document.getElementById("export-warning");
+  const exportSinglePng = document.getElementById("export-single-png");
   let renderer = null;
   let graph = null;
   let searchIndex = null;
@@ -8782,6 +8824,9 @@ function main() {
   let allNodes = [];
   let showDependency = true;
   let showInteraction = true;
+  let showTeams = true;
+  let showAuthors = true;
+  let hiddenNodeSet = /* @__PURE__ */ new Set();
   let highlightNodes = /* @__PURE__ */ new Set();
   let highlightEdges = /* @__PURE__ */ new Set();
   let coverBlobUrls = /* @__PURE__ */ new Map();
@@ -8802,12 +8847,21 @@ function main() {
     }, 700);
   }
   async function boot() {
-    setProgress(0, "\u52A0\u8F7D\u6570\u636E\u4E2D\u2026\u2026", "graph.json");
-    const data = await loadGraph();
+    setProgress(0, "\u52A0\u8F7D\u6570\u636E\u4E2D\u2026\u2026", "");
+    const data = await loadGraph((received, total) => {
+      setProgress(
+        Math.round(received / total * 10),
+        "\u52A0\u8F7D\u6570\u636E\u4E2D\u2026\u2026",
+        (received / 1048576).toFixed(1) + " / " + (total / 1048576).toFixed(1) + " MB"
+      );
+    });
     GRAPH_MODE = data.meta && data.meta.mode === "author" ? "author" : "mod";
     document.getElementById("search-input").placeholder = GRAPH_MODE === "author" ? "\u641C\u7D22\u4F5C\u8005\u540D\u2026" : "\u641C\u7D22\u6A21\u7EC4\u540D\u2026";
+    document.querySelectorAll(".author-only").forEach((el) => {
+      el.style.display = GRAPH_MODE === "author" ? "" : "none";
+    });
     renderMetaPanel(data.meta);
-    setProgress(10, "\u68C0\u67E5\u5C01\u9762\u7F13\u5B58\u2026\u2026", "");
+    setProgress(10, "\u6B63\u5728\u8BFB\u53D6\u5C01\u9762\u7F13\u5B58\u2026\u2026", "");
     await new Promise((r) => setTimeout(r, 30));
     const coverItems = [];
     for (const n of data.nodes) {
@@ -8830,58 +8884,74 @@ function main() {
         await showProxyErrorModal(proxyStatus);
         return;
       }
-      const loaded = await loadAllCovers(db, coverItems);
+      const wantUrls = [...new Set(coverItems.map((it) => it.url))];
+      const loaded = await loadAllCovers(db, wantUrls, (done, total) => {
+        setProgress(
+          10 + Math.round(Math.min(done, total) / Math.max(1, total) * 5),
+          "\u6B63\u5728\u8BFB\u53D6\u5C01\u9762\u7F13\u5B58\u2026\u2026",
+          done + " / " + total
+        );
+      });
       blobUrls = loaded.blobUrls;
       if (loaded.staleKeys.length) {
-        const byKey = new Map(coverItems.map((it) => [it.key, it.url]));
-        const downloadItems = loaded.staleKeys.map((k) => ({ key: k, url: byKey.get(k) }));
-        const result = await showCoverModal(db, downloadItems, blobUrls);
+        const staleSet = new Set(loaded.staleKeys);
+        const uniqueUrls = [...new Set(coverItems.filter((it) => staleSet.has(it.url)).map((it) => it.url))];
+        const result = await showCoverModal(db, uniqueUrls.map((url) => ({ url })), blobUrls, (pct, text, label) => {
+          setProgress(15 + Math.round(pct * 0.25), text, label);
+        });
         blobUrls = result.blobUrls;
-      }
-      const purged = await purgeStaleKeys(db, coverItems);
-      for (const k of purged) {
-        const u = blobUrls.get(k);
-        if (u) URL.revokeObjectURL(u);
       }
     }
     if (blobUrls.size) {
       const prewarmItems = [];
       for (const n of data.nodes) {
         if (n.type !== "core" && n.type !== "author") continue;
+        const url = normalizeCoverUrl(n.cover_url);
+        if (!url) continue;
         const deg = n.degree != null ? n.degree : n.in_degree || 0;
         const isTeam = !!n.is_team;
         prewarmItems.push({
-          key: n.key,
+          url,
           hiRes: nodeSize(deg, n.type, isTeam, n.member_count) > COVER_HI_RES_THRESHOLD
         });
       }
-      setProgress(20, "\u6B63\u5728\u751F\u6210\u5C01\u9762\u7EB9\u7406\u2026", "");
-      await prewarmCovers(prewarmItems, blobUrls, (done, total) => {
-        setProgress(
-          20 + Math.round(done / Math.max(1, total) * 60),
-          "\u6B63\u5728\u751F\u6210\u5C01\u9762\u7EB9\u7406\u2026",
-          done + " / " + total
-        );
+      await prewarmCovers(prewarmItems, blobUrls, (done, total, phase) => {
+        const register = phase === "\u6CE8\u518C";
+        const base = register ? 40 : 52;
+        const span = register ? 12 : 23;
+        const pct = base + Math.round(Math.min(done, total) / Math.max(1, total) * span);
+        setProgress(pct, register ? "\u6B63\u5728\u6CE8\u518C\u5C01\u9762\u56FE\u7247\u2026" : "\u6B63\u5728\u89E3\u7801\u5C01\u9762\u56FE\u7247\u2026", done + " / " + total);
       });
     }
-    setProgress(85, "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026", "");
-    await new Promise((r) => setTimeout(r, 30));
-    const built = buildGraph(data, blobUrls);
+    setProgress(75, "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026", "");
+    const built = await buildGraph(data, blobUrls, (done, total) => {
+      setProgress(
+        75 + Math.round(Math.min(done, total) / Math.max(1, total) * 15),
+        "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026",
+        done + " / " + total
+      );
+    });
     graph = built.graph;
     coverBlobUrls = blobUrls;
-    searchIndex = buildSearch(data);
+    searchIndex = await buildSearch(data, (done, total) => {
+      setProgress(
+        90 + Math.round(Math.min(done, total) / Math.max(1, total) * 5),
+        "\u6784\u5EFA\u641C\u7D22\u7D22\u5F15\u2026\u2026",
+        done + " / " + total
+      );
+    });
     allNodes = sortNodes([...data.nodes]);
     searchMatches = [...allNodes];
     searchPage = 0;
     renderSearchResults();
-    setProgress(100, "\u6E32\u67D3\u4E2D\u2026\u2026", "");
+    setProgress(95, "\u6E32\u67D3\u4E2D\u2026\u2026", "");
     await new Promise((r) => setTimeout(r, 30));
     renderer = new Sigma(graph, container, {
       renderLabels: true,
       renderEdgeLabels: false,
       hideEdgesOnMove: false,
       enableEdgeEvents: true,
-      // 节点尺寸与坐标同单位（世界单位），去重叠才能与渲染一致
+      // 节点尺寸与坐标同单位，即世界单位；去重叠才能与渲染一致
       itemSizesReference: "positions",
       zoomToSizeRatioFunction: (ratio) => ratio,
       defaultNodeType: "circle",
@@ -8897,7 +8967,6 @@ function main() {
       nodeProgramClasses: {
         image: FadingNodeImageProgram,
         imageHi: FadingNodeImageProgramHi
-        // 大节点 300px 高清
       }
     });
     bindEvents();
@@ -8922,7 +8991,7 @@ function main() {
       if (highlightEdges.has(edge)) {
         return { ...attrs, hidden: false, color: HIGHLIGHT_EDGE_COLOR, size: Math.max(attrs.size || 0.5, 1.6) };
       }
-      if (attrs.kind === "dependency" && !showDependency || attrs.kind === "interaction" && !showInteraction || culledEdges.has(edge)) {
+      if (attrs.kind === "dependency" && !showDependency || attrs.kind === "interaction" && !showInteraction || culledEdges.has(edge) || hiddenNodeSet.has(graph.source(edge)) || hiddenNodeSet.has(graph.target(edge))) {
         return { ...attrs, hidden: true };
       }
       return attrs;
@@ -8931,6 +9000,7 @@ function main() {
       if (highlightNodes.has(node)) {
         return { ...attr, hidden: false, color: HIGHLIGHT_NODE_COLOR };
       }
+      if (hiddenNodeSet.has(node)) return { ...attr, hidden: true };
       return attr;
     });
     const cam = renderer.getCamera();
@@ -8959,7 +9029,7 @@ function main() {
     updateCulling(cam.getState());
     renderer.refresh();
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    await new Promise((r) => setTimeout(r, 700));
+    setProgress(100, "\u6E32\u67D3\u5B8C\u6210", "");
     renderer.scheduleRefresh();
     finishLoading();
   }
@@ -9030,6 +9100,23 @@ function main() {
     });
     showLabels.addEventListener("change", () => {
       renderer.setSetting("renderLabels", showLabels.checked);
+    });
+    function updateHiddenNodes() {
+      hiddenNodeSet = /* @__PURE__ */ new Set();
+      if (showTeams && showAuthors) return;
+      graph.forEachNode((node, attrs) => {
+        if (attrs.is_team && !showTeams || !attrs.is_team && !showAuthors) hiddenNodeSet.add(node);
+      });
+    }
+    showTeamsEl.addEventListener("change", () => {
+      showTeams = showTeamsEl.checked;
+      updateHiddenNodes();
+      renderer.scheduleRefresh();
+    });
+    showAuthorsEl.addEventListener("change", () => {
+      showAuthors = showAuthorsEl.checked;
+      updateHiddenNodes();
+      renderer.scheduleRefresh();
     });
     exportButton.addEventListener("click", exportPNG);
     function updateExportWarning() {
@@ -9746,10 +9833,10 @@ function main() {
       ctx.stroke();
     }
   }
-  function drawLabel(ctx, cx, cy, r, attrs) {
+  function drawLabel(ctx, cx, cy, r, attrs, labelScale) {
     const name = attrs.name || attrs.key;
     const idText = nodeKindLabel(attrs) + " " + attrs.key;
-    const fontSize = LABEL_FONT_SIZE;
+    const fontSize = LABEL_FONT_SIZE * (labelScale || 1);
     const lineHeight = fontSize * 1.25;
     ctx.font = fontSize + 'px "Microsoft YaHei", "PingFang SC", sans-serif';
     ctx.textAlign = "center";
@@ -9770,7 +9857,7 @@ function main() {
     ctx.fillStyle = "#9fb0c3";
     ctx.fillText(idText, cx, by + padY + lineHeight);
   }
-  async function drawNodesAt(ctx, items, onProgress) {
+  async function drawNodesAt(ctx, items, onProgress, labelScale) {
     const total = items.length;
     let idx = 0;
     let done = 0;
@@ -9807,7 +9894,7 @@ function main() {
           ctx.fillStyle = attrs.color || "#888888";
           ctx.fill();
         }
-        drawLabel(ctx, cx, cy, r, attrs);
+        drawLabel(ctx, cx, cy, r, attrs, labelScale);
         done++;
         if (onProgress) onProgress(done, total);
       }
@@ -9930,10 +10017,146 @@ function main() {
     }
     return encodePNG(W, H, getScanlines);
   }
+  async function zipStore(files) {
+    const parts = [];
+    const central = [];
+    let offset = 0;
+    let cdBytes = 0;
+    const enc = new TextEncoder();
+    for (const f of files) {
+      const name = enc.encode(f.name);
+      const crc = crc32(f.bytes, 0, f.bytes.length);
+      const size = f.bytes.length;
+      const lh = new DataView(new ArrayBuffer(30));
+      lh.setUint32(0, 67324752, true);
+      lh.setUint16(4, 20, true);
+      lh.setUint16(6, 2048, true);
+      lh.setUint16(8, 0, true);
+      lh.setUint16(10, 0, true);
+      lh.setUint16(12, 33, true);
+      lh.setUint32(14, crc, true);
+      lh.setUint32(18, size, true);
+      lh.setUint32(22, size, true);
+      lh.setUint16(26, name.length, true);
+      lh.setUint16(28, 0, true);
+      parts.push(lh.buffer, name, f.bytes.buffer);
+      const ch = new DataView(new ArrayBuffer(46));
+      ch.setUint32(0, 33639248, true);
+      ch.setUint16(4, 20, true);
+      ch.setUint16(6, 20, true);
+      ch.setUint16(8, 2048, true);
+      ch.setUint16(10, 0, true);
+      ch.setUint16(12, 0, true);
+      ch.setUint16(14, 33, true);
+      ch.setUint32(16, crc, true);
+      ch.setUint32(20, size, true);
+      ch.setUint32(24, size, true);
+      ch.setUint16(28, name.length, true);
+      ch.setUint16(30, 0, true);
+      ch.setUint16(32, 0, true);
+      ch.setUint16(34, 0, true);
+      ch.setUint16(36, 0, true);
+      ch.setUint32(38, 0, true);
+      ch.setUint32(42, offset, true);
+      central.push(ch.buffer, name);
+      offset += 30 + name.length + size;
+      cdBytes += 46 + name.length;
+    }
+    const eocd = new DataView(new ArrayBuffer(22));
+    eocd.setUint32(0, 101010256, true);
+    eocd.setUint16(4, 0, true);
+    eocd.setUint16(6, 0, true);
+    eocd.setUint16(8, files.length, true);
+    eocd.setUint16(10, files.length, true);
+    eocd.setUint32(12, cdBytes, true);
+    eocd.setUint32(16, offset, true);
+    eocd.setUint16(20, 0, true);
+    parts.push(...central, eocd.buffer);
+    return new Blob(parts, { type: "application/zip" });
+  }
+  function viewerHtml(W, H, maxLevel) {
+    const css = "html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif}#view{position:fixed;inset:0;cursor:grab;touch-action:none}#view.drag{cursor:grabbing}#hint{position:fixed;left:10px;bottom:10px;color:#888;font-size:12px;background:rgba(0,0,0,.5);padding:4px 8px;border-radius:4px;pointer-events:none}";
+    const js = "const W=" + W + ",H=" + H + ",TILE=" + EXPORT_TILE + ",MAX_LEVEL=" + maxLevel + ";const c=document.getElementById('view'),ctx=c.getContext('2d');let vw=0,vh=0;function rs(){vw=c.width=innerWidth;vh=c.height=innerHeight;}addEventListener('resize',rs);rs();let s=Math.min(vw/W,vh/H)*.95,ox=(vw-W*s)/2,oy=(vh-H*s)/2;const cache=new Map(),pending=new Set();function lvl(){return Math.max(0,Math.min(MAX_LEVEL,Math.ceil(Math.log2(1/s))));}function draw(){ctx.fillStyle='#000';ctx.fillRect(0,0,vw,vh);const l=lvl(),div=1<<l,span=TILE*div;const x0=-ox/s,x1=(vw-ox)/s,y0=-oy/s,y1=(vh-oy)/s;const c0=Math.max(0,Math.floor(x0/span)),c1=Math.min(Math.ceil(W/span)-1,Math.floor(x1/span));const r0=Math.max(0,Math.floor(y0/span)),r1=Math.min(Math.ceil(H/span)-1,Math.floor(y1/span));for(let r=r0;r<=r1;r++)for(let cc=c0;cc<=c1;cc++){const key=l+':'+cc+':'+r,img=cache.get(key);if(img)ctx.drawImage(img,ox+cc*span*s,oy+r*span*s,span*s,span*s);else if(!pending.has(key)){pending.add(key);load(key,l,cc,r);}}}function load(key,l,cc,r){const im=new Image();im.onload=()=>{cache.set(key,im);pending.delete(key);draw();};im.onerror=()=>pending.delete(key);im.src='tiles/'+l+'/'+cc+'_'+r+'.png';}let drag=false,lx=0,ly=0;c.addEventListener('mousedown',e=>{drag=true;lx=e.clientX;ly=e.clientY;c.classList.add('drag');});addEventListener('mousemove',e=>{if(!drag)return;ox+=e.clientX-lx;oy+=e.clientY-ly;lx=e.clientX;ly=e.clientY;draw();});addEventListener('mouseup',()=>{drag=false;c.classList.remove('drag');});c.addEventListener('wheel',e=>{e.preventDefault();const f=Math.exp(-e.deltaY*.0012),nx=e.clientX,ny=e.clientY;const gx=(nx-ox)/s,gy=(ny-oy)/s;s=Math.min(Math.max(s*f,Math.min(vw/W,vh/H)*.5),2);ox=nx-gx*s;oy=ny-gy*s;draw();},{passive:false});let t=null;c.addEventListener('touchstart',e=>{t={x:e.touches[0].clientX,y:e.touches[0].clientY};},{passive:true});c.addEventListener('touchmove',e=>{if(!t)return;ox+=e.touches[0].clientX-t.x;oy+=e.touches[0].clientY-t.y;t={x:e.touches[0].clientX,y:e.touches[0].clientY};draw();},{passive:true});c.addEventListener('touchend',()=>{t=null;});draw();";
+    return "<!DOCTYPE html>\n<html lang='zh-CN'>\n<head>\n<meta charset='utf-8'>\n<meta name='viewport' content='width=device-width,initial-scale=1'>\n<title>\u661F\u56FE\u5BFC\u51FA</title>\n<style>" + css + "</style>\n</head>\n<body>\n<canvas id='view'></canvas>\n<div id='hint'>\u62D6\u62FD\u5E73\u79FB \xB7 \u6EDA\u8F6E\u7F29\u653E</div>\n<script>" + js + "<\/script>\n</body>\n</html>";
+  }
+  async function renderPyramidTiles(W, H, scale0, ox0, oy0, minX, minY, nodePixels0, onProgress) {
+    const maxDim = Math.max(W, H);
+    const maxLevel = Math.max(0, Math.ceil(Math.log2(maxDim / MIN_LEVEL_SIZE)));
+    const toX0 = (x) => (x - minX) * scale0 + ox0;
+    const toY0 = (y) => (y - minY) * scale0 + oy0;
+    let total = 0;
+    for (let l = 0; l <= maxLevel; l++) {
+      const d = 1 << l;
+      total += Math.ceil(Math.ceil(W / d) / EXPORT_TILE) * Math.ceil(Math.ceil(H / d) / EXPORT_TILE);
+    }
+    const files = [];
+    let done = 0;
+    const labelBottom = LABEL_FONT_SIZE * 3.25;
+    for (let l = 0; l <= maxLevel; l++) {
+      const d = 1 << l;
+      const Wl = Math.ceil(W / d), Hl = Math.ceil(H / d);
+      const cols = Math.ceil(Wl / EXPORT_TILE), rows = Math.ceil(Hl / EXPORT_TILE);
+      const labelScale = 1 / d;
+      const bandNodes = Array.from({ length: rows }, () => []);
+      for (const n of nodePixels0) {
+        const px = n.px / d, py = n.py / d, pr = n.pr / d;
+        const top = Math.max(0, Math.floor((py - pr) / EXPORT_TILE));
+        const bottom = Math.min(rows - 1, Math.floor((py + pr + labelBottom * labelScale) / EXPORT_TILE));
+        for (let r = top; r <= bottom; r++) bandNodes[r].push({ attrs: n.attrs, px, py, pr });
+      }
+      const bandEdges = Array.from({ length: rows }, () => []);
+      graph.forEachEdge((edge, attrs, source, target, sa, ta) => {
+        const ax = toX0(sa.x) / d, ay = toY0(sa.y) / d;
+        const bx = toX0(ta.x) / d, by = toY0(ta.y) / d;
+        const lineWidth = Math.max(1, (attrs.size || 0.5) * scale0 / d);
+        const half = lineWidth / 2 + 1;
+        const top = Math.max(0, Math.floor((Math.min(ay, by) - half) / EXPORT_TILE));
+        const bottom = Math.min(rows - 1, Math.floor((Math.max(ay, by) + half) / EXPORT_TILE));
+        const item = {
+          ax,
+          ay,
+          bx,
+          by,
+          half,
+          lineWidth,
+          rgb: attrs.rgb || DEPENDENCY_EDGE_RGB,
+          alpha: attrs.alpha != null ? attrs.alpha : EDGE_ALPHA
+        };
+        for (let r = top; r <= bottom; r++) bandEdges[r].push(item);
+      });
+      for (let r = 0; r < rows; r++) {
+        const bandE = bandEdges[r];
+        const band = bandNodes[r];
+        for (let c = 0; c < cols; c++) {
+          const canvas = document.createElement("canvas");
+          canvas.width = EXPORT_TILE;
+          canvas.height = EXPORT_TILE;
+          const ctx = canvas.getContext("2d");
+          ctx.fillStyle = "#000000";
+          ctx.fillRect(0, 0, EXPORT_TILE, EXPORT_TILE);
+          drawEdgesBand(ctx, bandE, c * EXPORT_TILE, r * EXPORT_TILE, EXPORT_TILE);
+          const items = [];
+          for (const n of band) {
+            const labelHalf = Math.max(n.pr, LABEL_FONT_SIZE * 16 * labelScale);
+            if (n.px + labelHalf >= c * EXPORT_TILE && n.px - labelHalf <= c * EXPORT_TILE + EXPORT_TILE) {
+              items.push({ attrs: n.attrs, cx: n.px - c * EXPORT_TILE, cy: n.py - r * EXPORT_TILE, r: n.pr });
+            }
+          }
+          await drawNodesAt(ctx, items, null, labelScale);
+          const blob = await canvasToBlob(canvas);
+          files.push({ name: "tiles/" + l + "/" + c + "_" + r + ".png", bytes: new Uint8Array(await blob.arrayBuffer()) });
+          done++;
+          if (onProgress) onProgress(done, total);
+        }
+      }
+    }
+    return { files, maxLevel };
+  }
   async function exportPNG() {
     if (!graph) return;
     const W = Math.max(64, parseInt(exportWidth.value, 10) || 65536);
     const H = Math.max(64, parseInt(exportHeight.value, 10) || 65536);
+    const wantSinglePng = exportSinglePng.checked;
     exportButton.disabled = true;
     exportButton.textContent = "\u5BFC\u51FA\u4E2D\u2026";
     try {
@@ -9964,28 +10187,40 @@ function main() {
         py: toY(attrs.y),
         pr: attrs.size * scale2
       }));
-      const SINGLE_MAX = 16384;
-      const blob = W < SINGLE_MAX && H < SINGLE_MAX ? await renderSingle(W, H, scale2, nodePixels, toX, toY) : await renderTiled(W, H, scale2, nodePixels, toX, toY);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "mcmod-graph-" + W + "x" + H + ".png";
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      const { files, maxLevel } = await renderPyramidTiles(W, H, scale2, ox, oy, minX, minY, nodePixels, (done, total) => {
+        exportButton.textContent = "\u5BFC\u51FA\u74E6\u7247 " + Math.round(done / total * 100) + "% \xB7 " + done + " / " + total;
+      });
+      files.push({ name: "viewer.html", bytes: new TextEncoder().encode(viewerHtml(W, H, maxLevel)) });
+      const zipBlob = await zipStore(files);
+      downloadBlob(zipBlob, "mcmod-graph-" + W + "x" + H + ".zip");
+      if (wantSinglePng) {
+        exportButton.textContent = "\u5BFC\u51FA\u5355\u5F20 PNG\u2026";
+        const SINGLE_MAX = 16384;
+        const blob = W < SINGLE_MAX && H < SINGLE_MAX ? await renderSingle(W, H, scale2, nodePixels, toX, toY) : await renderTiled(W, H, scale2, nodePixels, toX, toY);
+        downloadBlob(blob, "mcmod-graph-" + W + "x" + H + ".png");
+      }
     } catch (err) {
-      console.error("[\u9519\u8BEF] \u5BFC\u51FA PNG \u5931\u8D25", err);
+      console.error("[\u9519\u8BEF] \u5BFC\u51FA\u5931\u8D25", err);
       exportButton.textContent = "\u5BFC\u51FA\u5931\u8D25";
       setTimeout(() => {
         exportButton.textContent = "\u4E0B\u8F7D\u6E32\u67D3\u56FE";
       }, 2e3);
     } finally {
       exportButton.disabled = false;
-      if (exportButton.textContent.startsWith("\u5BFC\u51FA\u4E2D")) {
+      if (exportButton.textContent.startsWith("\u5BFC\u51FA") && !exportButton.textContent.startsWith("\u5BFC\u51FA\u5931\u8D25")) {
         exportButton.textContent = "\u4E0B\u8F7D\u6E32\u67D3\u56FE";
       }
     }
+  }
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   }
   boot().catch((err) => {
     statusText.textContent = "\u51FA\u9519\u4E86\uFF1A" + err.message;
