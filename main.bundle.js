@@ -9263,10 +9263,21 @@ function main() {
   let lastMouse = { x: 0, y: 0 };
   let hoveredNode = null;
   let altLock = false;
+  let lastAltPress = 0;
+  const ALT_DOUBLE_MS = 300;
   window.addEventListener("keydown", (e) => {
     if (e.key === "Alt") {
       e.preventDefault();
       altLock = true;
+      const now = performance.now();
+      if (now - lastAltPress < ALT_DOUBLE_MS) {
+        lastAltPress = 0;
+        if (panel.classList.contains("collapsed") || panel.style.display === "none") {
+          panel.style.display = panel.style.display === "none" ? "" : "none";
+        }
+      } else {
+        lastAltPress = now;
+      }
     }
   });
   window.addEventListener("keyup", (e) => {

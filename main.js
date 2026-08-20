@@ -1543,11 +1543,23 @@ function main() {
   let lastMouse = { x: 0, y: 0 };
   let hoveredNode = null; // 当前悬浮的节点，Alt 松开时决定是否隐藏
   let altLock = false;    // Alt 按住时锁定 tooltip，不消失、不跟随
+  let lastAltPress = 0;   // 上次 Alt 按下时间，用于双击检测
+  const ALT_DOUBLE_MS = 300;
 
   window.addEventListener("keydown", (e) => {
     if (e.key === "Alt") {
       e.preventDefault();
       altLock = true;
+      const now = performance.now();
+      if (now - lastAltPress < ALT_DOUBLE_MS) {
+        lastAltPress = 0;
+        // 双击 Alt：侧边栏收起时切换显隐，完全隐藏与恢复（展开状态不响应）
+        if (panel.classList.contains("collapsed") || panel.style.display === "none") {
+          panel.style.display = panel.style.display === "none" ? "" : "none";
+        }
+      } else {
+        lastAltPress = now;
+      }
     }
   });
   window.addEventListener("keyup", (e) => {
