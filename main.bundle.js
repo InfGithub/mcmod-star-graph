@@ -7985,18 +7985,26 @@ var NodePictogramProgram = createNodeImageProgram({
 });
 
 // main.js
-var FadingNodeImageProgram = class extends createNodeImageProgram({
-  size: { mode: "max", value: 128 }
-}) {
-  getDefinition() {
-    const def = super.getDefinition();
-    def.FRAGMENT_SHADER_SOURCE = def.FRAGMENT_SHADER_SOURCE.replace("max(texel.a, v_color.a)", "v_color.a").replace(
-      "  #endif\n\n  // Crop in a circle when u_keepWithinCircle is truthy:",
-      "  color.rgb *= v_color.a;\n  #endif\n\n  // Crop in a circle when u_keepWithinCircle is truthy:"
-    );
-    return def;
+function makeFadingImageProgram(textureSize) {
+  class FadingImageProgram extends createNodeImageProgram({
+    size: { mode: "max", value: textureSize }
+  }) {
+    getDefinition() {
+      const def = super.getDefinition();
+      def.FRAGMENT_SHADER_SOURCE = def.FRAGMENT_SHADER_SOURCE.replace(
+        "color = vec4(mix(v_color, texel, texel.a).rgb, max(texel.a, v_color.a));",
+        "color = vec4(texel.rgb * texel.a, texel.a * v_color.a);"
+      ).replace(
+        "  #endif\n\n  // Crop in a circle when u_keepWithinCircle is truthy:",
+        "  color.rgb *= v_color.a;\n  #endif\n\n  // Crop in a circle when u_keepWithinCircle is truthy:"
+      );
+      return def;
+    }
   }
-};
+  return FadingImageProgram;
+}
+var FadingNodeImageProgram = makeFadingImageProgram(96);
+var FadingNodeImageProgramHi = makeFadingImageProgram(300);
 function drawNodeLabel(context, data, settings) {
   if (!data.label) return;
   const lines = String(data.label).split("\n");
@@ -8052,22 +8060,22 @@ var PALETTE = [
 ];
 var EXTERNAL_COLOR = "#9e9e9e";
 var ISOLATED_COLOR = "#d6d6d6";
-var EDGE_ALPHA = 0.3;
+var EDGE_ALPHA = 0.16;
 var DEPENDENCY_EDGE_RGB = [255, 182, 193];
 var INTERACTION_EDGE_RGB = [173, 216, 230];
+var TEAM_TEAM_EDGE_RGB = [144, 238, 144];
+var TEAM_MIXED_EDGE_RGB = [255, 99, 71];
+var INDIVIDUAL_EDGE_RGB = [173, 216, 230];
+var MEMBER_EDGE_RGB = [180, 255, 180];
+var MEMBER_EDGE_ALPHA = 0.1;
+var MEMBER_SIZE_WEIGHT = 50;
 function premulRgba(rgb, alpha) {
   return "rgba(" + Math.round(rgb[0] * alpha) + "," + Math.round(rgb[1] * alpha) + "," + Math.round(rgb[2] * alpha) + "," + alpha.toFixed(4) + ")";
 }
-var DEPENDENCY_EDGE_COLOR = premulRgba(DEPENDENCY_EDGE_RGB, EDGE_ALPHA);
-var INTERACTION_EDGE_COLOR = premulRgba(INTERACTION_EDGE_RGB, EDGE_ALPHA);
 function rgbaString(rgb, alpha) {
   return "rgba(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + "," + alpha + ")";
 }
-var LOD_MAX_THRESHOLD = 50;
-var LOD_FULL_ZOOM_RATIO = 0.05;
 var LOD_THROTTLE_MS = 33;
-var NODE_LOD_MIN_VISIBLE = 300;
-var NODE_LOD_ENABLED = true;
 var NODE_DIAMETER_SCREEN_RATIO = 0.1;
 var LABEL_FONT_SIZE = 14;
 var HIGHLIGHT_NODE_COLOR = "#ffd700";
@@ -8079,15 +8087,102 @@ var COVER_CONCURRENCY = 20;
 var COVER_INTERVAL_MS = 200;
 var COVER_RETRIES = 2;
 var COVER_PROXY = "/cover_proxy?url=";
-function communityColor(community, type) {
+var COVER_HI_RES_THRESHOLD = 20;
+var GRAPH_MODE = "mod";
+function communityColor(community, type, teamCommunity) {
   if (type === "external") return EXTERNAL_COLOR;
   if (community < 0) return ISOLATED_COLOR;
-  return PALETTE[community % PALETTE.length];
+  const base = PALETTE[community % PALETTE.length];
+  if (teamCommunity == null || teamCommunity < 0) return base;
+  const c = teamCommunity;
+  const dr = (c * 13 % 7 + 7) % 7 - 3;
+  const dg = (c * 29 % 7 + 7) % 7 - 3;
+  const db = (c * 47 % 7 + 7) % 7 - 3;
+  const cl = (v) => Math.max(0, Math.min(255, v));
+  const r = cl(parseInt(base.slice(1, 3), 16) + dr * 20);
+  const g = cl(parseInt(base.slice(3, 5), 16) + dg * 20);
+  const b = cl(parseInt(base.slice(5, 7), 16) + db * 20);
+  return "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
 }
-function nodeSize(inDegree, type) {
-  const d = Math.max(0, inDegree || 0);
+function nodeSize(inDegree, type, isTeam, memberCount) {
+  const d = Math.max(0, inDegree || 0) + (isTeam ? MEMBER_SIZE_WEIGHT * (memberCount || 0) : 0);
   const s = 2 + Math.sqrt(d);
-  return type === "external" ? Math.min(s, 10) : Math.min(s, 48);
+  return isTeam ? s * 1.618 : s;
+}
+function nodeKindLabel(node) {
+  if (GRAPH_MODE !== "author") return "class";
+  return node && node.is_team ? "\u56E2\u961F" : "\u4F5C\u8005";
+}
+var KIND_FILTERS = [
+  { key: "all", label: "\u5168\u90E8" },
+  { key: "team", label: "\u56E2\u961F" },
+  { key: "author", label: "\u666E\u901A\u4F5C\u8005" }
+];
+function filterNodesByKind(nodes, kind) {
+  if (kind === "team") return nodes.filter((n) => n.is_team);
+  if (kind === "author") return nodes.filter((n) => !n.is_team);
+  return nodes;
+}
+function filterNodesByRel(nodes, rel) {
+  if (rel === "contains") return nodes.filter((n) => n.is_team);
+  if (rel === "belongs") return nodes.filter((n) => n.teams && n.teams.length);
+  if (rel === "coop") return nodes.filter((n) => (n.degree || 0) > 0);
+  return nodes;
+}
+function buildFilterBar(kindCounts, relItems, state, onChange) {
+  const bar = document.createElement("div");
+  bar.className = "filter-bar";
+  const row1 = document.createElement("div");
+  row1.className = "filter-row";
+  for (const f of KIND_FILTERS) {
+    const c = kindCounts[f.key] || 0;
+    if (c <= 0) continue;
+    const b = document.createElement("button");
+    b.className = "filter-btn" + (state.kind === f.key ? " active" : "");
+    b.textContent = f.label + (f.key === "all" ? "" : " " + c);
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.kind = f.key;
+      onChange();
+    });
+    row1.appendChild(b);
+  }
+  bar.appendChild(row1);
+  const row2 = document.createElement("div");
+  row2.className = "filter-row";
+  const allBtn = document.createElement("button");
+  allBtn.className = "filter-btn" + (state.rel === "all" ? " active" : "");
+  allBtn.textContent = "\u5168\u90E8";
+  allBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    state.rel = "all";
+    onChange();
+  });
+  row2.appendChild(allBtn);
+  for (const item of relItems) {
+    if (!item.count) continue;
+    const b = document.createElement("button");
+    b.className = "filter-btn" + (state.rel === item.key ? " active" : "");
+    b.textContent = item.label + " " + item.count;
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.rel = item.key;
+      onChange();
+    });
+    row2.appendChild(b);
+  }
+  bar.appendChild(row2);
+  return bar;
+}
+function sortNodes(nodes) {
+  if (GRAPH_MODE === "author") {
+    return nodes.sort((a, b) => (b.degree || 0) - (a.degree || 0) || (b.views || 0) - (a.views || 0));
+  }
+  return nodes.sort((a, b) => (b.views || 0) - (a.views || 0));
+}
+function edgeSizeFor(weight) {
+  const w = Math.max(1, weight || 1);
+  return Math.min(0.5 + Math.log2(w) * 0.35, 3);
 }
 function formatNum(n) {
   if (n >= 1e4) return (n / 1e4).toFixed(1) + "\u4E07";
@@ -8100,18 +8195,6 @@ function formatDuration(ms) {
   const r = s % 60;
   return m + "m" + r + "s";
 }
-function edgeColorFor(rgb, alpha) {
-  return premulRgba(rgb, EDGE_ALPHA * alpha);
-}
-function hexToRgba(hex, alpha, premul) {
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  const rr = premul ? Math.round(r * alpha) : r;
-  const gg = premul ? Math.round(g * alpha) : g;
-  const bb = premul ? Math.round(b * alpha) : b;
-  return "rgba(" + rr + "," + gg + "," + bb + "," + alpha.toFixed(4) + ")";
-}
 async function loadGraph() {
   const res = await fetch(GRAPH_URL);
   if (!res.ok) throw new Error("\u52A0\u8F7D graph.json \u5931\u8D25: " + res.status);
@@ -8121,7 +8204,18 @@ function renderMetaPanel(meta) {
   const el = document.getElementById("panel-meta");
   if (!el || !meta) return;
   const w = meta.weights || {};
-  const rows = [
+  const rows = GRAPH_MODE === "author" ? [
+    ["\u8282\u70B9", meta.node_count],
+    ["\u666E\u901A\u4F5C\u8005", meta.author_count],
+    ["\u56E2\u961F", meta.team_count],
+    ["\u5408\u4F5C\u8FB9", meta.cooperation_edges],
+    ["\u6210\u5458\u8FB9", meta.membership_edges],
+    ["\u793E\u533A", meta.community_count],
+    ["\u8FDE\u901A\u5206\u91CF", meta.component_count],
+    ["\u751F\u6210\u65F6\u95F4", meta.generated_at],
+    ["\u5E03\u5C40", meta.layout],
+    ["\u6570\u636E\u6E90", meta.source_db]
+  ] : [
     ["\u7248\u672C", meta.mc_version],
     ["\u52A0\u8F7D\u5668", meta.api],
     ["\u8282\u70B9", meta.node_count],
@@ -8139,6 +8233,24 @@ function renderMetaPanel(meta) {
   el.innerHTML = html;
 }
 var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function debounce(fn, ms) {
+  let timer = null;
+  const wrapped = (...args) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      fn(...args);
+    }, ms);
+  };
+  wrapped.flush = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+      fn();
+    }
+  };
+  return wrapped;
+}
 function openCoverDB() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(COVER_DB_NAME, 2);
@@ -8150,13 +8262,6 @@ function openCoverDB() {
         req.transaction.objectStore(COVER_STORE).clear();
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-function idbGet(db, key) {
-  return new Promise((resolve, reject) => {
-    const req = db.transaction(COVER_STORE, "readonly").objectStore(COVER_STORE).get(key);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -8185,34 +8290,54 @@ function normalizeCoverUrl(url) {
 async function loadAllCovers(db, items) {
   const blobUrls = /* @__PURE__ */ new Map();
   const staleKeys = [];
-  for (const item of items) {
-    try {
-      const entry = await idbGet(db, item.key);
-      if (entry && entry.url === item.url && entry.blob) {
-        blobUrls.set(item.key, URL.createObjectURL(entry.blob));
+  const want = new Map(items.map((it) => [String(it.key), it.url]));
+  const tx = db.transaction(COVER_STORE, "readonly");
+  const store = tx.objectStore(COVER_STORE);
+  const req = store.openCursor();
+  req.onsuccess = () => {
+    const cursor = req.result;
+    if (!cursor) return;
+    const url = want.get(String(cursor.key));
+    if (url !== void 0) {
+      const entry = cursor.value;
+      if (entry && entry.url === url && entry.blob) {
+        blobUrls.set(cursor.key, URL.createObjectURL(entry.blob));
       } else {
-        staleKeys.push(item.key);
+        staleKeys.push(cursor.key);
       }
-    } catch (e) {
-      staleKeys.push(item.key);
     }
+    cursor.continue();
+  };
+  await new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  const found = /* @__PURE__ */ new Set();
+  for (const k of blobUrls.keys()) found.add(String(k));
+  for (const k of staleKeys) found.add(String(k));
+  for (const it of items) {
+    if (!found.has(String(it.key))) staleKeys.push(it.key);
   }
   return { blobUrls, staleKeys };
 }
 function purgeStaleKeys(db, items) {
   return new Promise((resolve, reject) => {
     const keep = new Set(items.map((it) => it.key));
+    const deletedKeys = [];
     const tx = db.transaction(COVER_STORE, "readwrite");
     const store = tx.objectStore(COVER_STORE);
     const req = store.openCursor();
     req.onsuccess = () => {
       const cursor = req.result;
       if (cursor) {
-        if (!keep.has(cursor.key)) cursor.delete();
+        if (!keep.has(cursor.key)) {
+          deletedKeys.push(cursor.key);
+          cursor.delete();
+        }
         cursor.continue();
       }
     };
-    tx.oncomplete = () => resolve();
+    tx.oncomplete = () => resolve(deletedKeys);
     tx.onerror = () => reject(tx.error);
   });
 }
@@ -8222,6 +8347,7 @@ async function downloadCovers(db, items, onProgress) {
   let failed = 0;
   const failedKeys = [];
   const errors = [];
+  const blobUrls = /* @__PURE__ */ new Map();
   async function worker() {
     while (idx < items.length) {
       const i = idx++;
@@ -8230,10 +8356,11 @@ async function downloadCovers(db, items, onProgress) {
       let lastErr = "";
       for (let attempt = 0; attempt <= COVER_RETRIES && !ok; attempt++) {
         try {
-          const resp = await fetch(COVER_PROXY + encodeURIComponent(item.url));
+          const resp = await fetch(COVER_PROXY + encodeURIComponent(item.url) + "&ua=" + encodeURIComponent(navigator.userAgent));
           if (!resp.ok) throw new Error("HTTP " + resp.status);
           const blob = await resp.blob();
           await idbPut(db, item.key, { url: item.url, blob });
+          blobUrls.set(item.key, URL.createObjectURL(blob));
           ok = true;
         } catch (e) {
           lastErr = String(e && e.message || e);
@@ -8256,17 +8383,18 @@ async function downloadCovers(db, items, onProgress) {
   const workers = [];
   for (let w = 0; w < COVER_CONCURRENCY; w++) workers.push(worker());
   await Promise.all(workers);
-  return { failed, failedKeys, errors };
+  return { failed, failedKeys, errors, blobUrls };
 }
-function showCoverModal(db, downloadItems, allItems) {
+function showCoverModal(db, downloadItems, existingBlobUrls) {
   return new Promise((resolve) => {
     const coverByKey = new Map(downloadItems.map((it) => [it.key, it.url]));
     const modal = document.createElement("div");
     modal.className = "cover-modal";
-    modal.innerHTML = '<div class="cover-box">  <div class="cover-head">    <span class="cover-title"></span>    <button class="cover-close" title="\u62D2\u7EDD\u4E0B\u8F7D">\xD7</button>  </div>  <div class="cover-desc"></div>  <div class="cover-progress hidden">    <div class="cover-track"><div class="cover-fill"></div></div>    <div class="cover-label"></div>  </div>  <div class="cover-actions">    <button class="cover-btn primary"></button>    <button class="cover-btn ghost hidden"></button>  </div></div>';
+    modal.innerHTML = '<div class="cover-box">  <div class="cover-head">    <span class="cover-title"></span>    <button class="cover-close" title="\u62D2\u7EDD\u4E0B\u8F7D">\xD7</button>  </div>  <div class="cover-desc"></div>  <div class="cover-warn hidden"></div>  <div class="cover-progress hidden">    <div class="cover-track"><div class="cover-fill"></div></div>    <div class="cover-label"></div>  </div>  <div class="cover-actions">    <button class="cover-btn primary"></button>    <button class="cover-btn ghost hidden"></button>  </div></div>';
     document.body.appendChild(modal);
     const titleEl = modal.querySelector(".cover-title");
     const descEl = modal.querySelector(".cover-desc");
+    const warnEl = modal.querySelector(".cover-warn");
     const closeEl = modal.querySelector(".cover-close");
     const progressEl = modal.querySelector(".cover-progress");
     const fillEl = modal.querySelector(".cover-fill");
@@ -8276,6 +8404,7 @@ function showCoverModal(db, downloadItems, allItems) {
     let state = "confirm";
     let pending = downloadItems.slice();
     let doneCount = 0;
+    const accumulated = new Map(existingBlobUrls);
     let failedCount = 0;
     let failedKeys = [];
     let failErrors = [];
@@ -8287,9 +8416,14 @@ function showCoverModal(db, downloadItems, allItems) {
       if (state === "confirm") {
         titleEl.textContent = "\u4E0B\u8F7D\u5C01\u9762";
         descEl.textContent = "\u672C\u56FE\u9700\u8981\u4E0B\u8F7D " + downloadItems.length + " \u5F20\u6A21\u7EC4\u5C01\u9762\u624D\u80FD\u6B63\u5E38\u4F7F\u7528\u3002\u5C01\u9762\u5C06\u7F13\u5B58\u5230\u6D4F\u89C8\u5668\u672C\u5730\uFF0C\u4E0B\u6B21\u6253\u5F00\u65E0\u9700\u91CD\u590D\u4E0B\u8F7D\u3002";
+        warnEl.textContent = "\u8B66\u544A\uFF1A\u5C06\u4EE5 " + COVER_CONCURRENCY + " \u5E76\u53D1\u91CF\u4E0B\u8F7D " + downloadItems.length + " \u5F20\u5C01\u9762\u3002\u9AD8\u9891\u8BF7\u6C42\u53EF\u80FD\u89E6\u53D1 mcmod \u98CE\u63A7\uFF0C\u5E76\u5360\u7528\u7F51\u7EDC\u8D44\u6E90\u3002\u70B9\u51FB\u201C\u786E\u5B9A\u4E0B\u8F7D\u201D\u5373\u89C6\u4E3A\u5DF2\u77E5\u6089\u5E76\u63A5\u53D7\u98CE\u9669\uFF0C\u540E\u679C\u81EA\u8D1F\u3002";
+        warnEl.classList.remove("hidden");
         primaryBtn.textContent = "\u786E\u5B9A\u4E0B\u8F7D";
         primaryBtn.classList.remove("hidden");
-      } else if (state === "refuse") {
+      } else {
+        warnEl.classList.add("hidden");
+      }
+      if (state === "refuse") {
         titleEl.textContent = "\u672A\u4E0B\u8F7D\u5C01\u9762";
         descEl.textContent = "\u5C01\u9762\u662F\u672C\u56FE\u7684\u6838\u5FC3\u89C6\u89C9\u5143\u7D20\uFF0C\u672A\u4E0B\u8F7D\u65E0\u6CD5\u4F7F\u7528\u3002";
         primaryBtn.textContent = "\u91CD\u65B0\u4E0B\u8F7D\u5C01\u9762";
@@ -8342,12 +8476,12 @@ function showCoverModal(db, downloadItems, allItems) {
       failedKeys = result.failedKeys;
       failedCount = result.failed;
       failErrors = result.errors;
+      for (const [k, v] of result.blobUrls) accumulated.set(k, v);
       if (result.failed > 0) {
         state = "failed";
         showState();
       } else {
-        const loaded = await loadAllCovers(db, allItems);
-        finish(loaded.blobUrls);
+        finish(accumulated);
       }
     }
     primaryBtn.addEventListener("click", async () => {
@@ -8356,9 +8490,7 @@ function showCoverModal(db, downloadItems, allItems) {
       } else if (state === "refuse") {
         startDownload(downloadItems.slice());
       } else if (state === "failed") {
-        const loaded = await loadAllCovers(db, allItems);
-        const urls = loaded.blobUrls;
-        finish(urls);
+        finish(accumulated);
       }
     });
     ghostBtn.addEventListener("click", () => {
@@ -8402,35 +8534,88 @@ function showProxyErrorModal(status) {
     modal.querySelector(".cover-btn").addEventListener("click", () => location.reload());
   });
 }
+async function prewarmCovers(items, blobUrls, onProgress) {
+  const normal = /* @__PURE__ */ new Set();
+  const hi = /* @__PURE__ */ new Set();
+  for (const it of items) {
+    const src = blobUrls.get(it.key);
+    if (!src) continue;
+    (it.hiRes ? hi : normal).add(src);
+  }
+  const groups = [
+    { program: FadingNodeImageProgram, sources: [...normal] },
+    { program: FadingNodeImageProgramHi, sources: [...hi] }
+  ];
+  const total = normal.size + hi.size;
+  if (!total) return 0;
+  const BATCH = 300;
+  const BATCH_GAP = 40;
+  for (const g of groups) {
+    for (let i = 0; i < g.sources.length; i += BATCH) {
+      const chunk = g.sources.slice(i, i + BATCH);
+      for (const s of chunk) g.program.textureManager.registerImage(s);
+      await sleep(BATCH_GAP);
+    }
+  }
+  const countOf = (g) => Object.keys(g.program.textureManager.getAtlas()).length;
+  const deadline = Date.now() + 12e4;
+  let last = -1;
+  let stable = 0;
+  while (Date.now() < deadline) {
+    const done = groups.reduce((sum, g) => sum + countOf(g), 0);
+    if (onProgress) onProgress(done, total);
+    if (done >= total) return done;
+    if (done === last) {
+      if (++stable >= 4) return done;
+    } else {
+      stable = 0;
+      last = done;
+    }
+    await sleep(250);
+  }
+  return groups.reduce((sum, g) => sum + countOf(g), 0);
+}
 function buildGraph(data, blobUrls) {
   const graph = new import_graphology.default({ multi: true });
   const labelIndex = /* @__PURE__ */ new Map();
   const degMap = /* @__PURE__ */ new Map();
+  const teamFlag = /* @__PURE__ */ new Map();
   for (const n of data.nodes) {
-    degMap.set(n.key, n.in_degree);
-    const isCore = n.type === "core";
+    const deg = n.degree != null ? n.degree : n.in_degree || 0;
+    const isTeam = !!n.is_team;
+    degMap.set(n.key, deg);
+    teamFlag.set(n.key, isTeam);
+    const hasImage = n.type === "core" || n.type === "author";
+    const sz = nodeSize(deg, n.type, isTeam, n.member_count);
+    const hiRes = sz > COVER_HI_RES_THRESHOLD;
     graph.addNode(n.key, {
       x: typeof n.x === "number" ? n.x : Math.random() * 100,
       y: typeof n.y === "number" ? n.y : Math.random() * 100,
-      size: nodeSize(n.in_degree, n.type),
-      color: communityColor(n.community, n.type),
-      label: n.label + "\nclass " + n.key,
+      size: sz,
+      color: communityColor(n.community, n.type, n.team_community),
+      label: n.label + "\n" + nodeKindLabel(n) + " " + n.key,
       name: n.label,
       name_en: n.name_en,
       description: n.description,
       kind: n.type,
-      type: isCore ? "image" : "circle",
-      image: isCore ? blobUrls.get(n.key) || null : null,
+      type: hasImage ? hiRes ? "imageHi" : "image" : "circle",
+      image: hasImage ? blobUrls.get(n.key) || null : null,
       views: n.views,
       favorites: n.favorites,
       category: n.category,
       status: n.status,
       in_degree: n.in_degree,
       out_degree: n.out_degree,
+      degree: deg,
       pagerank: n.pagerank,
       community: n.community,
       rank: n.rank,
-      density: n.density
+      density: n.density,
+      is_team: isTeam,
+      member_count: n.member_count || 0,
+      members: (n.members || []).map(String),
+      teams: (n.teams || []).map(String),
+      team_community: n.team_community != null ? n.team_community : null
     });
     if (n.label) {
       const k = n.label.toLowerCase();
@@ -8440,15 +8625,27 @@ function buildGraph(data, blobUrls) {
   }
   for (const e of data.edges) {
     const importance = Math.min(degMap.get(e.source) || 0, degMap.get(e.target) || 0);
-    const kind = e.type === "interaction" ? "interaction" : "dependency";
-    const rgb = kind === "interaction" ? INTERACTION_EDGE_RGB : DEPENDENCY_EDGE_RGB;
+    const kind = e.type === "interaction" ? "interaction" : e.type === "cooperation" ? "cooperation" : e.type === "membership" ? "membership" : "dependency";
+    let rgb;
+    if (kind === "cooperation" && GRAPH_MODE === "author") {
+      const sTeam = teamFlag.get(e.source);
+      const tTeam = teamFlag.get(e.target);
+      rgb = sTeam && tTeam ? TEAM_TEAM_EDGE_RGB : sTeam || tTeam ? TEAM_MIXED_EDGE_RGB : INDIVIDUAL_EDGE_RGB;
+    } else if (kind === "membership") {
+      rgb = MEMBER_EDGE_RGB;
+    } else {
+      rgb = kind === "interaction" ? INTERACTION_EDGE_RGB : DEPENDENCY_EDGE_RGB;
+    }
     graph.addEdge(e.source, e.target, {
-      size: 0.5,
-      color: kind === "interaction" ? INTERACTION_EDGE_COLOR : DEPENDENCY_EDGE_COLOR,
+      size: GRAPH_MODE === "author" ? kind === "membership" ? 0.4 : edgeSizeFor(e.weight) : 0.5,
+      color: premulRgba(rgb, kind === "membership" ? MEMBER_EDGE_ALPHA : EDGE_ALPHA),
+      alpha: kind === "membership" ? MEMBER_EDGE_ALPHA : EDGE_ALPHA,
+      // 导出绘制用（与屏幕一致）
       type: "line",
       kind,
       rgb,
       importance,
+      weight: e.weight,
       group_name: e.group_name || ""
     });
   }
@@ -8558,16 +8755,13 @@ function main() {
   const tooltipEl = document.getElementById("tooltip");
   const contextMenu = document.getElementById("context-menu");
   const searchInput = document.getElementById("search-input");
+  const searchFilters = document.getElementById("search-filters");
   const searchResults = document.getElementById("search-results");
   const searchList = document.getElementById("search-list");
   const searchPagination = document.getElementById("search-pagination");
   const statusText = document.getElementById("status-text");
   const progressFill = document.getElementById("progress-fill");
   const progressLabel = document.getElementById("progress-label");
-  const lodSlider = document.getElementById("lod-slider");
-  const lodValue = document.getElementById("lod-value");
-  const edgeLodSlider = document.getElementById("edge-lod-slider");
-  const edgeLodValue = document.getElementById("edge-lod-value");
   const panel = document.getElementById("panel");
   const panelToggle = document.getElementById("panel-toggle");
   const edgeDependency = document.getElementById("edge-dependency");
@@ -8577,23 +8771,15 @@ function main() {
   const exportHeight = document.getElementById("export-height");
   const exportButton = document.getElementById("export-button");
   const exportWarning = document.getElementById("export-warning");
-  const exportLodSlider = document.getElementById("export-lod-slider");
-  const exportLodValue = document.getElementById("export-lod-value");
   let renderer = null;
   let graph = null;
   let searchIndex = null;
-  let lodThresholdValue = 0;
   let lodTimer = null;
   let culledEdges = /* @__PURE__ */ new Set();
-  let nodeVisibleCount = 0;
-  let edgeAlpha = /* @__PURE__ */ new Map();
-  let nodeAlpha = /* @__PURE__ */ new Map();
-  let fadeTimer = null;
   let searchMatches = [];
   let searchPage = 0;
+  const searchFilter = { kind: "all", rel: "all" };
   let allNodes = [];
-  let nodeLodStrength = 1;
-  let edgeLodStrength = 1;
   let showDependency = true;
   let showInteraction = true;
   let highlightNodes = /* @__PURE__ */ new Set();
@@ -8618,12 +8804,14 @@ function main() {
   async function boot() {
     setProgress(0, "\u52A0\u8F7D\u6570\u636E\u4E2D\u2026\u2026", "graph.json");
     const data = await loadGraph();
+    GRAPH_MODE = data.meta && data.meta.mode === "author" ? "author" : "mod";
+    document.getElementById("search-input").placeholder = GRAPH_MODE === "author" ? "\u641C\u7D22\u4F5C\u8005\u540D\u2026" : "\u641C\u7D22\u6A21\u7EC4\u540D\u2026";
     renderMetaPanel(data.meta);
     setProgress(10, "\u68C0\u67E5\u5C01\u9762\u7F13\u5B58\u2026\u2026", "");
     await new Promise((r) => setTimeout(r, 30));
     const coverItems = [];
     for (const n of data.nodes) {
-      if (n.type !== "core") continue;
+      if (n.type !== "core" && n.type !== "author") continue;
       const url = normalizeCoverUrl(n.cover_url);
       if (url) coverItems.push({ key: n.key, url });
     }
@@ -8647,18 +8835,42 @@ function main() {
       if (loaded.staleKeys.length) {
         const byKey = new Map(coverItems.map((it) => [it.key, it.url]));
         const downloadItems = loaded.staleKeys.map((k) => ({ key: k, url: byKey.get(k) }));
-        const result = await showCoverModal(db, downloadItems, coverItems);
+        const result = await showCoverModal(db, downloadItems, blobUrls);
         blobUrls = result.blobUrls;
       }
-      await purgeStaleKeys(db, coverItems);
+      const purged = await purgeStaleKeys(db, coverItems);
+      for (const k of purged) {
+        const u = blobUrls.get(k);
+        if (u) URL.revokeObjectURL(u);
+      }
     }
-    setProgress(20, "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026", "");
+    if (blobUrls.size) {
+      const prewarmItems = [];
+      for (const n of data.nodes) {
+        if (n.type !== "core" && n.type !== "author") continue;
+        const deg = n.degree != null ? n.degree : n.in_degree || 0;
+        const isTeam = !!n.is_team;
+        prewarmItems.push({
+          key: n.key,
+          hiRes: nodeSize(deg, n.type, isTeam, n.member_count) > COVER_HI_RES_THRESHOLD
+        });
+      }
+      setProgress(20, "\u6B63\u5728\u751F\u6210\u5C01\u9762\u7EB9\u7406\u2026", "");
+      await prewarmCovers(prewarmItems, blobUrls, (done, total) => {
+        setProgress(
+          20 + Math.round(done / Math.max(1, total) * 60),
+          "\u6B63\u5728\u751F\u6210\u5C01\u9762\u7EB9\u7406\u2026",
+          done + " / " + total
+        );
+      });
+    }
+    setProgress(85, "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026", "");
     await new Promise((r) => setTimeout(r, 30));
     const built = buildGraph(data, blobUrls);
     graph = built.graph;
     coverBlobUrls = blobUrls;
     searchIndex = buildSearch(data);
-    allNodes = [...data.nodes].sort((a, b) => (b.views || 0) - (a.views || 0));
+    allNodes = sortNodes([...data.nodes]);
     searchMatches = [...allNodes];
     searchPage = 0;
     renderSearchResults();
@@ -8683,7 +8895,9 @@ function main() {
       labelDensity: 0.4,
       defaultDrawNodeLabel: drawNodeLabel,
       nodeProgramClasses: {
-        image: FadingNodeImageProgram
+        image: FadingNodeImageProgram,
+        imageHi: FadingNodeImageProgramHi
+        // 大节点 300px 高清
       }
     });
     bindEvents();
@@ -8708,22 +8922,14 @@ function main() {
       if (highlightEdges.has(edge)) {
         return { ...attrs, hidden: false, color: HIGHLIGHT_EDGE_COLOR, size: Math.max(attrs.size || 0.5, 1.6) };
       }
-      const alpha = edgeAlpha.get(edge);
-      if (alpha === 0) return { ...attrs, hidden: true };
-      if (alpha !== void 0 && alpha < 1) {
-        return { ...attrs, color: edgeColorFor(attrs.rgb || DEPENDENCY_EDGE_RGB, alpha) };
+      if (attrs.kind === "dependency" && !showDependency || attrs.kind === "interaction" && !showInteraction || culledEdges.has(edge)) {
+        return { ...attrs, hidden: true };
       }
       return attrs;
     });
     renderer.setSetting("nodeReducer", (node, attr) => {
       if (highlightNodes.has(node)) {
         return { ...attr, hidden: false, color: HIGHLIGHT_NODE_COLOR };
-      }
-      const alpha = nodeAlpha.get(node);
-      if (alpha === 0) return { ...attr, hidden: true };
-      if (alpha !== void 0 && alpha < 1) {
-        const premul = attr.type !== "image";
-        return { ...attr, color: hexToRgba(attr.color, alpha, premul) };
       }
       return attr;
     });
@@ -8734,38 +8940,43 @@ function main() {
       const applyLod = () => {
         lodLastRun = performance.now();
         const state = cam.getState();
-        lodThresholdValue = computeLodThreshold(state.ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
-        nodeVisibleCount = computeVisibleNodeCount(state.ratio, nodeLodStrength);
         updateCulling(state);
-        startFade();
       };
-      if (lodTimer) clearTimeout(lodTimer);
       const elapsed = now - lodLastRun;
       if (elapsed >= LOD_THROTTLE_MS) {
+        if (lodTimer) {
+          clearTimeout(lodTimer);
+          lodTimer = null;
+        }
         applyLod();
-      } else {
-        lodTimer = setTimeout(applyLod, LOD_THROTTLE_MS - elapsed);
+      } else if (!lodTimer) {
+        lodTimer = setTimeout(() => {
+          lodTimer = null;
+          applyLod();
+        }, LOD_THROTTLE_MS - elapsed);
       }
     });
-    lodThresholdValue = computeLodThreshold(cam.getState().ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
-    nodeVisibleCount = computeVisibleNodeCount(cam.getState().ratio, nodeLodStrength);
     updateCulling(cam.getState());
     renderer.refresh();
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     await new Promise((r) => setTimeout(r, 700));
-    startFade();
+    renderer.scheduleRefresh();
     finishLoading();
   }
   function bindEvents() {
     renderer.on("enterNode", ({ node }) => {
+      hoveredNode = node;
+      if (altLock) return;
       const attrs = graph.getNodeAttributes(node);
       showTooltip(node, attrs);
     });
     renderer.on("leaveNode", () => {
-      hideTooltip();
+      hoveredNode = null;
+      if (!altLock) hideTooltip();
     });
     renderer.on("clickNode", ({ node }) => {
-      window.open("https://www.mcmod.cn/class/" + node + ".html", "_blank");
+      const base = GRAPH_MODE === "author" ? "author" : "class";
+      window.open("https://www.mcmod.cn/" + base + "/" + node + ".html", "_blank");
     });
     renderer.on("clickEdge", ({ edge }) => {
       const source = graph.source(edge);
@@ -8778,7 +8989,7 @@ function main() {
       const dt = (td.x - cam.x) * (td.x - cam.x) + (td.y - cam.y) * (td.y - cam.y);
       focusNode(ds >= dt ? source : target);
     });
-    searchInput.addEventListener("input", () => {
+    const debouncedSearch = debounce(() => {
       const q = searchInput.value.trim().toLowerCase();
       if (!q) {
         searchMatches = [...allNodes];
@@ -8792,27 +9003,17 @@ function main() {
           for (const n of nodes) matched.add(n);
         }
       }
-      searchMatches = [...matched].sort((a, b) => (b.views || 0) - (a.views || 0));
+      searchMatches = sortNodes([...matched]);
       searchPage = 0;
       renderSearchResults();
-    });
+    }, 150);
+    searchInput.addEventListener("input", debouncedSearch);
     searchInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
+        debouncedSearch.flush();
         const first = searchList.querySelector("li");
         if (first) first.click();
       }
-    });
-    lodSlider.addEventListener("input", () => {
-      nodeLodStrength = Number(lodSlider.value) / 100;
-      lodValue.textContent = Math.round(nodeLodStrength * 100) + "%";
-      nodeVisibleCount = computeVisibleNodeCount(renderer.getCamera().getState().ratio, nodeLodStrength);
-      startFade();
-    });
-    edgeLodSlider.addEventListener("input", () => {
-      edgeLodStrength = Number(edgeLodSlider.value) / 100;
-      edgeLodValue.textContent = Math.round(edgeLodStrength * 100) + "%";
-      lodThresholdValue = computeLodThreshold(renderer.getCamera().getState().ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
-      startFade();
     });
     panelToggle.addEventListener("click", () => {
       const collapsed = panel.classList.toggle("collapsed");
@@ -8821,19 +9022,16 @@ function main() {
     });
     edgeDependency.addEventListener("change", () => {
       showDependency = edgeDependency.checked;
-      startFade();
+      renderer.scheduleRefresh();
     });
     edgeInteraction.addEventListener("change", () => {
       showInteraction = edgeInteraction.checked;
-      startFade();
+      renderer.scheduleRefresh();
     });
     showLabels.addEventListener("change", () => {
       renderer.setSetting("renderLabels", showLabels.checked);
     });
     exportButton.addEventListener("click", exportPNG);
-    exportLodSlider.addEventListener("input", () => {
-      exportLodValue.textContent = exportLodSlider.value + "%";
-    });
     function updateExportWarning() {
       const w = parseInt(exportWidth.value, 10) || 0;
       const h = parseInt(exportHeight.value, 10) || 0;
@@ -8846,16 +9044,39 @@ function main() {
   function renderSearchResults() {
     searchList.innerHTML = "";
     searchPagination.innerHTML = "";
+    let list = searchMatches;
+    if (GRAPH_MODE === "author") {
+      const pool = searchMatches;
+      searchFilters.innerHTML = "";
+      searchFilters.appendChild(buildFilterBar(
+        {
+          all: pool.length,
+          team: pool.filter((n) => n.is_team).length,
+          author: pool.filter((n) => !n.is_team).length
+        },
+        [
+          { key: "coop", label: "\u5408\u4F5C", count: pool.filter((n) => (n.degree || 0) > 0).length },
+          { key: "contains", label: "\u5305\u542B", count: pool.filter((n) => n.is_team).length },
+          { key: "belongs", label: "\u5C5E\u4E8E", count: pool.filter((n) => n.teams && n.teams.length).length }
+        ],
+        searchFilter,
+        () => {
+          searchPage = 0;
+          renderSearchResults();
+        }
+      ));
+      list = filterNodesByKind(filterNodesByRel(pool, searchFilter.rel), searchFilter.kind);
+    }
     const pageSize = 10;
-    const total = searchMatches.length;
+    const total = list.length;
     const pages = Math.max(1, Math.ceil(total / pageSize));
     if (searchPage >= pages) searchPage = pages - 1;
     const start = searchPage * pageSize;
-    const page = searchMatches.slice(start, start + pageSize);
+    const page = list.slice(start, start + pageSize);
     for (const n of page) {
       const li = document.createElement("li");
       li.textContent = n.label + (n.name_en ? " (" + n.name_en + ")" : "");
-      li.title = "class " + n.key;
+      li.title = nodeKindLabel(n) + " " + n.key;
       li.addEventListener("click", () => {
         focusNode(n.key);
       });
@@ -8903,77 +9124,33 @@ function main() {
     const targetRatio = 2 * size * C / (NODE_DIAMETER_SCREEN_RATIO * width);
     cam.animate({ x: nd.x, y: nd.y, ratio: targetRatio }, { duration: 600 });
   }
-  function computeLodThreshold(ratio, maxThreshold) {
-    if (ratio <= LOD_FULL_ZOOM_RATIO) return 0;
-    const maxR = 1;
-    const r = Math.min(ratio, maxR);
-    const t = (Math.log(r) - Math.log(LOD_FULL_ZOOM_RATIO)) / (Math.log(maxR) - Math.log(LOD_FULL_ZOOM_RATIO));
-    return Math.round(maxThreshold * t);
-  }
-  function computeVisibleNodeCount(ratio, strength) {
-    const total = graph.order;
-    if (strength <= 0) return total;
-    if (ratio <= LOD_FULL_ZOOM_RATIO) return total;
-    const maxR = 1;
-    const r = Math.min(ratio, maxR);
-    const t = (Math.log(r) - Math.log(LOD_FULL_ZOOM_RATIO)) / (Math.log(maxR) - Math.log(LOD_FULL_ZOOM_RATIO));
-    return Math.round(total * Math.pow(NODE_LOD_MIN_VISIBLE / total, t * strength));
-  }
-  function edgeTarget(edge, attrs) {
-    if (attrs.kind === "dependency" && !showDependency) return 0;
-    if (attrs.kind === "interaction" && !showInteraction) return 0;
-    if ((attrs.importance || 0) < lodThresholdValue) return 0;
-    if (culledEdges.has(edge)) return 0;
-    return 1;
-  }
-  function nodeTarget(node, attrs) {
-    if (!NODE_LOD_ENABLED) return 1;
-    return (attrs.rank ?? Infinity) < nodeVisibleCount ? 1 : 0;
-  }
-  function fadeStep() {
-    const step = 0.36;
-    const changedNodes = [];
-    const changedEdges = [];
-    graph.forEachEdge((edge, attrs) => {
-      const target = edgeTarget(edge, attrs);
-      const cur = edgeAlpha.has(edge) ? edgeAlpha.get(edge) : 1;
-      if (cur === target) return;
-      let next = cur + (target - cur) * step;
-      if (Math.abs(next - target) < 0.02) next = target;
-      if (next === 1) edgeAlpha.delete(edge);
-      else edgeAlpha.set(edge, next);
-      changedEdges.push(edge);
-    });
-    graph.forEachNode((node, attrs) => {
-      const target = nodeTarget(node, attrs);
-      const cur = nodeAlpha.has(node) ? nodeAlpha.get(node) : 1;
-      if (cur === target) return;
-      let next = cur + (target - cur) * step;
-      if (Math.abs(next - target) < 0.02) next = target;
-      if (next === 1) nodeAlpha.delete(node);
-      else nodeAlpha.set(node, next);
-      changedNodes.push(node);
-    });
-    if (changedNodes.length || changedEdges.length) {
-      renderer.refresh();
-      fadeTimer = setTimeout(fadeStep, 33);
-    } else {
-      fadeTimer = null;
-    }
-  }
-  function startFade() {
-    if (fadeTimer) return;
-    fadeStep();
+  function teamNames(ids) {
+    return ids.map((id) => {
+      const a = graph.getNodeAttributes(String(id));
+      return a && a.name ? a.name : String(id);
+    }).join("\u3001");
   }
   function showTooltip(node, attrs) {
     const lines = [];
     lines.push("<div class='tt-title'>" + escapeHtml(attrs.name) + "</div>");
     if (attrs.name_en) lines.push("<div class='tt-sub'>" + escapeHtml(attrs.name_en) + "</div>");
-    if (attrs.description) lines.push("<div class='tt-desc'>" + escapeHtml(attrs.description) + "</div>");
-    lines.push("<div class='tt-meta'>" + (attrs.kind === "core" ? "\u6838\u5FC3\u6A21\u7EC4" : "\u5916\u90E8\u5F15\u7528") + " \xB7 " + escapeHtml(attrs.category || "\u65E0\u5206\u7C7B") + "</div>");
+    if (attrs.description) lines.push("<div class='tt-desc'>" + attrs.description + "</div>");
+    const kindText = GRAPH_MODE === "author" ? nodeKindLabel(attrs) : attrs.kind === "core" ? "\u6838\u5FC3\u6A21\u7EC4" : "\u5916\u90E8\u5F15\u7528";
+    lines.push("<div class='tt-meta'>" + kindText + " \xB7 " + escapeHtml(attrs.category || "\u65E0\u5206\u7C7B") + "</div>");
+    if (GRAPH_MODE === "author") {
+      if (attrs.is_team) {
+        lines.push("<div class='tt-meta team'>\u56E2\u961F \xB7 " + attrs.member_count + " \u540D\u6210\u5458</div>");
+      } else if (attrs.teams && attrs.teams.length) {
+        lines.push("<div class='tt-meta team'>\u53C2\u4E0E\u56E2\u961F\uFF1A" + escapeHtml(teamNames(attrs.teams)) + "</div>");
+      }
+    }
     if (attrs.status) lines.push("<div class='tt-meta'>\u72B6\u6001\uFF1A" + escapeHtml(attrs.status) + "</div>");
     lines.push("<div class='tt-stats'>\u6D4F\u89C8\u91CF " + formatNum(attrs.views) + " \xB7 \u6536\u85CF " + formatNum(attrs.favorites) + "</div>");
-    lines.push("<div class='tt-stats'>\u88AB\u4F9D\u8D56 " + attrs.in_degree + " \xB7 \u4F9D\u8D56 " + attrs.out_degree + " \xB7 PageRank " + attrs.pagerank.toFixed(5) + "</div>");
+    if (GRAPH_MODE === "author") {
+      lines.push("<div class='tt-stats'>\u5408\u4F5C\u5EA6 " + (attrs.degree != null ? attrs.degree : 0) + " \xB7 PageRank " + attrs.pagerank.toFixed(5) + "</div>");
+    } else {
+      lines.push("<div class='tt-stats'>\u88AB\u4F9D\u8D56 " + attrs.in_degree + " \xB7 \u4F9D\u8D56 " + attrs.out_degree + " \xB7 PageRank " + attrs.pagerank.toFixed(5) + "</div>");
+    }
     lines.push("<div class='tt-hint'>\u70B9\u51FB\u8DF3\u8F6C mcmod \u9875\u9762</div>");
     tooltipEl.innerHTML = lines.join("");
     tooltipEl.classList.remove("hidden");
@@ -8983,6 +9160,7 @@ function main() {
     tooltipEl.classList.add("hidden");
   }
   function positionTooltip() {
+    if (altLock) return;
     const pad = 12;
     const w = tooltipEl.offsetWidth;
     const h = tooltipEl.offsetHeight;
@@ -8990,10 +9168,26 @@ function main() {
     let y = lastMouse.y + pad;
     if (x + w > window.innerWidth) x = lastMouse.x - w - pad;
     if (y + h > window.innerHeight) y = lastMouse.y - h - pad;
+    x = Math.max(pad, Math.min(x, window.innerWidth - w - pad));
+    y = Math.max(pad, Math.min(y, window.innerHeight - h - pad));
     tooltipEl.style.left = x + "px";
     tooltipEl.style.top = y + "px";
   }
   let lastMouse = { x: 0, y: 0 };
+  let hoveredNode = null;
+  let altLock = false;
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Alt") {
+      e.preventDefault();
+      altLock = true;
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.key === "Alt") {
+      altLock = false;
+      if (!hoveredNode) hideTooltip();
+    }
+  });
   window.addEventListener("mousemove", (e) => {
     lastMouse = { x: e.clientX, y: e.clientY };
     if (!tooltipEl.classList.contains("hidden")) positionTooltip();
@@ -9016,7 +9210,28 @@ function main() {
   function hideContextMenu() {
     contextMenu.classList.add("hidden");
   }
+  function nodeDeg(key) {
+    const a = graph.getNodeAttributes(key);
+    return a.degree != null ? a.degree : a.in_degree || 0;
+  }
   function collectRelations(key) {
+    if (GRAPH_MODE === "author") {
+      const attrs = graph.getNodeAttributes(key);
+      const byDeg = (a, b) => nodeDeg(b) - nodeDeg(a);
+      const partners = /* @__PURE__ */ new Set();
+      graph.forEachEdge((edge, eAttrs, source, target) => {
+        if (eAttrs.kind !== "cooperation") return;
+        if (source === key) partners.add(target);
+        else if (target === key) partners.add(source);
+      });
+      const teams = (attrs.teams || []).filter((id) => graph.hasNode(String(id)));
+      const members = (attrs.members || []).filter((id) => graph.hasNode(String(id)));
+      return {
+        partners: [...partners].sort(byDeg),
+        teams: [...teams].sort(byDeg),
+        members: [...members].sort(byDeg)
+      };
+    }
     const dependsOn = /* @__PURE__ */ new Set();
     const dependedBy = /* @__PURE__ */ new Set();
     const interacts = /* @__PURE__ */ new Set();
@@ -9032,7 +9247,7 @@ function main() {
       if (kind === "interaction") interacts.add(s);
       else dependedBy.add(s);
     });
-    const byInDegree = (a, b) => (graph.getNodeAttribute(b, "in_degree") || 0) - (graph.getNodeAttribute(a, "in_degree") || 0);
+    const byInDegree = (a, b) => nodeDeg(b) - nodeDeg(a);
     return {
       dependsOn: [...dependsOn].sort(byInDegree),
       dependedBy: [...dependedBy].sort(byInDegree),
@@ -9060,15 +9275,21 @@ function main() {
     const lines = [];
     lines.push(attrs.name || key);
     if (attrs.name_en) lines.push(attrs.name_en);
-    lines.push("class " + key);
-    lines.push("\u88AB\u4F9D\u8D56 " + attrs.in_degree + " \xB7 \u4F9D\u8D56 " + attrs.out_degree);
+    lines.push(nodeKindLabel(attrs) + " " + key);
+    if (GRAPH_MODE === "author") {
+      if (attrs.is_team) lines.push("\u56E2\u961F \xB7 " + attrs.member_count + " \u540D\u6210\u5458");
+      else if (attrs.teams && attrs.teams.length) lines.push("\u53C2\u4E0E\u56E2\u961F " + teamNames(attrs.teams));
+      lines.push("\u5408\u4F5C\u5EA6 " + (attrs.degree != null ? attrs.degree : 0));
+    } else {
+      lines.push("\u88AB\u4F9D\u8D56 " + attrs.in_degree + " \xB7 \u4F9D\u8D56 " + attrs.out_degree);
+    }
     lines.push("\u6D4F\u89C8\u91CF " + formatNum(attrs.views));
     lines.push("\u6536\u85CF " + formatNum(attrs.favorites));
     if (attrs.category) lines.push("\u5206\u7C7B " + attrs.category);
     if (attrs.status) lines.push("\u72B6\u6001 " + attrs.status);
     return lines.join("\n");
   }
-  const REL_LABELS = { dependsOn: "\u4F9D\u8D56", dependedBy: "\u88AB\u4F9D\u8D56", interacts: "\u8054\u52A8" };
+  const REL_LABELS = { dependsOn: "\u4F9D\u8D56", dependedBy: "\u88AB\u4F9D\u8D56", interacts: "\u8054\u52A8", partners: "\u5408\u4F5C", teams: "\u56E2\u961F", members: "\u6210\u5458" };
   function contextItem(key, badgeType) {
     const attrs = graph.getNodeAttributes(key);
     const div = document.createElement("div");
@@ -9131,10 +9352,11 @@ function main() {
     if (hops && hops.length) {
       for (const e of hops) if (e != null) highlightEdges.add(e);
     }
-    if (renderer) renderer.refresh();
+    if (renderer) renderer.scheduleRefresh();
   }
   function showSixDegreesMenu(source, x, y) {
     const state = { query: "", page: 0, target: null, result: null };
+    const filter = { kind: "all", rel: "all" };
     contextMenu.innerHTML = "";
     const titleEl = document.createElement("div");
     titleEl.className = "ctx-title ctx-title-row";
@@ -9155,9 +9377,12 @@ function main() {
     searchWrap.className = "ctx-search";
     const input = document.createElement("input");
     input.type = "text";
-    input.placeholder = "\u641C\u7D22\u76EE\u6807\u6A21\u7EC4\u2026";
+    input.placeholder = GRAPH_MODE === "author" ? "\u641C\u7D22\u76EE\u6807\u4F5C\u8005\u2026" : "\u641C\u7D22\u76EE\u6807\u6A21\u7EC4\u2026";
     searchWrap.appendChild(input);
     contextMenu.appendChild(searchWrap);
+    const filterEl = document.createElement("div");
+    filterEl.className = "ctx-filters";
+    contextMenu.appendChild(filterEl);
     const listEl = document.createElement("div");
     contextMenu.appendChild(listEl);
     const detectBtn = document.createElement("button");
@@ -9170,8 +9395,9 @@ function main() {
     contextMenu.appendChild(resultEl);
     function renderList() {
       listEl.innerHTML = "";
+      filterEl.innerHTML = "";
       const q = state.query.trim().toLowerCase();
-      let matches = [];
+      let pool = [];
       if (q) {
         const seen = /* @__PURE__ */ new Set();
         for (const [term, nodes] of searchIndex) {
@@ -9179,15 +9405,38 @@ function main() {
             for (const n of nodes) {
               if (!seen.has(n.key)) {
                 seen.add(n.key);
-                matches.push(n);
+                pool.push(n);
               }
             }
           }
         }
       } else {
-        matches = [...allNodes];
+        pool = [...allNodes];
       }
-      matches.sort((a, b) => (b.views || 0) - (a.views || 0));
+      if (GRAPH_MODE === "author") {
+        filterEl.appendChild(buildFilterBar(
+          {
+            all: pool.length,
+            team: pool.filter((n) => n.is_team).length,
+            author: pool.filter((n) => !n.is_team).length
+          },
+          [
+            { key: "coop", label: "\u5408\u4F5C", count: pool.filter((n) => (n.degree || 0) > 0).length },
+            { key: "contains", label: "\u5305\u542B", count: pool.filter((n) => n.is_team).length },
+            { key: "belongs", label: "\u5C5E\u4E8E", count: pool.filter((n) => n.teams && n.teams.length).length }
+          ],
+          filter,
+          () => {
+            state.page = 0;
+            state.target = null;
+            detectBtn.disabled = true;
+            renderList();
+            positionMenu(x, y);
+          }
+        ));
+      }
+      let matches = GRAPH_MODE === "author" ? filterNodesByKind(filterNodesByRel(pool, filter.rel), filter.kind) : pool;
+      matches = sortNodes(matches);
       const pageSize = 20;
       const pages = Math.max(1, Math.ceil(matches.length / pageSize));
       if (state.page >= pages) state.page = pages - 1;
@@ -9197,7 +9446,7 @@ function main() {
         const li = document.createElement("div");
         li.className = "ctx-item" + (state.target === n.key ? " selected" : "");
         li.textContent = n.label + (n.name_en ? " (" + n.name_en + ")" : "");
-        li.title = "class " + n.key;
+        li.title = nodeKindLabel(n) + " " + n.key;
         li.addEventListener("click", (e) => {
           e.stopPropagation();
           state.target = n.key;
@@ -9249,6 +9498,9 @@ function main() {
           if (kind === "interaction") {
             label = "\u8054\u52A8";
             cls = "interaction";
+          } else if (kind === "cooperation") {
+            label = "\u5408\u4F5C";
+            cls = "interaction";
           } else {
             const s = graph.source(hop);
             label = s === path[i] ? "\u4F9D\u8D56" : "\u88AB\u4F9D\u8D56";
@@ -9274,14 +9526,15 @@ function main() {
       positionMenu(x, y);
     }
     detectBtn.addEventListener("click", detect);
-    input.addEventListener("input", () => {
+    const onSixInput = debounce(() => {
       state.query = input.value;
       state.page = 0;
       state.target = null;
       detectBtn.disabled = true;
       renderList();
       positionMenu(x, y);
-    });
+    }, 150);
+    input.addEventListener("input", onSixInput);
     renderList();
     contextMenu.classList.remove("hidden");
     positionMenu(x, y);
@@ -9291,6 +9544,7 @@ function main() {
     const attrs = graph.getNodeAttributes(node);
     const rel = collectRelations(node);
     const state = { title: attrs.name || node, rel, tab: "all", page: 0, query: "" };
+    const filter = { kind: "all", rel: "all" };
     contextMenu.innerHTML = "";
     const titleEl = document.createElement("div");
     titleEl.className = "ctx-title ctx-title-row";
@@ -9311,7 +9565,7 @@ function main() {
     searchWrap.className = "ctx-search";
     const input = document.createElement("input");
     input.type = "text";
-    input.placeholder = "\u641C\u7D22\u5173\u8054\u6A21\u7EC4\u2026";
+    input.placeholder = GRAPH_MODE === "author" ? "\u641C\u7D22\u2026" : "\u641C\u7D22\u5173\u8054\u6A21\u7EC4\u2026";
     searchWrap.appendChild(input);
     contextMenu.appendChild(searchWrap);
     const tabs = document.createElement("div");
@@ -9325,6 +9579,22 @@ function main() {
       { key: "dependedBy", label: "\u88AB\u4F9D\u8D56" },
       { key: "interacts", label: "\u8054\u52A8" }
     ];
+    const unionKeys = GRAPH_MODE === "author" ? [.../* @__PURE__ */ new Set([...state.rel.partners, ...state.rel.teams, ...state.rel.members])] : [];
+    function kindCounts(keys) {
+      if (GRAPH_MODE !== "author") return { all: 0, team: 0, author: 0 };
+      const team = keys.filter((k) => graph.getNodeAttribute(k, "is_team")).length;
+      return { all: keys.length, team, author: keys.length - team };
+    }
+    function relItems() {
+      const items = [{ key: "coop", label: "\u5408\u4F5C", count: state.rel.partners.length }];
+      if (attrs.is_team) {
+        items.push({ key: "contains", label: "\u5305\u542B", count: state.rel.members.length });
+      }
+      if ((attrs.teams || []).length) {
+        items.push({ key: "belongs", label: "\u5C5E\u4E8E", count: state.rel.teams.length });
+      }
+      return items;
+    }
     function tabCount(key) {
       if (key === "all") {
         return state.rel.dependsOn.length + state.rel.dependedBy.length + state.rel.interacts.length;
@@ -9332,14 +9602,34 @@ function main() {
       return state.rel[key].length;
     }
     function activeList() {
+      if (GRAPH_MODE === "author") {
+        let keys;
+        if (filter.rel === "coop") keys = state.rel.partners;
+        else if (filter.rel === "contains") keys = state.rel.members;
+        else if (filter.rel === "belongs") keys = state.rel.teams;
+        else keys = unionKeys;
+        if (filter.kind === "team") keys = keys.filter((k) => graph.getNodeAttribute(k, "is_team"));
+        else if (filter.kind === "author") keys = keys.filter((k) => !graph.getNodeAttribute(k, "is_team"));
+        const items2 = keys.map((key) => {
+          let type = null;
+          if (filter.rel === "all") {
+            if (state.rel.members.includes(key)) type = "members";
+            else if (state.rel.teams.includes(key)) type = "teams";
+            else type = "partners";
+          } else {
+            type = filter.rel === "coop" ? "partners" : filter.rel;
+          }
+          return { key, type };
+        });
+        items2.sort((a, b) => nodeDeg(b.key) - nodeDeg(a.key));
+        return items2;
+      }
       const items = [];
       if (state.tab === "all") {
         for (const key of state.rel.dependsOn) items.push({ key, type: "dependsOn" });
         for (const key of state.rel.dependedBy) items.push({ key, type: "dependedBy" });
         for (const key of state.rel.interacts) items.push({ key, type: "interacts" });
-        items.sort(
-          (a, b) => (graph.getNodeAttribute(b.key, "in_degree") || 0) - (graph.getNodeAttribute(a.key, "in_degree") || 0)
-        );
+        items.sort((a, b) => nodeDeg(b.key) - nodeDeg(a.key));
       } else {
         for (const key of state.rel[state.tab]) items.push({ key, type: null });
       }
@@ -9347,6 +9637,15 @@ function main() {
     }
     function renderTabs() {
       tabs.innerHTML = "";
+      if (GRAPH_MODE === "author") {
+        tabs.appendChild(buildFilterBar(kindCounts(unionKeys), relItems(), filter, () => {
+          state.page = 0;
+          renderTabs();
+          renderBody();
+          positionMenu(x, y);
+        }));
+        return;
+      }
       for (const def of TAB_DEFS) {
         const t = document.createElement("button");
         t.className = "ctx-tab" + (state.tab === def.key ? " active" : "");
@@ -9413,7 +9712,8 @@ function main() {
     contextMenu.innerHTML = "";
     const titleEl = document.createElement("div");
     titleEl.className = "ctx-title";
-    titleEl.textContent = "\u5173\u7CFB";
+    const kind = graph.getEdgeAttribute(edge, "kind");
+    titleEl.textContent = GRAPH_MODE === "author" ? kind === "membership" ? "\u6210\u5458" : kind === "cooperation" ? "\u5408\u4F5C" : "\u5173\u7CFB" : "\u5173\u7CFB";
     contextMenu.appendChild(titleEl);
     const st = document.createElement("div");
     st.className = "ctx-section-title";
@@ -9424,11 +9724,10 @@ function main() {
     contextMenu.classList.remove("hidden");
     positionMenu(x, y);
   }
-  function drawEdges(ctx, tx, ty, scale2, minImportance) {
+  function drawEdges(ctx, tx, ty, scale2) {
     graph.forEachEdge((edge, attrs, source, target, sa, ta) => {
-      if (minImportance > 0 && (attrs.importance || 0) < minImportance) return;
       const rgb = attrs.rgb || DEPENDENCY_EDGE_RGB;
-      ctx.strokeStyle = rgbaString(rgb, EDGE_ALPHA);
+      ctx.strokeStyle = rgbaString(rgb, attrs.alpha != null ? attrs.alpha : EDGE_ALPHA);
       ctx.lineWidth = Math.max(1, (attrs.size || 0.5) * scale2);
       ctx.beginPath();
       ctx.moveTo(tx(sa.x), ty(sa.y));
@@ -9436,9 +9735,20 @@ function main() {
       ctx.stroke();
     });
   }
+  function drawEdgesBand(ctx, edges, tileX0, tileY0, tileW) {
+    for (const e of edges) {
+      if (Math.max(e.ax, e.bx) + e.half < tileX0 || Math.min(e.ax, e.bx) - e.half > tileX0 + tileW) continue;
+      ctx.strokeStyle = rgbaString(e.rgb, e.alpha);
+      ctx.lineWidth = e.lineWidth;
+      ctx.beginPath();
+      ctx.moveTo(e.ax - tileX0, e.ay - tileY0);
+      ctx.lineTo(e.bx - tileX0, e.by - tileY0);
+      ctx.stroke();
+    }
+  }
   function drawLabel(ctx, cx, cy, r, attrs) {
     const name = attrs.name || attrs.key;
-    const idText = "class " + attrs.key;
+    const idText = nodeKindLabel(attrs) + " " + attrs.key;
     const fontSize = LABEL_FONT_SIZE;
     const lineHeight = fontSize * 1.25;
     ctx.font = fontSize + 'px "Microsoft YaHei", "PingFang SC", sans-serif';
@@ -9514,14 +9824,14 @@ function main() {
       }, "image/png");
     });
   }
-  async function renderSingle(W, H, scale2, nodePixels, toX, toY, minImportance) {
+  async function renderSingle(W, H, scale2, nodePixels, toX, toY) {
     const canvas = document.createElement("canvas");
     canvas.width = W;
     canvas.height = H;
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = "#000000";
     ctx.fillRect(0, 0, W, H);
-    drawEdges(ctx, toX, toY, scale2, minImportance);
+    drawEdges(ctx, toX, toY, scale2);
     const items = nodePixels.map((n) => ({ attrs: n.attrs, cx: n.px, cy: n.py, r: n.pr }));
     const startTime = Date.now();
     await drawNodesAt(ctx, items, (done, total) => {
@@ -9534,18 +9844,47 @@ function main() {
     });
     return canvasToBlob(canvas);
   }
-  async function renderTiled(W, H, scale2, nodePixels, toX, toY, minImportance) {
+  async function renderTiled(W, H, scale2, nodePixels, toX, toY) {
     const TILE_W = 8192;
-    const TILE_H = 1024;
+    const TILE_H = 256;
     const cols = Math.ceil(W / TILE_W);
     const rows = Math.ceil(H / TILE_H);
     const totalTiles = cols * rows;
     let renderedTiles = 0;
     const startTime = Date.now();
+    const labelBottom = LABEL_FONT_SIZE * 3.25;
+    const bandNodes = Array.from({ length: rows }, () => []);
+    for (const n of nodePixels) {
+      const top = Math.max(0, Math.floor((n.py - n.pr) / TILE_H));
+      const bottom = Math.min(rows - 1, Math.floor((n.py + n.pr + labelBottom) / TILE_H));
+      for (let r = top; r <= bottom; r++) bandNodes[r].push(n);
+    }
+    const bandEdges = Array.from({ length: rows }, () => []);
+    graph.forEachEdge((edge, attrs, source, target, sa, ta) => {
+      const ax = toX(sa.x), ay = toY(sa.y);
+      const bx = toX(ta.x), by = toY(ta.y);
+      const lineWidth = Math.max(1, (attrs.size || 0.5) * scale2);
+      const half = lineWidth / 2 + 1;
+      const top = Math.max(0, Math.floor((Math.min(ay, by) - half) / TILE_H));
+      const bottom = Math.min(rows - 1, Math.floor((Math.max(ay, by) + half) / TILE_H));
+      const item = {
+        ax,
+        ay,
+        bx,
+        by,
+        half,
+        lineWidth,
+        rgb: attrs.rgb || DEPENDENCY_EDGE_RGB,
+        alpha: attrs.alpha != null ? attrs.alpha : EDGE_ALPHA
+      };
+      for (let r = top; r <= bottom; r++) bandEdges[r].push(item);
+    });
     async function* getScanlines() {
       for (let r = 0; r < rows; r++) {
         const tileY0 = r * TILE_H;
         const tileH = Math.min(TILE_H, H - tileY0);
+        const band = bandNodes[r];
+        const bandE = bandEdges[r];
         const colData = [];
         for (let c = 0; c < cols; c++) {
           const tileX0 = c * TILE_W;
@@ -9556,14 +9895,11 @@ function main() {
           const ctx = canvas.getContext("2d");
           ctx.fillStyle = "#000000";
           ctx.fillRect(0, 0, tileW, tileH);
-          const tx = (x) => toX(x) - tileX0;
-          const ty = (y) => toY(y) - tileY0;
-          drawEdges(ctx, tx, ty, scale2, minImportance);
+          drawEdgesBand(ctx, bandE, tileX0, tileY0, tileW);
           const items = [];
-          for (const n of nodePixels) {
-            const labelBottom = LABEL_FONT_SIZE * 3.25;
+          for (const n of band) {
             const labelHalf = Math.max(n.pr, LABEL_FONT_SIZE * 16);
-            if (n.px + labelHalf >= tileX0 && n.px - labelHalf <= tileX0 + tileW && n.py + n.pr + labelBottom >= tileY0 && n.py - n.pr <= tileY0 + tileH) {
+            if (n.px + labelHalf >= tileX0 && n.px - labelHalf <= tileX0 + tileW) {
               items.push({ attrs: n.attrs, cx: n.px - tileX0, cy: n.py - tileY0, r: n.pr });
             }
           }
@@ -9596,8 +9932,8 @@ function main() {
   }
   async function exportPNG() {
     if (!graph) return;
-    const W = parseInt(exportWidth.value, 10) || 65536;
-    const H = parseInt(exportHeight.value, 10) || 65536;
+    const W = Math.max(64, parseInt(exportWidth.value, 10) || 65536);
+    const H = Math.max(64, parseInt(exportHeight.value, 10) || 65536);
     exportButton.disabled = true;
     exportButton.textContent = "\u5BFC\u51FA\u4E2D\u2026";
     try {
@@ -9629,8 +9965,7 @@ function main() {
         pr: attrs.size * scale2
       }));
       const SINGLE_MAX = 16384;
-      const minImportance = Math.round(LOD_MAX_THRESHOLD * ((Number(exportLodSlider.value) || 0) / 100));
-      const blob = W < SINGLE_MAX && H < SINGLE_MAX ? await renderSingle(W, H, scale2, nodePixels, toX, toY, minImportance) : await renderTiled(W, H, scale2, nodePixels, toX, toY, minImportance);
+      const blob = W < SINGLE_MAX && H < SINGLE_MAX ? await renderSingle(W, H, scale2, nodePixels, toX, toY) : await renderTiled(W, H, scale2, nodePixels, toX, toY);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;

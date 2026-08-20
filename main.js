@@ -12,27 +12,36 @@ import Graph from "graphology";
 import Sigma from "sigma";
 import { createNodeImageProgram } from "@sigma/node-image";
 
-// 支持封面透明度淡入淡出的图像节点程序。
+// 封面纹理程序工厂：按纹理上限生成（96px 常规 / 300px 大节点高清）。
 // sigma 使用预乘 alpha 混合（blendFunc(ONE, ONE_MINUS_SRC_ALPHA)），
 // 因此颜色 RGB 必须先乘以 alpha，否则降低 alpha 会变成加色混合（变亮）而不是变透明。
-// 纹理强制 max 128px：封面以 128px 入图集（每图集约 961 张），
-// 避免封面多时图集数超 WebGL MAX_TEXTURE_IMAGE_UNITS(16)；导出用原始 blob 不受影响。
-class FadingNodeImageProgram extends createNodeImageProgram({
-  size: { mode: "max", value: 128 },
-}) {
-  getDefinition() {
-    const def = super.getDefinition();
-    def.FRAGMENT_SHADER_SOURCE = def.FRAGMENT_SHADER_SOURCE
-      // 封面默认 alpha 取 max(texel.a, v_color.a)，会强制不透明，改成跟随 v_color.a 才能淡出
-      .replace("max(texel.a, v_color.a)", "v_color.a")
-      // 在裁剪前统一预乘，覆盖「无纹理 / 纹理缺失 / 正常贴图」所有分支
-      .replace(
-        "  #endif\n\n  // Crop in a circle when u_keepWithinCircle is truthy:",
-        "  color.rgb *= v_color.a;\n  #endif\n\n  // Crop in a circle when u_keepWithinCircle is truthy:"
-      );
-    return def;
+// 96px：作者图 1.9 万头像，128px 图集数会超 WebGL MAX_TEXTURE_IMAGE_UNITS(16)；
+// 大节点（半径 > COVER_HI_RES_THRESHOLD）改用 300px——数量少，不撑爆图集。
+function makeFadingImageProgram(textureSize) {
+  class FadingImageProgram extends createNodeImageProgram({
+    size: { mode: "max", value: textureSize },
+  }) {
+    getDefinition() {
+      const def = super.getDefinition();
+      def.FRAGMENT_SHADER_SOURCE = def.FRAGMENT_SHADER_SOURCE
+        // 已加载封面：颜色直接取纹理并预乘（texel.a 消透明区、v_color.a 供淡出），
+        // 透明区不再掺节点纯色——否则圆形头像外围会有一圈纯色环
+        .replace(
+          "color = vec4(mix(v_color, texel, texel.a).rgb, max(texel.a, v_color.a));",
+          "color = vec4(texel.rgb * texel.a, texel.a * v_color.a);"
+        )
+        // 无纹理/纹理缺失分支（纯色圆）：预乘淡出 alpha
+        .replace(
+          "  #endif\n\n  // Crop in a circle when u_keepWithinCircle is truthy:",
+          "  color.rgb *= v_color.a;\n  #endif\n\n  // Crop in a circle when u_keepWithinCircle is truthy:"
+        );
+      return def;
+    }
   }
+  return FadingImageProgram;
 }
+const FadingNodeImageProgram = makeFadingImageProgram(96);
+const FadingNodeImageProgramHi = makeFadingImageProgram(300);
 
 // 自定义节点标签绘制：支持 \n 换行（第一行名称，第二行 class id）。
 // sigma 默认只在节点右上角画单行文字，这里按行拆分并围绕节点中心垂直居中。
@@ -84,9 +93,18 @@ const PALETTE = [
 
 const EXTERNAL_COLOR = "#9e9e9e";
 const ISOLATED_COLOR = "#d6d6d6";
-const EDGE_ALPHA = 0.3;
+const EDGE_ALPHA = 0.16;             // 边透明度（低：节点是主体，边做弱连接提示）
 const DEPENDENCY_EDGE_RGB = [255, 182, 193];  // 依赖：粉
 const INTERACTION_EDGE_RGB = [173, 216, 230]; // 联动：浅蓝
+// 作者图合作边按两端团队状态三色区分：团队-团队绿 / 团队-个人红 / 个人-个人蓝
+const TEAM_TEAM_EDGE_RGB = [144, 238, 144];
+const TEAM_MIXED_EDGE_RGB = [255, 99, 71];
+const INDIVIDUAL_EDGE_RGB = [173, 216, 230];
+// 成员-团队边（membership）：淡绿细线，透明度更低（结构连接，弱于合作边）
+const MEMBER_EDGE_RGB = [180, 255, 180];
+const MEMBER_EDGE_ALPHA = 0.10;
+// 团队尺寸中成员数折算权重（与后端布局 node_size_px 一致）
+const MEMBER_SIZE_WEIGHT = 50;
 // sigma 是预乘 alpha 混合，颜色字符串的 RGB 必须先乘 alpha，否则会变亮
 function premulRgba(rgb, alpha) {
   return (
@@ -101,20 +119,13 @@ function premulRgba(rgb, alpha) {
     ")"
   );
 }
-const DEPENDENCY_EDGE_COLOR = premulRgba(DEPENDENCY_EDGE_RGB, EDGE_ALPHA);
-const INTERACTION_EDGE_COLOR = premulRgba(INTERACTION_EDGE_RGB, EDGE_ALPHA);
-
 // 2D Canvas 用直通（非预乘）alpha；WebGL 才需要预乘
 function rgbaString(rgb, alpha) {
   return "rgba(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + "," + alpha + ")";
 }
 
 // 边 LoD：ratio 越大（缩到最小）阈值越高，只留骨干边
-const LOD_MAX_THRESHOLD = 50;
-const LOD_FULL_ZOOM_RATIO = 0.05;
 const LOD_THROTTLE_MS = 33;
-const NODE_LOD_MIN_VISIBLE = 300;
-const NODE_LOD_ENABLED = true;
 const NODE_DIAMETER_SCREEN_RATIO = 0.1; // 跳转后节点直径占屏幕宽度的比例
 const LABEL_FONT_SIZE = 14; // 导出标签字号（固定，不随节点/图幅变化）
 const HIGHLIGHT_NODE_COLOR = "#ffd700"; // 六度分隔路径高亮色（节点）
@@ -128,18 +139,128 @@ const COVER_CONCURRENCY = 20;   // 并发下载数
 const COVER_INTERVAL_MS = 200;  // 每个 worker 完成一张后的固定间隔
 const COVER_RETRIES = 2;        // 每张失败后的额外重试次数
 const COVER_PROXY = "/cover_proxy?url="; // 同源代理（绕过 i.mcmod.cn 防盗链）
+// 封面纹理分级：节点半径超过该值时改用 300px 高清纹理（96px 会糊）。
+// 阈值 20：高清节点 373 个（团队 370 + 普通作者 3），300px 图集 3 页 + 96px 11 页
+// = 14（padding 后仍 14，余量 2 页，低于 MAX_TEXTURE_IMAGE_UNITS(16)）。
+const COVER_HI_RES_THRESHOLD = 20;
 
-function communityColor(community, type) {
+// 图模式：由 graph.json 的 meta.mode 决定（mod=模组依赖/联动图，author=作者合作图）
+let GRAPH_MODE = "mod";
+
+function communityColor(community, type, teamCommunity) {
   if (type === "external") return EXTERNAL_COLOR;
   if (community < 0) return ISOLATED_COLOR;
-  return PALETTE[community % PALETTE.length];
+  const base = PALETTE[community % PALETTE.length];
+  // 团队社区：在 Louvain 社区色基础上 RGB 加减（同团队社区同偏移，±60 内保持色系）
+  if (teamCommunity == null || teamCommunity < 0) return base;
+  const c = teamCommunity;
+  const dr = (((c * 13) % 7) + 7) % 7 - 3;
+  const dg = (((c * 29) % 7) + 7) % 7 - 3;
+  const db = (((c * 47) % 7) + 7) % 7 - 3;
+  const cl = (v) => Math.max(0, Math.min(255, v));
+  const r = cl(parseInt(base.slice(1, 3), 16) + dr * 20);
+  const g = cl(parseInt(base.slice(3, 5), 16) + dg * 20);
+  const b = cl(parseInt(base.slice(5, 7), 16) + db * 20);
+  return "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
 }
 
-function nodeSize(inDegree, type) {
-  // 半径 = 2 + sqrt(被依赖次数)，面积正比于评分
-  const d = Math.max(0, inDegree || 0);
+function nodeSize(inDegree, type, isTeam, memberCount) {
+  // 半径 = 2 + sqrt(度)，面积正比于评分（mod 为被依赖数，author 为加权合作度）
+  // 团队度 = 合作度 + 成员数×50（组织规模参与尺寸），×1.618 不封顶
+  const d = Math.max(0, inDegree || 0) + (isTeam ? MEMBER_SIZE_WEIGHT * (memberCount || 0) : 0);
   const s = 2 + Math.sqrt(d);
-  return type === "external" ? Math.min(s, 10) : Math.min(s, 48);
+  return isTeam ? s * 1.618 : s;
+}
+
+function nodeKindLabel(node) {
+  // 作者图里团队节点显示“团队”，其余显示“作者”；模组图一律 class
+  if (GRAPH_MODE !== "author") return "class";
+  return node && node.is_team ? "团队" : "作者";
+}
+
+// ==================== 作者图二级筛选（模组图不使用） ====================
+// 第一级：节点类型（全部/团队/普通作者）；第二级：关系/属性（全部/合作/包含/属于）
+const KIND_FILTERS = [
+  { key: "all", label: "全部" },
+  { key: "team", label: "团队" },
+  { key: "author", label: "普通作者" },
+];
+
+function filterNodesByKind(nodes, kind) {
+  if (kind === "team") return nodes.filter((n) => n.is_team);
+  if (kind === "author") return nodes.filter((n) => !n.is_team);
+  return nodes;
+}
+
+// 全局检索的第二级语义：包含=团队节点；属于=归属于团队；合作=有合作边
+function filterNodesByRel(nodes, rel) {
+  if (rel === "contains") return nodes.filter((n) => n.is_team);
+  if (rel === "belongs") return nodes.filter((n) => n.teams && n.teams.length);
+  if (rel === "coop") return nodes.filter((n) => (n.degree || 0) > 0);
+  return nodes;
+}
+
+// 构建二级筛选条。kindCounts: {all,team,author}；relItems: [{key,label,count}]。
+// 除“全部”外的条件带计数；计数为 0 的条件不显示。state: {kind, rel}，变更回调 onChange。
+function buildFilterBar(kindCounts, relItems, state, onChange) {
+  const bar = document.createElement("div");
+  bar.className = "filter-bar";
+  const row1 = document.createElement("div");
+  row1.className = "filter-row";
+  for (const f of KIND_FILTERS) {
+    const c = kindCounts[f.key] || 0;
+    if (c <= 0) continue;
+    const b = document.createElement("button");
+    b.className = "filter-btn" + (state.kind === f.key ? " active" : "");
+    b.textContent = f.label + (f.key === "all" ? "" : " " + c);
+    b.addEventListener("click", (e) => {
+      e.stopPropagation(); // 阻止冒泡：onChange 重渲染会移除本按钮，误触发外部点击关闭
+      state.kind = f.key;
+      onChange();
+    });
+    row1.appendChild(b);
+  }
+  bar.appendChild(row1);
+  const row2 = document.createElement("div");
+  row2.className = "filter-row";
+  const allBtn = document.createElement("button");
+  allBtn.className = "filter-btn" + (state.rel === "all" ? " active" : "");
+  allBtn.textContent = "全部";
+  allBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    state.rel = "all";
+    onChange();
+  });
+  row2.appendChild(allBtn);
+  for (const item of relItems) {
+    if (!item.count) continue;
+    const b = document.createElement("button");
+    b.className = "filter-btn" + (state.rel === item.key ? " active" : "");
+    b.textContent = item.label + " " + item.count;
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.rel = item.key;
+      onChange();
+    });
+    row2.appendChild(b);
+  }
+  bar.appendChild(row2);
+  return bar;
+}
+
+// 全局检索排序：作者图按合作度降序（浏览量平局裁决），与右键菜单一致；
+// 模组图保持浏览量降序。传入数组会被原地排序，调用方请传副本。
+function sortNodes(nodes) {
+  if (GRAPH_MODE === "author") {
+    return nodes.sort((a, b) => ((b.degree || 0) - (a.degree || 0)) || ((b.views || 0) - (a.views || 0)));
+  }
+  return nodes.sort((a, b) => (b.views || 0) - (a.views || 0));
+}
+
+function edgeSizeFor(weight) {
+  // 合作边粗细：log 映射（1 次最细，权重翻倍粗 0.35，封顶 3.0）
+  const w = Math.max(1, weight || 1);
+  return Math.min(0.5 + Math.log2(w) * 0.35, 3.0);
 }
 
 function formatNum(n) {
@@ -155,20 +276,6 @@ function formatDuration(ms) {
   return m + "m" + r + "s";
 }
 
-function edgeColorFor(rgb, alpha) {
-  return premulRgba(rgb, EDGE_ALPHA * alpha);
-}
-
-function hexToRgba(hex, alpha, premul) {
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  const rr = premul ? Math.round(r * alpha) : r;
-  const gg = premul ? Math.round(g * alpha) : g;
-  const bb = premul ? Math.round(b * alpha) : b;
-  return "rgba(" + rr + "," + gg + "," + bb + "," + alpha.toFixed(4) + ")";
-}
-
 async function loadGraph() {
   const res = await fetch(GRAPH_URL);
   if (!res.ok) throw new Error("加载 graph.json 失败: " + res.status);
@@ -180,20 +287,34 @@ function renderMetaPanel(meta) {
   const el = document.getElementById("panel-meta");
   if (!el || !meta) return;
   const w = meta.weights || {};
-  const rows = [
-    ["版本", meta.mc_version],
-    ["加载器", meta.api],
-    ["节点", meta.node_count],
-    ["依赖边", meta.dependency_edges],
-    ["联动边", meta.interaction_edges],
-    ["社区", meta.community_count],
-    ["连通分量", meta.component_count],
-    ["生成时间", meta.generated_at],
-    ["布局", meta.layout],
-    ["依赖权重", w.dependency],
-    ["联动权重", w.interaction],
-    ["数据源", meta.source_db],
-  ];
+  const rows =
+    GRAPH_MODE === "author"
+      ? [
+          ["节点", meta.node_count],
+          ["普通作者", meta.author_count],
+          ["团队", meta.team_count],
+          ["合作边", meta.cooperation_edges],
+          ["成员边", meta.membership_edges],
+          ["社区", meta.community_count],
+          ["连通分量", meta.component_count],
+          ["生成时间", meta.generated_at],
+          ["布局", meta.layout],
+          ["数据源", meta.source_db],
+        ]
+      : [
+          ["版本", meta.mc_version],
+          ["加载器", meta.api],
+          ["节点", meta.node_count],
+          ["依赖边", meta.dependency_edges],
+          ["联动边", meta.interaction_edges],
+          ["社区", meta.community_count],
+          ["连通分量", meta.component_count],
+          ["生成时间", meta.generated_at],
+          ["布局", meta.layout],
+          ["依赖权重", w.dependency],
+          ["联动权重", w.interaction],
+          ["数据源", meta.source_db],
+        ];
   const html =
     '<div class="meta-title">图元数据</div>' +
     rows
@@ -205,6 +326,26 @@ function renderMetaPanel(meta) {
 // ==================== 封面：IndexedDB 缓存 + 强制下载 ====================
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 防抖：连续调用时延迟 ms 执行；flush 立即执行挂起的调用（如输入后按 Enter）
+function debounce(fn, ms) {
+  let timer = null;
+  const wrapped = (...args) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      fn(...args);
+    }, ms);
+  };
+  wrapped.flush = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+      fn();
+    }
+  };
+  return wrapped;
+}
 
 function openCoverDB() {
   return new Promise((resolve, reject) => {
@@ -218,14 +359,6 @@ function openCoverDB() {
         req.transaction.objectStore(COVER_STORE).clear();
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function idbGet(db, key) {
-  return new Promise((resolve, reject) => {
-    const req = db.transaction(COVER_STORE, "readonly").objectStore(COVER_STORE).get(key);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -258,48 +391,76 @@ function normalizeCoverUrl(url) {
 
 // 读取全部封面缓存并校验 URL；返回 { blobUrls, staleKeys }
 // staleKeys：缺失或 URL 已变化的条目（需重新下载）
+// 单只读事务 + 游标批量遍历（替代逐条 idbGet，作者图 1.9 万条时事务开销显著）
 async function loadAllCovers(db, items) {
   const blobUrls = new Map();
   const staleKeys = [];
-  for (const item of items) {
-    try {
-      const entry = await idbGet(db, item.key);
-      if (entry && entry.url === item.url && entry.blob) {
-        blobUrls.set(item.key, URL.createObjectURL(entry.blob));
+  const want = new Map(items.map((it) => [String(it.key), it.url]));
+
+  const tx = db.transaction(COVER_STORE, "readonly");
+  const store = tx.objectStore(COVER_STORE);
+  const req = store.openCursor();
+  req.onsuccess = () => {
+    const cursor = req.result;
+    if (!cursor) return;
+    const url = want.get(String(cursor.key));
+    if (url !== undefined) {
+      const entry = cursor.value;
+      if (entry && entry.url === url && entry.blob) {
+        blobUrls.set(cursor.key, URL.createObjectURL(entry.blob));
       } else {
-        staleKeys.push(item.key);
+        staleKeys.push(cursor.key);
       }
-    } catch (e) { staleKeys.push(item.key); }
+    }
+    cursor.continue();
+  };
+  await new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+
+  // 数据库里没有的 key 也视为过期（需要下载）
+  const found = new Set();
+  for (const k of blobUrls.keys()) found.add(String(k));
+  for (const k of staleKeys) found.add(String(k));
+  for (const it of items) {
+    if (!found.has(String(it.key))) staleKeys.push(it.key);
   }
   return { blobUrls, staleKeys };
 }
 
-// 清理当前图不需要的缓存条目（旧图残留）
+// 清理当前图不需要的缓存条目（旧图残留），返回被删除的 key（供调用方 revoke blob URL）
 function purgeStaleKeys(db, items) {
   return new Promise((resolve, reject) => {
     const keep = new Set(items.map((it) => it.key));
+    const deletedKeys = [];
     const tx = db.transaction(COVER_STORE, "readwrite");
     const store = tx.objectStore(COVER_STORE);
     const req = store.openCursor();
     req.onsuccess = () => {
       const cursor = req.result;
       if (cursor) {
-        if (!keep.has(cursor.key)) cursor.delete();
+        if (!keep.has(cursor.key)) {
+          deletedKeys.push(cursor.key);
+          cursor.delete();
+        }
         cursor.continue();
       }
     };
-    tx.oncomplete = () => resolve();
+    tx.oncomplete = () => resolve(deletedKeys);
     tx.onerror = () => reject(tx.error);
   });
 }
 
-// 并发下载封面，每张重试 COVER_RETRIES 次；返回 { failed, failedKeys, errors }
+// 并发下载封面，每张重试 COVER_RETRIES 次；返回 { failed, failedKeys, errors, blobUrls }
+// blobUrls：本次新下载成功的 key -> blob URL（下载循环就地记录，避免成功后全量重读）
 async function downloadCovers(db, items, onProgress) {
   let idx = 0;
   let done = 0;
   let failed = 0;
   const failedKeys = [];
   const errors = [];
+  const blobUrls = new Map();
 
   async function worker() {
     while (idx < items.length) {
@@ -309,10 +470,11 @@ async function downloadCovers(db, items, onProgress) {
       let lastErr = "";
       for (let attempt = 0; attempt <= COVER_RETRIES && !ok; attempt++) {
         try {
-          const resp = await fetch(COVER_PROXY + encodeURIComponent(item.url));
+          const resp = await fetch(COVER_PROXY + encodeURIComponent(item.url) + "&ua=" + encodeURIComponent(navigator.userAgent));
           if (!resp.ok) throw new Error("HTTP " + resp.status);
           const blob = await resp.blob();
           await idbPut(db, item.key, { url: item.url, blob });
+          blobUrls.set(item.key, URL.createObjectURL(blob));
           ok = true;
         } catch (e) {
           lastErr = String((e && e.message) || e);
@@ -336,12 +498,12 @@ async function downloadCovers(db, items, onProgress) {
   const workers = [];
   for (let w = 0; w < COVER_CONCURRENCY; w++) workers.push(worker());
   await Promise.all(workers);
-  return { failed, failedKeys, errors };
+  return { failed, failedKeys, errors, blobUrls };
 }
 
-// 强制下载门槛 modal（下载 downloadItems 差异部分，完成后加载 allItems 全量）。
+// 强制下载门槛 modal（下载 downloadItems 差异部分，完成后合并已缓存与新增封面）。
 // resolve({ blobUrls }) 表示可进入星图。
-function showCoverModal(db, downloadItems, allItems) {
+function showCoverModal(db, downloadItems, existingBlobUrls) {
   return new Promise((resolve) => {
     const coverByKey = new Map(downloadItems.map((it) => [it.key, it.url]));
 
@@ -354,6 +516,7 @@ function showCoverModal(db, downloadItems, allItems) {
       '    <button class="cover-close" title="拒绝下载">×</button>' +
       "  </div>" +
       '  <div class="cover-desc"></div>' +
+      '  <div class="cover-warn hidden"></div>' +
       '  <div class="cover-progress hidden">' +
       '    <div class="cover-track"><div class="cover-fill"></div></div>' +
       '    <div class="cover-label"></div>' +
@@ -367,6 +530,7 @@ function showCoverModal(db, downloadItems, allItems) {
 
     const titleEl = modal.querySelector(".cover-title");
     const descEl = modal.querySelector(".cover-desc");
+    const warnEl = modal.querySelector(".cover-warn");
     const closeEl = modal.querySelector(".cover-close");
     const progressEl = modal.querySelector(".cover-progress");
     const fillEl = modal.querySelector(".cover-fill");
@@ -377,6 +541,8 @@ function showCoverModal(db, downloadItems, allItems) {
     let state = "confirm";
     let pending = downloadItems.slice();
     let doneCount = 0;
+    // 全量封面映射 = boot 已缓存的部分 + startDownload 累加的新下载部分
+    const accumulated = new Map(existingBlobUrls);
     let failedCount = 0;
     let failedKeys = [];
     let failErrors = [];
@@ -391,9 +557,17 @@ function showCoverModal(db, downloadItems, allItems) {
         descEl.textContent =
           "本图需要下载 " + downloadItems.length + " 张模组封面才能正常使用。" +
           "封面将缓存到浏览器本地，下次打开无需重复下载。";
+        warnEl.textContent =
+          "警告：将以 " + COVER_CONCURRENCY + " 并发量下载 " + downloadItems.length + " 张封面。" +
+          "高频请求可能触发 mcmod 风控，并占用网络资源。" +
+          "点击“确定下载”即视为已知悉并接受风险，后果自负。";
+        warnEl.classList.remove("hidden");
         primaryBtn.textContent = "确定下载";
         primaryBtn.classList.remove("hidden");
-      } else if (state === "refuse") {
+      } else {
+        warnEl.classList.add("hidden");
+      }
+      if (state === "refuse") {
         titleEl.textContent = "未下载封面";
         descEl.textContent = "封面是本图的核心视觉元素，未下载无法使用。";
         primaryBtn.textContent = "重新下载封面";
@@ -451,13 +625,13 @@ function showCoverModal(db, downloadItems, allItems) {
       failedKeys = result.failedKeys;
       failedCount = result.failed;
       failErrors = result.errors;
+      for (const [k, v] of result.blobUrls) accumulated.set(k, v);
 
       if (result.failed > 0) {
         state = "failed";
         showState();
       } else {
-        const loaded = await loadAllCovers(db, allItems);
-        finish(loaded.blobUrls);
+        finish(accumulated);
       }
     }
 
@@ -467,9 +641,7 @@ function showCoverModal(db, downloadItems, allItems) {
       } else if (state === "refuse") {
         startDownload(downloadItems.slice());
       } else if (state === "failed") {
-        const loaded = await loadAllCovers(db, allItems);
-        const urls = loaded.blobUrls;
-        finish(urls);
+        finish(accumulated);
       }
     });
 
@@ -535,36 +707,100 @@ function showProxyErrorModal(status) {
   });
 }
 
+// ==================== 封面纹理预热 ====================
+// sigma node-image 的封面纹理是渲染时按视口惰性注册的：新节点进视口 → 异步解码 →
+// 500ms 防抖 → 同步画进 4096² atlas + 页增长时重编译 shader，全部卡在交互路径
+// （作者图 1.9 万张会持续触发）。预热：在加载期把全部封面注册并等 atlas 构建完成，
+// 运行时不再有任何注册事件。
+async function prewarmCovers(items, blobUrls, onProgress) {
+  // 分流（hiRes 判定与 buildGraph 一致）+ 同 URL 去重
+  const normal = new Set();
+  const hi = new Set();
+  for (const it of items) {
+    const src = blobUrls.get(it.key);
+    if (!src) continue;
+    (it.hiRes ? hi : normal).add(src);
+  }
+  const groups = [
+    { program: FadingNodeImageProgram, sources: [...normal] },
+    { program: FadingNodeImageProgramHi, sources: [...hi] },
+  ];
+  const total = normal.size + hi.size;
+  if (!total) return 0;
+
+  // 分批注册：registerImage 内部无解码并发上限，全量发起会引发解码风暴
+  const BATCH = 300;
+  const BATCH_GAP = 40;
+  for (const g of groups) {
+    for (let i = 0; i < g.sources.length; i += BATCH) {
+      const chunk = g.sources.slice(i, i + BATCH);
+      for (const s of chunk) g.program.textureManager.registerImage(s);
+      await sleep(BATCH_GAP);
+    }
+  }
+
+  // 等待 atlas 构建完成：条目数连续稳定视为完成（加载失败的图不会进 atlas，由稳定判定放行）
+  const countOf = (g) => Object.keys(g.program.textureManager.getAtlas()).length;
+  const deadline = Date.now() + 120000; // 2 分钟兜底
+  let last = -1;
+  let stable = 0;
+  while (Date.now() < deadline) {
+    const done = groups.reduce((sum, g) => sum + countOf(g), 0);
+    if (onProgress) onProgress(done, total);
+    if (done >= total) return done;
+    if (done === last) {
+      if (++stable >= 4) return done; // ~1s 无增长，认为构建完成
+    } else {
+      stable = 0;
+      last = done;
+    }
+    await sleep(250);
+  }
+  return groups.reduce((sum, g) => sum + countOf(g), 0);
+}
+
 function buildGraph(data, blobUrls) {
   const graph = new Graph({ multi: true });
   const labelIndex = new Map(); // lowercase name -> [keys]
   const degMap = new Map();
+  const teamFlag = new Map();   // key -> 是否团队（合作边三色用）
 
   for (const n of data.nodes) {
-    degMap.set(n.key, n.in_degree);
-    const isCore = n.type === "core";
+    const deg = n.degree != null ? n.degree : (n.in_degree || 0); // 旧文件无 degree 时回退 in_degree
+    const isTeam = !!n.is_team;
+    degMap.set(n.key, deg);
+    teamFlag.set(n.key, isTeam);
+    const hasImage = n.type === "core" || n.type === "author";
+    const sz = nodeSize(deg, n.type, isTeam, n.member_count);
+    const hiRes = sz > COVER_HI_RES_THRESHOLD; // 大节点用 300px 高清封面
     graph.addNode(n.key, {
       x: typeof n.x === "number" ? n.x : Math.random() * 100,
       y: typeof n.y === "number" ? n.y : Math.random() * 100,
-      size: nodeSize(n.in_degree, n.type),
-      color: communityColor(n.community, n.type),
-      label: n.label + "\nclass " + n.key,
+      size: sz,
+      color: communityColor(n.community, n.type, n.team_community),
+      label: n.label + "\n" + nodeKindLabel(n) + " " + n.key,
       name: n.label,
       name_en: n.name_en,
       description: n.description,
       kind: n.type,
-      type: isCore ? "image" : "circle",
-      image: isCore ? (blobUrls.get(n.key) || null) : null,
+      type: hasImage ? (hiRes ? "imageHi" : "image") : "circle",
+      image: hasImage ? (blobUrls.get(n.key) || null) : null,
       views: n.views,
       favorites: n.favorites,
       category: n.category,
       status: n.status,
       in_degree: n.in_degree,
       out_degree: n.out_degree,
+      degree: deg,
       pagerank: n.pagerank,
       community: n.community,
       rank: n.rank,
       density: n.density,
+      is_team: isTeam,
+      member_count: n.member_count || 0,
+      members: (n.members || []).map(String),
+      teams: (n.teams || []).map(String),
+      team_community: n.team_community != null ? n.team_community : null,
     });
     if (n.label) {
       const k = n.label.toLowerCase();
@@ -575,15 +811,29 @@ function buildGraph(data, blobUrls) {
 
   for (const e of data.edges) {
     const importance = Math.min(degMap.get(e.source) || 0, degMap.get(e.target) || 0);
-    const kind = e.type === "interaction" ? "interaction" : "dependency";
-    const rgb = kind === "interaction" ? INTERACTION_EDGE_RGB : DEPENDENCY_EDGE_RGB;
+    const kind = e.type === "interaction" ? "interaction"
+      : (e.type === "cooperation" ? "cooperation"
+        : (e.type === "membership" ? "membership" : "dependency"));
+    // 作者图合作边按两端团队状态三色区分；成员边淡绿细线；模组图沿用类型色
+    let rgb;
+    if (kind === "cooperation" && GRAPH_MODE === "author") {
+      const sTeam = teamFlag.get(e.source);
+      const tTeam = teamFlag.get(e.target);
+      rgb = sTeam && tTeam ? TEAM_TEAM_EDGE_RGB : (sTeam || tTeam ? TEAM_MIXED_EDGE_RGB : INDIVIDUAL_EDGE_RGB);
+    } else if (kind === "membership") {
+      rgb = MEMBER_EDGE_RGB;
+    } else {
+      rgb = kind === "interaction" ? INTERACTION_EDGE_RGB : DEPENDENCY_EDGE_RGB;
+    }
     graph.addEdge(e.source, e.target, {
-      size: 0.5,
-      color: kind === "interaction" ? INTERACTION_EDGE_COLOR : DEPENDENCY_EDGE_COLOR,
+      size: GRAPH_MODE === "author" ? (kind === "membership" ? 0.4 : edgeSizeFor(e.weight)) : 0.5,
+      color: premulRgba(rgb, kind === "membership" ? MEMBER_EDGE_ALPHA : EDGE_ALPHA),
+      alpha: kind === "membership" ? MEMBER_EDGE_ALPHA : EDGE_ALPHA, // 导出绘制用（与屏幕一致）
       type: "line",
       kind,
       rgb,
       importance,
+      weight: e.weight,
       group_name: e.group_name || "",
     });
   }
@@ -710,16 +960,13 @@ function main() {
   const tooltipEl = document.getElementById("tooltip");
   const contextMenu = document.getElementById("context-menu");
   const searchInput = document.getElementById("search-input");
+  const searchFilters = document.getElementById("search-filters");
   const searchResults = document.getElementById("search-results");
   const searchList = document.getElementById("search-list");
   const searchPagination = document.getElementById("search-pagination");
   const statusText = document.getElementById("status-text");
   const progressFill = document.getElementById("progress-fill");
   const progressLabel = document.getElementById("progress-label");
-  const lodSlider = document.getElementById("lod-slider");
-  const lodValue = document.getElementById("lod-value");
-  const edgeLodSlider = document.getElementById("edge-lod-slider");
-  const edgeLodValue = document.getElementById("edge-lod-value");
   const panel = document.getElementById("panel");
   const panelToggle = document.getElementById("panel-toggle");
   const edgeDependency = document.getElementById("edge-dependency");
@@ -729,31 +976,23 @@ function main() {
   const exportHeight = document.getElementById("export-height");
   const exportButton = document.getElementById("export-button");
   const exportWarning = document.getElementById("export-warning");
-  const exportLodSlider = document.getElementById("export-lod-slider");
-  const exportLodValue = document.getElementById("export-lod-value");
 
   let renderer = null;
   let graph = null;
   let searchIndex = null;
-  let lodThresholdValue = 0;
   let lodTimer = null;
   let culledEdges = new Set();
-  let nodeVisibleCount = 0;
-  let edgeAlpha = new Map();
-  let nodeAlpha = new Map();
-  let fadeTimer = null;
   let searchMatches = [];
   let searchPage = 0;
+  // 作者图二级筛选状态（侧边栏全局检索；模组图不使用）
+  const searchFilter = { kind: "all", rel: "all" };
   let allNodes = [];
-  let nodeLodStrength = 1;
-  let edgeLodStrength = 1;
   let showDependency = true;
   let showInteraction = true;
   let highlightNodes = new Set();
   let highlightEdges = new Set();
   // 导出用全量封面映射（与屏幕渲染的 image 属性解耦，导出不受纹理限制影响）
   let coverBlobUrls = new Map();
-
   function setProgress(pct, text, label) {
     statusText.textContent = text;
     progressFill.style.width = Math.max(0, Math.min(100, pct)) + "%";
@@ -776,14 +1015,17 @@ function main() {
   async function boot() {
     setProgress(0, "加载数据中……", "graph.json");
     const data = await loadGraph();
+    GRAPH_MODE = data.meta && data.meta.mode === "author" ? "author" : "mod";
+    document.getElementById("search-input").placeholder =
+      GRAPH_MODE === "author" ? "搜索作者名…" : "搜索模组名…";
     renderMetaPanel(data.meta);
     setProgress(10, "检查封面缓存……", "");
     await new Promise((r) => setTimeout(r, 30));
 
-    // 封面清单（仅核心节点 + 有 URL 的）
+    // 封面清单（有图的节点 + 有 URL 的：mod=核心模组封面，author=作者头像）
     const coverItems = [];
     for (const n of data.nodes) {
-      if (n.type !== "core") continue;
+      if (n.type !== "core" && n.type !== "author") continue;
       const url = normalizeCoverUrl(n.cover_url);
       if (url) coverItems.push({ key: n.key, url });
     }
@@ -809,20 +1051,47 @@ function main() {
       if (loaded.staleKeys.length) {
         const byKey = new Map(coverItems.map((it) => [it.key, it.url]));
         const downloadItems = loaded.staleKeys.map((k) => ({ key: k, url: byKey.get(k) }));
-        const result = await showCoverModal(db, downloadItems, coverItems);
+        const result = await showCoverModal(db, downloadItems, blobUrls);
         blobUrls = result.blobUrls;
       }
-      await purgeStaleKeys(db, coverItems);
+      const purged = await purgeStaleKeys(db, coverItems);
+      // 被删条目对应的 blob URL 已不再被引用，释放内存
+      for (const k of purged) {
+        const u = blobUrls.get(k);
+        if (u) URL.revokeObjectURL(u);
+      }
     }
 
-    setProgress(20, "构建图结构……", "");
+    // 封面纹理预热：把 atlas 惰性注册的卡顿移进加载期，等待构建完成再放行
+    if (blobUrls.size) {
+      const prewarmItems = [];
+      for (const n of data.nodes) {
+        if (n.type !== "core" && n.type !== "author") continue;
+        const deg = n.degree != null ? n.degree : (n.in_degree || 0);
+        const isTeam = !!n.is_team;
+        prewarmItems.push({
+          key: n.key,
+          hiRes: nodeSize(deg, n.type, isTeam, n.member_count) > COVER_HI_RES_THRESHOLD,
+        });
+      }
+      setProgress(20, "正在生成封面纹理…", "");
+      await prewarmCovers(prewarmItems, blobUrls, (done, total) => {
+        setProgress(
+          20 + Math.round((done / Math.max(1, total)) * 60),
+          "正在生成封面纹理…",
+          done + " / " + total
+        );
+      });
+    }
+
+    setProgress(85, "构建图结构……", "");
     await new Promise((r) => setTimeout(r, 30));
 
     const built = buildGraph(data, blobUrls);
     graph = built.graph;
     coverBlobUrls = blobUrls;
     searchIndex = buildSearch(data);
-    allNodes = [...data.nodes].sort((a, b) => (b.views || 0) - (a.views || 0));
+    allNodes = sortNodes([...data.nodes]);
     searchMatches = [...allNodes];
     searchPage = 0;
     renderSearchResults();
@@ -850,6 +1119,7 @@ function main() {
       defaultDrawNodeLabel: drawNodeLabel,
       nodeProgramClasses: {
         image: FadingNodeImageProgram,
+        imageHi: FadingNodeImageProgramHi, // 大节点 300px 高清
       },
     });
 
@@ -877,10 +1147,11 @@ function main() {
       if (highlightEdges.has(edge)) {
         return { ...attrs, hidden: false, color: HIGHLIGHT_EDGE_COLOR, size: Math.max(attrs.size || 0.5, 1.6) };
       }
-      const alpha = edgeAlpha.get(edge);
-      if (alpha === 0) return { ...attrs, hidden: true };
-      if (alpha !== undefined && alpha < 1) {
-        return { ...attrs, color: edgeColorFor(attrs.rgb || DEPENDENCY_EDGE_RGB, alpha) };
+      // 直接判定可见性：筛选开关 + 视口裁剪（culledEdges 查询放最后，被筛选隐藏的边短路跳过）
+      if ((attrs.kind === "dependency" && !showDependency) ||
+          (attrs.kind === "interaction" && !showInteraction) ||
+          culledEdges.has(edge)) {
+        return { ...attrs, hidden: true };
       }
       return attrs;
     });
@@ -888,14 +1159,6 @@ function main() {
     renderer.setSetting("nodeReducer", (node, attr) => {
       if (highlightNodes.has(node)) {
         return { ...attr, hidden: false, color: HIGHLIGHT_NODE_COLOR };
-      }
-      const alpha = nodeAlpha.get(node);
-      if (alpha === 0) return { ...attr, hidden: true };
-      if (alpha !== undefined && alpha < 1) {
-        // image 节点的预乘在 FadingNodeImageProgram 的 shader 里完成，
-        // circle 节点没有自定义 shader，因此在这里预乘。
-        const premul = attr.type !== "image";
-        return { ...attr, color: hexToRgba(attr.color, alpha, premul) };
       }
       return attr;
     });
@@ -907,21 +1170,20 @@ function main() {
       const applyLod = () => {
         lodLastRun = performance.now();
         const state = cam.getState();
-        lodThresholdValue = computeLodThreshold(state.ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
-        nodeVisibleCount = computeVisibleNodeCount(state.ratio, nodeLodStrength);
         updateCulling(state);
-        startFade();
       };
-      if (lodTimer) clearTimeout(lodTimer);
       const elapsed = now - lodLastRun;
       if (elapsed >= LOD_THROTTLE_MS) {
+        if (lodTimer) { clearTimeout(lodTimer); lodTimer = null; }
         applyLod();
-      } else {
-        lodTimer = setTimeout(applyLod, LOD_THROTTLE_MS - elapsed);
+      } else if (!lodTimer) {
+        // 定时器只设一次不重置：保证缩放中每 33ms 至少更新一次视口裁剪
+        lodTimer = setTimeout(() => {
+          lodTimer = null;
+          applyLod();
+        }, LOD_THROTTLE_MS - elapsed);
       }
     });
-    lodThresholdValue = computeLodThreshold(cam.getState().ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
-    nodeVisibleCount = computeVisibleNodeCount(cam.getState().ratio, nodeLodStrength);
     updateCulling(cam.getState());
 
     // 触发首次渲染并等待封面纹理图集生成，避免加载页淡出后卡顿
@@ -929,22 +1191,26 @@ function main() {
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     await new Promise((r) => setTimeout(r, 700));
 
-    startFade();
+    renderer.scheduleRefresh();
     finishLoading();
   }
 
   function bindEvents() {
     renderer.on("enterNode", ({ node }) => {
+      hoveredNode = node;
+      if (altLock) return; // Alt 锁定时内容与位置都锁定，仅记录 hover 状态
       const attrs = graph.getNodeAttributes(node);
       showTooltip(node, attrs);
     });
 
     renderer.on("leaveNode", () => {
-      hideTooltip();
+      hoveredNode = null;
+      if (!altLock) hideTooltip();
     });
 
     renderer.on("clickNode", ({ node }) => {
-      window.open("https://www.mcmod.cn/class/" + node + ".html", "_blank");
+      const base = GRAPH_MODE === "author" ? "author" : "class";
+      window.open("https://www.mcmod.cn/" + base + "/" + node + ".html", "_blank");
     });
 
     renderer.on("clickEdge", ({ edge }) => {
@@ -959,7 +1225,8 @@ function main() {
       focusNode(ds >= dt ? source : target);
     });
 
-    searchInput.addEventListener("input", () => {
+    // 防抖：索引大（作者图约 5.7 万 term），每次按键全扫 + 排序代价高
+    const debouncedSearch = debounce(() => {
       const q = searchInput.value.trim().toLowerCase();
       if (!q) {
         searchMatches = [...allNodes];
@@ -973,30 +1240,19 @@ function main() {
           for (const n of nodes) matched.add(n);
         }
       }
-      searchMatches = [...matched].sort((a, b) => (b.views || 0) - (a.views || 0));
+      searchMatches = sortNodes([...matched]);
       searchPage = 0;
       renderSearchResults();
-    });
+    }, 150);
+
+    searchInput.addEventListener("input", debouncedSearch);
 
     searchInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
+        debouncedSearch.flush(); // 输入后立即 Enter：先渲染当前结果再取第一个
         const first = searchList.querySelector("li");
         if (first) first.click();
       }
-    });
-
-    lodSlider.addEventListener("input", () => {
-      nodeLodStrength = Number(lodSlider.value) / 100;
-      lodValue.textContent = Math.round(nodeLodStrength * 100) + "%";
-      nodeVisibleCount = computeVisibleNodeCount(renderer.getCamera().getState().ratio, nodeLodStrength);
-      startFade();
-    });
-
-    edgeLodSlider.addEventListener("input", () => {
-      edgeLodStrength = Number(edgeLodSlider.value) / 100;
-      edgeLodValue.textContent = Math.round(edgeLodStrength * 100) + "%";
-      lodThresholdValue = computeLodThreshold(renderer.getCamera().getState().ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
-      startFade();
     });
 
     panelToggle.addEventListener("click", () => {
@@ -1007,22 +1263,17 @@ function main() {
 
     edgeDependency.addEventListener("change", () => {
       showDependency = edgeDependency.checked;
-      startFade();
+      renderer.scheduleRefresh(); // reducer 读最新开关
     });
     edgeInteraction.addEventListener("change", () => {
       showInteraction = edgeInteraction.checked;
-      startFade();
+      renderer.scheduleRefresh();
     });
     showLabels.addEventListener("change", () => {
       renderer.setSetting("renderLabels", showLabels.checked);
     });
 
     exportButton.addEventListener("click", exportPNG);
-
-    // 导出边 LoD：阈值 = LOD_MAX_THRESHOLD × 强度（0 = 全量），只影响导出 PNG
-    exportLodSlider.addEventListener("input", () => {
-      exportLodValue.textContent = exportLodSlider.value + "%";
-    });
 
     function updateExportWarning() {
       const w = parseInt(exportWidth.value, 10) || 0;
@@ -1037,17 +1288,42 @@ function main() {
   function renderSearchResults() {
     searchList.innerHTML = "";
     searchPagination.innerHTML = "";
+    let list = searchMatches;
+    // 作者图：二级筛选（第一级类型 × 第二级关系），计数来自未筛选的搜索池
+    if (GRAPH_MODE === "author") {
+      const pool = searchMatches;
+      searchFilters.innerHTML = "";
+      searchFilters.appendChild(buildFilterBar(
+        {
+          all: pool.length,
+          team: pool.filter((n) => n.is_team).length,
+          author: pool.filter((n) => !n.is_team).length,
+        },
+        [
+          { key: "coop", label: "合作", count: pool.filter((n) => (n.degree || 0) > 0).length },
+          { key: "contains", label: "包含", count: pool.filter((n) => n.is_team).length },
+          { key: "belongs", label: "属于", count: pool.filter((n) => n.teams && n.teams.length).length },
+        ],
+        searchFilter,
+        () => {
+          searchPage = 0;
+          renderSearchResults();
+        }
+      ));
+      list = filterNodesByKind(filterNodesByRel(pool, searchFilter.rel), searchFilter.kind);
+    }
+
     const pageSize = 10;
-    const total = searchMatches.length;
+    const total = list.length;
     const pages = Math.max(1, Math.ceil(total / pageSize));
     if (searchPage >= pages) searchPage = pages - 1;
     const start = searchPage * pageSize;
-    const page = searchMatches.slice(start, start + pageSize);
+    const page = list.slice(start, start + pageSize);
 
     for (const n of page) {
       const li = document.createElement("li");
       li.textContent = n.label + (n.name_en ? " (" + n.name_en + ")" : "");
-      li.title = "class " + n.key;
+      li.title = nodeKindLabel(n) + " " + n.key;
       li.addEventListener("click", () => {
         focusNode(n.key);
       });
@@ -1086,6 +1362,7 @@ function main() {
       const tOut = ta.x < rect.minX || ta.x > rect.maxX || ta.y < rect.minY || ta.y > rect.maxY;
       if (sOut && tOut) next.add(edge);
     });
+    // 只更新集合不做 diff/不刷新——edgeReducer 每帧读最新 culledEdges
     culledEdges = next;
   }
 
@@ -1103,92 +1380,35 @@ function main() {
     cam.animate({ x: nd.x, y: nd.y, ratio: targetRatio }, { duration: 600 });
   }
 
-  function computeLodThreshold(ratio, maxThreshold) {
-    // 边 LoD：ratio 越大（缩到最小）阈值越高，只留骨干边。
-    // maxThreshold 已按 edgeLodStrength 缩放：0 = 禁用边 LoD（阈值恒 0），1 = 最强。
-    if (ratio <= LOD_FULL_ZOOM_RATIO) return 0;
-    const maxR = 1;
-    const r = Math.min(ratio, maxR);
-    const t = (Math.log(r) - Math.log(LOD_FULL_ZOOM_RATIO)) /
-              (Math.log(maxR) - Math.log(LOD_FULL_ZOOM_RATIO));
-    return Math.round(maxThreshold * t);
-  }
-
-  function computeVisibleNodeCount(ratio, strength) {
-    // 按重要度排名平滑显隐：缩到最小时只留 NODE_LOD_MIN_VISIBLE 个骨干，放大后逐渐增多。
-    // strength 为 LoD 强度：0 = 完全禁用（全量渲染），1 = 最强。
-    const total = graph.order;
-    if (strength <= 0) return total;
-    if (ratio <= LOD_FULL_ZOOM_RATIO) return total;
-    const maxR = 1;
-    const r = Math.min(ratio, maxR);
-    const t = (Math.log(r) - Math.log(LOD_FULL_ZOOM_RATIO)) /
-              (Math.log(maxR) - Math.log(LOD_FULL_ZOOM_RATIO));
-    return Math.round(total * Math.pow(NODE_LOD_MIN_VISIBLE / total, t * strength));
-  }
-
-  function edgeTarget(edge, attrs) {
-    if (attrs.kind === "dependency" && !showDependency) return 0;
-    if (attrs.kind === "interaction" && !showInteraction) return 0;
-    if ((attrs.importance || 0) < lodThresholdValue) return 0;
-    if (culledEdges.has(edge)) return 0;
-    return 1;
-  }
-
-  function nodeTarget(node, attrs) {
-    if (!NODE_LOD_ENABLED) return 1;
-    return (attrs.rank ?? Infinity) < nodeVisibleCount ? 1 : 0;
-  }
-
-  function fadeStep() {
-    const step = 0.36; // 渐变时长减半
-    const changedNodes = [];
-    const changedEdges = [];
-
-    graph.forEachEdge((edge, attrs) => {
-      const target = edgeTarget(edge, attrs);
-      const cur = edgeAlpha.has(edge) ? edgeAlpha.get(edge) : 1;
-      if (cur === target) return;
-      let next = cur + (target - cur) * step;
-      if (Math.abs(next - target) < 0.02) next = target;
-      if (next === 1) edgeAlpha.delete(edge);
-      else edgeAlpha.set(edge, next);
-      changedEdges.push(edge);
-    });
-
-    graph.forEachNode((node, attrs) => {
-      const target = nodeTarget(node, attrs);
-      const cur = nodeAlpha.has(node) ? nodeAlpha.get(node) : 1;
-      if (cur === target) return;
-      let next = cur + (target - cur) * step;
-      if (Math.abs(next - target) < 0.02) next = target;
-      if (next === 1) nodeAlpha.delete(node);
-      else nodeAlpha.set(node, next);
-      changedNodes.push(node);
-    });
-
-    if (changedNodes.length || changedEdges.length) {
-      renderer.refresh();
-      fadeTimer = setTimeout(fadeStep, 33);
-    } else {
-      fadeTimer = null;
-    }
-  }
-
-  function startFade() {
-    if (fadeTimer) return;
-    fadeStep();
+  function teamNames(ids) {
+    // 团队 id 列表 → 名称（图上查不到时回退为 id 本身）
+    return ids.map((id) => {
+      const a = graph.getNodeAttributes(String(id));
+      return a && a.name ? a.name : String(id);
+    }).join("、");
   }
 
   function showTooltip(node, attrs) {
     const lines = [];
     lines.push("<div class='tt-title'>" + escapeHtml(attrs.name) + "</div>");
     if (attrs.name_en) lines.push("<div class='tt-sub'>" + escapeHtml(attrs.name_en) + "</div>");
-    if (attrs.description) lines.push("<div class='tt-desc'>" + escapeHtml(attrs.description) + "</div>");
-    lines.push("<div class='tt-meta'>" + (attrs.kind === "core" ? "核心模组" : "外部引用") + " · " + escapeHtml(attrs.category || "无分类") + "</div>");
+    if (attrs.description) lines.push("<div class='tt-desc'>" + attrs.description + "</div>");
+    const kindText = GRAPH_MODE === "author" ? nodeKindLabel(attrs) : (attrs.kind === "core" ? "核心模组" : "外部引用");
+    lines.push("<div class='tt-meta'>" + kindText + " · " + escapeHtml(attrs.category || "无分类") + "</div>");
+    if (GRAPH_MODE === "author") {
+      if (attrs.is_team) {
+        lines.push("<div class='tt-meta team'>团队 · " + attrs.member_count + " 名成员</div>");
+      } else if (attrs.teams && attrs.teams.length) {
+        lines.push("<div class='tt-meta team'>参与团队：" + escapeHtml(teamNames(attrs.teams)) + "</div>");
+      }
+    }
     if (attrs.status) lines.push("<div class='tt-meta'>状态：" + escapeHtml(attrs.status) + "</div>");
     lines.push("<div class='tt-stats'>浏览量 " + formatNum(attrs.views) + " · 收藏 " + formatNum(attrs.favorites) + "</div>");
-    lines.push("<div class='tt-stats'>被依赖 " + attrs.in_degree + " · 依赖 " + attrs.out_degree + " · PageRank " + attrs.pagerank.toFixed(5) + "</div>");
+    if (GRAPH_MODE === "author") {
+      lines.push("<div class='tt-stats'>合作度 " + (attrs.degree != null ? attrs.degree : 0) + " · PageRank " + attrs.pagerank.toFixed(5) + "</div>");
+    } else {
+      lines.push("<div class='tt-stats'>被依赖 " + attrs.in_degree + " · 依赖 " + attrs.out_degree + " · PageRank " + attrs.pagerank.toFixed(5) + "</div>");
+    }
     lines.push("<div class='tt-hint'>点击跳转 mcmod 页面</div>");
     tooltipEl.innerHTML = lines.join("");
     tooltipEl.classList.remove("hidden");
@@ -1200,6 +1420,7 @@ function main() {
   }
 
   function positionTooltip() {
+    if (altLock) return; // Alt 锁定时不跟随鼠标
     const pad = 12;
     const w = tooltipEl.offsetWidth;
     const h = tooltipEl.offsetHeight;
@@ -1207,11 +1428,29 @@ function main() {
     let y = lastMouse.y + pad;
     if (x + w > window.innerWidth) x = lastMouse.x - w - pad;
     if (y + h > window.innerHeight) y = lastMouse.y - h - pad;
+    // 钳制到窗口内（翻转后仍可能超界：tooltip 比鼠标到边缘的距离还宽/高时）
+    x = Math.max(pad, Math.min(x, window.innerWidth - w - pad));
+    y = Math.max(pad, Math.min(y, window.innerHeight - h - pad));
     tooltipEl.style.left = x + "px";
     tooltipEl.style.top = y + "px";
   }
 
   let lastMouse = { x: 0, y: 0 };
+  let hoveredNode = null; // 当前悬浮的节点（Alt 松开时决定是否隐藏）
+  let altLock = false;    // Alt 按住时锁定 tooltip（不消失、不跟随）
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Alt") {
+      e.preventDefault();
+      altLock = true;
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.key === "Alt") {
+      altLock = false;
+      if (!hoveredNode) hideTooltip();
+    }
+  });
   window.addEventListener("mousemove", (e) => {
     lastMouse = { x: e.clientX, y: e.clientY };
     if (!tooltipEl.classList.contains("hidden")) positionTooltip();
@@ -1234,7 +1473,32 @@ function main() {
     contextMenu.classList.add("hidden");
   }
 
+  function nodeDeg(key) {
+    const a = graph.getNodeAttributes(key);
+    return a.degree != null ? a.degree : (a.in_degree || 0);
+  }
+
   function collectRelations(key) {
+    // 作者模式：无方向，全部邻居即合作者；另有参与团队/团队成员列表
+    if (GRAPH_MODE === "author") {
+      const attrs = graph.getNodeAttributes(key);
+      const byDeg = (a, b) => nodeDeg(b) - nodeDeg(a);
+      const partners = new Set();
+      // 合作者仅统计合作边（成员-团队边是结构连接，不算合作）
+      graph.forEachEdge((edge, eAttrs, source, target) => {
+        if (eAttrs.kind !== "cooperation") return;
+        if (source === key) partners.add(target);
+        else if (target === key) partners.add(source);
+      });
+      const teams = (attrs.teams || []).filter((id) => graph.hasNode(String(id)));
+      const members = (attrs.members || []).filter((id) => graph.hasNode(String(id)));
+      return {
+        partners: [...partners].sort(byDeg),
+        teams: [...teams].sort(byDeg),
+        members: [...members].sort(byDeg),
+      };
+    }
+
     const dependsOn = new Set();
     const dependedBy = new Set();
     const interacts = new Set();
@@ -1252,8 +1516,7 @@ function main() {
       else dependedBy.add(s);
     });
 
-    const byInDegree = (a, b) =>
-      (graph.getNodeAttribute(b, "in_degree") || 0) - (graph.getNodeAttribute(a, "in_degree") || 0);
+    const byInDegree = (a, b) => nodeDeg(b) - nodeDeg(a);
 
     return {
       dependsOn: [...dependsOn].sort(byInDegree),
@@ -1285,8 +1548,14 @@ function main() {
     const lines = [];
     lines.push(attrs.name || key);
     if (attrs.name_en) lines.push(attrs.name_en);
-    lines.push("class " + key);
-    lines.push("被依赖 " + attrs.in_degree + " · 依赖 " + attrs.out_degree);
+    lines.push(nodeKindLabel(attrs) + " " + key);
+    if (GRAPH_MODE === "author") {
+      if (attrs.is_team) lines.push("团队 · " + attrs.member_count + " 名成员");
+      else if (attrs.teams && attrs.teams.length) lines.push("参与团队 " + teamNames(attrs.teams));
+      lines.push("合作度 " + (attrs.degree != null ? attrs.degree : 0));
+    } else {
+      lines.push("被依赖 " + attrs.in_degree + " · 依赖 " + attrs.out_degree);
+    }
     lines.push("浏览量 " + formatNum(attrs.views));
     lines.push("收藏 " + formatNum(attrs.favorites));
     if (attrs.category) lines.push("分类 " + attrs.category);
@@ -1294,7 +1563,7 @@ function main() {
     return lines.join("\n");
   }
 
-  const REL_LABELS = { dependsOn: "依赖", dependedBy: "被依赖", interacts: "联动" };
+  const REL_LABELS = { dependsOn: "依赖", dependedBy: "被依赖", interacts: "联动", partners: "合作", teams: "团队", members: "成员" };
 
   function contextItem(key, badgeType) {
     const attrs = graph.getNodeAttributes(key);
@@ -1361,11 +1630,12 @@ function main() {
     if (hops && hops.length) {
       for (const e of hops) if (e != null) highlightEdges.add(e);
     }
-    if (renderer) renderer.refresh();
+    if (renderer) renderer.scheduleRefresh();
   }
 
   function showSixDegreesMenu(source, x, y) {
     const state = { query: "", page: 0, target: null, result: null };
+    const filter = { kind: "all", rel: "all" }; // 作者图二级筛选状态
     contextMenu.innerHTML = "";
 
     const titleEl = document.createElement("div");
@@ -1388,9 +1658,13 @@ function main() {
     searchWrap.className = "ctx-search";
     const input = document.createElement("input");
     input.type = "text";
-    input.placeholder = "搜索目标模组…";
+    input.placeholder = GRAPH_MODE === "author" ? "搜索目标作者…" : "搜索目标模组…";
     searchWrap.appendChild(input);
     contextMenu.appendChild(searchWrap);
+
+    const filterEl = document.createElement("div");
+    filterEl.className = "ctx-filters";
+    contextMenu.appendChild(filterEl);
 
     const listEl = document.createElement("div");
     contextMenu.appendChild(listEl);
@@ -1407,8 +1681,9 @@ function main() {
 
     function renderList() {
       listEl.innerHTML = "";
+      filterEl.innerHTML = "";
       const q = state.query.trim().toLowerCase();
-      let matches = [];
+      let pool = [];
       if (q) {
         const seen = new Set();
         for (const [term, nodes] of searchIndex) {
@@ -1416,15 +1691,41 @@ function main() {
             for (const n of nodes) {
               if (!seen.has(n.key)) {
                 seen.add(n.key);
-                matches.push(n);
+                pool.push(n);
               }
             }
           }
         }
       } else {
-        matches = [...allNodes];
+        pool = [...allNodes];
       }
-      matches.sort((a, b) => (b.views || 0) - (a.views || 0));
+      // 作者图二级筛选（计数来自未筛选池）
+      if (GRAPH_MODE === "author") {
+        filterEl.appendChild(buildFilterBar(
+          {
+            all: pool.length,
+            team: pool.filter((n) => n.is_team).length,
+            author: pool.filter((n) => !n.is_team).length,
+          },
+          [
+            { key: "coop", label: "合作", count: pool.filter((n) => (n.degree || 0) > 0).length },
+            { key: "contains", label: "包含", count: pool.filter((n) => n.is_team).length },
+            { key: "belongs", label: "属于", count: pool.filter((n) => n.teams && n.teams.length).length },
+          ],
+          filter,
+          () => {
+            state.page = 0;
+            state.target = null;
+            detectBtn.disabled = true;
+            renderList();
+            positionMenu(x, y);
+          }
+        ));
+      }
+      let matches = GRAPH_MODE === "author"
+        ? filterNodesByKind(filterNodesByRel(pool, filter.rel), filter.kind)
+        : pool;
+      matches = sortNodes(matches);
 
       const pageSize = 20;
       const pages = Math.max(1, Math.ceil(matches.length / pageSize));
@@ -1436,7 +1737,7 @@ function main() {
         const li = document.createElement("div");
         li.className = "ctx-item" + (state.target === n.key ? " selected" : "");
         li.textContent = n.label + (n.name_en ? " (" + n.name_en + ")" : "");
-        li.title = "class " + n.key;
+        li.title = nodeKindLabel(n) + " " + n.key;
         li.addEventListener("click", (e) => {
           e.stopPropagation();
           state.target = n.key;
@@ -1489,6 +1790,9 @@ function main() {
           if (kind === "interaction") {
             label = "联动";
             cls = "interaction";
+          } else if (kind === "cooperation") {
+            label = "合作";
+            cls = "interaction";
           } else {
             const s = graph.source(hop);
             label = (s === path[i]) ? "依赖" : "被依赖";
@@ -1516,14 +1820,15 @@ function main() {
     }
 
     detectBtn.addEventListener("click", detect);
-    input.addEventListener("input", () => {
+    const onSixInput = debounce(() => {
       state.query = input.value;
       state.page = 0;
       state.target = null;
       detectBtn.disabled = true;
       renderList();
       positionMenu(x, y);
-    });
+    }, 150);
+    input.addEventListener("input", onSixInput);
 
     renderList();
     contextMenu.classList.remove("hidden");
@@ -1535,6 +1840,7 @@ function main() {
     const attrs = graph.getNodeAttributes(node);
     const rel = collectRelations(node);
     const state = { title: attrs.name || node, rel, tab: "all", page: 0, query: "" };
+    const filter = { kind: "all", rel: "all" }; // 作者图二级筛选状态
 
     contextMenu.innerHTML = "";
 
@@ -1558,7 +1864,7 @@ function main() {
     searchWrap.className = "ctx-search";
     const input = document.createElement("input");
     input.type = "text";
-    input.placeholder = "搜索关联模组…";
+    input.placeholder = GRAPH_MODE === "author" ? "搜索…" : "搜索关联模组…";
     searchWrap.appendChild(input);
     contextMenu.appendChild(searchWrap);
 
@@ -1576,6 +1882,29 @@ function main() {
       { key: "interacts", label: "联动" },
     ];
 
+    // 作者图：全部关系的去重并集（第二级"全部"的池 + 第一级计数）
+    const unionKeys = GRAPH_MODE === "author"
+      ? [...new Set([...state.rel.partners, ...state.rel.teams, ...state.rel.members])]
+      : [];
+
+    function kindCounts(keys) {
+      if (GRAPH_MODE !== "author") return { all: 0, team: 0, author: 0 };
+      const team = keys.filter((k) => graph.getNodeAttribute(k, "is_team")).length;
+      return { all: keys.length, team, author: keys.length - team };
+    }
+
+    // 作者图第二级条目：合作恒有；包含仅团队节点；属于仅有上级团队
+    function relItems() {
+      const items = [{ key: "coop", label: "合作", count: state.rel.partners.length }];
+      if (attrs.is_team) {
+        items.push({ key: "contains", label: "包含", count: state.rel.members.length });
+      }
+      if ((attrs.teams || []).length) {
+        items.push({ key: "belongs", label: "属于", count: state.rel.teams.length });
+      }
+      return items;
+    }
+
     function tabCount(key) {
       if (key === "all") {
         return state.rel.dependsOn.length + state.rel.dependedBy.length + state.rel.interacts.length;
@@ -1584,14 +1913,38 @@ function main() {
     }
 
     function activeList() {
+      // 作者模式：第二级关系池 × 第一级类型筛选
+      if (GRAPH_MODE === "author") {
+        let keys;
+        if (filter.rel === "coop") keys = state.rel.partners;
+        else if (filter.rel === "contains") keys = state.rel.members;
+        else if (filter.rel === "belongs") keys = state.rel.teams;
+        else keys = unionKeys;
+        if (filter.kind === "team") keys = keys.filter((k) => graph.getNodeAttribute(k, "is_team"));
+        else if (filter.kind === "author") keys = keys.filter((k) => !graph.getNodeAttribute(k, "is_team"));
+        // 徽章类型：成员 > 团队 > 合作（"全部"池里一个节点可能属多个关系）
+        const items = keys.map((key) => {
+          let type = null;
+          if (filter.rel === "all") {
+            if (state.rel.members.includes(key)) type = "members";
+            else if (state.rel.teams.includes(key)) type = "teams";
+            else type = "partners";
+          } else {
+            type = filter.rel === "coop" ? "partners" : filter.rel;
+          }
+          return { key, type };
+        });
+        items.sort((a, b) => nodeDeg(b.key) - nodeDeg(a.key));
+        return items;
+      }
+
+      // 模组模式：原 tab 逻辑
       const items = [];
       if (state.tab === "all") {
         for (const key of state.rel.dependsOn) items.push({ key, type: "dependsOn" });
         for (const key of state.rel.dependedBy) items.push({ key, type: "dependedBy" });
         for (const key of state.rel.interacts) items.push({ key, type: "interacts" });
-        items.sort((a, b) =>
-          (graph.getNodeAttribute(b.key, "in_degree") || 0) - (graph.getNodeAttribute(a.key, "in_degree") || 0)
-        );
+        items.sort((a, b) => nodeDeg(b.key) - nodeDeg(a.key));
       } else {
         for (const key of state.rel[state.tab]) items.push({ key, type: null });
       }
@@ -1600,6 +1953,16 @@ function main() {
 
     function renderTabs() {
       tabs.innerHTML = "";
+      // 作者模式：二级筛选条（第一级类型 × 第二级关系）
+      if (GRAPH_MODE === "author") {
+        tabs.appendChild(buildFilterBar(kindCounts(unionKeys), relItems(), filter, () => {
+          state.page = 0;
+          renderTabs();
+          renderBody();
+          positionMenu(x, y);
+        }));
+        return;
+      }
       for (const def of TAB_DEFS) {
         const t = document.createElement("button");
         t.className = "ctx-tab" + (state.tab === def.key ? " active" : "");
@@ -1673,7 +2036,10 @@ function main() {
     contextMenu.innerHTML = "";
     const titleEl = document.createElement("div");
     titleEl.className = "ctx-title";
-    titleEl.textContent = "关系";
+    const kind = graph.getEdgeAttribute(edge, "kind");
+    titleEl.textContent = GRAPH_MODE === "author"
+      ? (kind === "membership" ? "成员" : (kind === "cooperation" ? "合作" : "关系"))
+      : "关系";
     contextMenu.appendChild(titleEl);
     const st = document.createElement("div");
     st.className = "ctx-section-title";
@@ -1685,12 +2051,11 @@ function main() {
     positionMenu(x, y);
   }
 
-  function drawEdges(ctx, tx, ty, scale, minImportance) {
+  function drawEdges(ctx, tx, ty, scale) {
+    // 单画布导出（renderSingle）：一次全量遍历，无分块裁剪
     graph.forEachEdge((edge, attrs, source, target, sa, ta) => {
-      // 导出边 LoD：importance 低于阈值的边不画（importance = min 两端被依赖次数）
-      if (minImportance > 0 && (attrs.importance || 0) < minImportance) return;
       const rgb = attrs.rgb || DEPENDENCY_EDGE_RGB;
-      ctx.strokeStyle = rgbaString(rgb, EDGE_ALPHA);
+      ctx.strokeStyle = rgbaString(rgb, attrs.alpha != null ? attrs.alpha : EDGE_ALPHA);
       ctx.lineWidth = Math.max(1, (attrs.size || 0.5) * scale);
       ctx.beginPath();
       ctx.moveTo(tx(sa.x), ty(sa.y));
@@ -1699,9 +2064,23 @@ function main() {
     });
   }
 
+  // 分块导出（renderTiled）的边绘制：只画预筛进本行带的边（像素坐标已算好）
+  function drawEdgesBand(ctx, edges, tileX0, tileY0, tileW) {
+    for (const e of edges) {
+      // 列过滤：bbox 与 tile x 区间无交集则跳过（y 方向已由行带预筛保证覆盖）
+      if (Math.max(e.ax, e.bx) + e.half < tileX0 || Math.min(e.ax, e.bx) - e.half > tileX0 + tileW) continue;
+      ctx.strokeStyle = rgbaString(e.rgb, e.alpha);
+      ctx.lineWidth = e.lineWidth;
+      ctx.beginPath();
+      ctx.moveTo(e.ax - tileX0, e.ay - tileY0);
+      ctx.lineTo(e.bx - tileX0, e.by - tileY0);
+      ctx.stroke();
+    }
+  }
+
   function drawLabel(ctx, cx, cy, r, attrs) {
     const name = attrs.name || attrs.key;
-    const idText = "class " + attrs.key;
+    const idText = nodeKindLabel(attrs) + " " + attrs.key;
     const fontSize = LABEL_FONT_SIZE;
     const lineHeight = fontSize * 1.25;
 
@@ -1793,7 +2172,7 @@ function main() {
     });
   }
 
-  async function renderSingle(W, H, scale, nodePixels, toX, toY, minImportance) {
+  async function renderSingle(W, H, scale, nodePixels, toX, toY) {
     const canvas = document.createElement("canvas");
     canvas.width = W;
     canvas.height = H;
@@ -1801,7 +2180,7 @@ function main() {
     ctx.fillStyle = "#000000";
     ctx.fillRect(0, 0, W, H);
 
-    drawEdges(ctx, toX, toY, scale, minImportance);
+    drawEdges(ctx, toX, toY, scale);
 
     const items = nodePixels.map((n) => ({ attrs: n.attrs, cx: n.px, cy: n.py, r: n.pr }));
     const startTime = Date.now();
@@ -1817,19 +2196,48 @@ function main() {
     return canvasToBlob(canvas);
   }
 
-  async function renderTiled(W, H, scale, nodePixels, toX, toY, minImportance) {
+  async function renderTiled(W, H, scale, nodePixels, toX, toY) {
     const TILE_W = 8192;
-    const TILE_H = 1024;
+    const TILE_H = 256; // 行带高度：内存峰值 = W×TILE_H×4，65536 导出约 67MB（原 1024 → 268MB）
     const cols = Math.ceil(W / TILE_W);
     const rows = Math.ceil(H / TILE_H);
     const totalTiles = cols * rows;
     let renderedTiles = 0;
     const startTime = Date.now();
+    const labelBottom = LABEL_FONT_SIZE * 3.25;
+
+    // 预计算行带 → 节点（含标签纵向延伸），避免每 tile 全量扫描全部节点
+    const bandNodes = Array.from({ length: rows }, () => []);
+    for (const n of nodePixels) {
+      const top = Math.max(0, Math.floor((n.py - n.pr) / TILE_H));
+      const bottom = Math.min(rows - 1, Math.floor((n.py + n.pr + labelBottom) / TILE_H));
+      for (let r = top; r <= bottom; r++) bandNodes[r].push(n);
+    }
+
+    // 预筛边 → 行带（对称 bandNodes）：像素 bbox 归入覆盖的行带。
+    // 避免每 tile 全量遍历全部边（作者图 4.7 万 × 2048 tile ≈ 30 秒 → <1 秒）
+    const bandEdges = Array.from({ length: rows }, () => []);
+    graph.forEachEdge((edge, attrs, source, target, sa, ta) => {
+      const ax = toX(sa.x), ay = toY(sa.y);
+      const bx = toX(ta.x), by = toY(ta.y);
+      const lineWidth = Math.max(1, (attrs.size || 0.5) * scale);
+      const half = lineWidth / 2 + 1;
+      const top = Math.max(0, Math.floor((Math.min(ay, by) - half) / TILE_H));
+      const bottom = Math.min(rows - 1, Math.floor((Math.max(ay, by) + half) / TILE_H));
+      const item = {
+        ax, ay, bx, by, half, lineWidth,
+        rgb: attrs.rgb || DEPENDENCY_EDGE_RGB,
+        alpha: attrs.alpha != null ? attrs.alpha : EDGE_ALPHA,
+      };
+      for (let r = top; r <= bottom; r++) bandEdges[r].push(item);
+    });
 
     async function* getScanlines() {
       for (let r = 0; r < rows; r++) {
         const tileY0 = r * TILE_H;
         const tileH = Math.min(TILE_H, H - tileY0);
+        const band = bandNodes[r];
+        const bandE = bandEdges[r];
 
         // 渲染这一“行”的所有列块，并保留像素数据
         const colData = [];
@@ -1844,19 +2252,14 @@ function main() {
           ctx.fillStyle = "#000000";
           ctx.fillRect(0, 0, tileW, tileH);
 
-          const tx = (x) => toX(x) - tileX0;
-          const ty = (y) => toY(y) - tileY0;
-          drawEdges(ctx, tx, ty, scale, minImportance);
+          drawEdgesBand(ctx, bandE, tileX0, tileY0, tileW);
 
           const items = [];
-          for (const n of nodePixels) {
-            // 标签从节点底部向下延伸（两行文字 + 内边距 + 间距），
-            // 横向用保守余量覆盖长名称与 "class 12345"，
-            // 确保标签跨越的 tile 都包含该节点，拼图后标签不被截断。
-            const labelBottom = LABEL_FONT_SIZE * 3.25;
+          for (const n of band) {
+            // 标签从节点底部向下延伸（两行文字 + 内边距 + 间距），横向用保守余量
+            // 覆盖长名称，确保标签跨越的 tile 都包含该节点，拼图后标签不被截断。
             const labelHalf = Math.max(n.pr, LABEL_FONT_SIZE * 16);
-            if (n.px + labelHalf >= tileX0 && n.px - labelHalf <= tileX0 + tileW &&
-                n.py + n.pr + labelBottom >= tileY0 && n.py - n.pr <= tileY0 + tileH) {
+            if (n.px + labelHalf >= tileX0 && n.px - labelHalf <= tileX0 + tileW) {
               items.push({ attrs: n.attrs, cx: n.px - tileX0, cy: n.py - tileY0, r: n.pr });
             }
           }
@@ -1896,8 +2299,9 @@ function main() {
   async function exportPNG() {
     if (!graph) return;
 
-    const W = parseInt(exportWidth.value, 10) || 65536;
-    const H = parseInt(exportHeight.value, 10) || 65536;
+    // 下限 64 防非法输入崩溃（负值/过小）；上限不封——允许用户导出任意大图
+    const W = Math.max(64, parseInt(exportWidth.value, 10) || 65536);
+    const H = Math.max(64, parseInt(exportHeight.value, 10) || 65536);
 
     exportButton.disabled = true;
     exportButton.textContent = "导出中…";
@@ -1931,11 +2335,9 @@ function main() {
       }));
 
       const SINGLE_MAX = 16384;
-      // 导出边 LoD 阈值：与屏幕边 LoD 100% 缩到底的骨干阈值一致（LOD_MAX_THRESHOLD × 强度）
-      const minImportance = Math.round(LOD_MAX_THRESHOLD * ((Number(exportLodSlider.value) || 0) / 100));
       const blob = (W < SINGLE_MAX && H < SINGLE_MAX)
-        ? await renderSingle(W, H, scale, nodePixels, toX, toY, minImportance)
-        : await renderTiled(W, H, scale, nodePixels, toX, toY, minImportance);
+        ? await renderSingle(W, H, scale, nodePixels, toX, toY)
+        : await renderTiled(W, H, scale, nodePixels, toX, toY);
 
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -1956,6 +2358,7 @@ function main() {
       }
     }
   }
+
 
   boot().catch((err) => {
     statusText.textContent = "出错了：" + err.message;

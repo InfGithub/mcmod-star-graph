@@ -108,9 +108,14 @@ class Handler(SimpleHTTPRequestHandler):
         if not self._is_allowed(url):
             self.send_error(403, "host not allowed")
             return
+        # 真实浏览器 UA（前端传 navigator.userAgent）：版本/平台永远真实，
+        # 避免固定 UA 版本号过时被 WAF 识别为伪造；非法或缺省回退默认 UA
+        ua = qs.get("ua", [""])[0]
+        if not ua or len(ua) > 512 or "\r" in ua or "\n" in ua:
+            ua = USER_AGENT
         # 按 COVER_SIZE 构造缩略图（@170x115.jpg → @300x300.jpg；无后缀的老封面原样转发）
         url = re.sub(r"@\d+x\d+\.jpg$", "@{}x{}.jpg".format(COVER_SIZE, COVER_SIZE), url)
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Referer": REFERER})
+        req = urllib.request.Request(url, headers={"User-Agent": ua, "Referer": REFERER})
         try:
             with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
                 data = resp.read()

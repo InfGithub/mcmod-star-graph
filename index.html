@@ -23,20 +23,6 @@
       <button id="panel-toggle" title="收起侧边栏">«</button>
     </div>
     <div class="panel-body">
-      <div class="lod-control">
-        <div class="lod-header">
-          <span class="lod-label">节点 LoD 强度</span>
-          <span class="lod-value" id="lod-value">100%</span>
-        </div>
-        <input type="range" id="lod-slider" min="0" max="100" step="1" value="100">
-      </div>
-      <div class="lod-control">
-        <div class="lod-header">
-          <span class="lod-label">边 LoD 强度</span>
-          <span class="lod-value" id="edge-lod-value">100%</span>
-        </div>
-        <input type="range" id="edge-lod-slider" min="0" max="100" step="1" value="100">
-      </div>
       <div class="controls">
         <label><input type="checkbox" id="edge-dependency" checked> 依赖</label>
         <label><input type="checkbox" id="edge-interaction" checked> 联动</label>
@@ -44,6 +30,7 @@
       </div>
       <div class="search">
         <input type="text" id="search-input" placeholder="搜索模组名…" autocomplete="off">
+        <div id="search-filters"></div>
         <div id="search-results" class="hidden">
           <ul id="search-list"></ul>
           <div id="search-pagination"></div>
@@ -51,13 +38,6 @@
       </div>
       <div class="export-control">
         <div class="export-label">导出 PNG</div>
-        <div class="lod-control">
-          <div class="lod-header">
-            <span class="lod-label">导出边 LoD 强度</span>
-            <span class="lod-value" id="export-lod-value">0%</span>
-          </div>
-          <input type="range" id="export-lod-slider" min="0" max="100" step="1" value="0">
-        </div>
         <div class="export-row">
           <input type="number" id="export-width" value="65536" min="64" step="64">
           <span class="export-x">×</span>
