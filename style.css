@@ -63,12 +63,14 @@ html, body {
   font-size: 16px;
   background: var(--status-bg);
   z-index: 30;
-  pointer-events: none;
+  /* 预热封面纹理期间拦截交互，避免 atlas 批处理卡顿被操作感知 */
+  pointer-events: auto;
   transition: opacity 0.5s ease;
 }
 
 #status.fade-out {
   opacity: 0;
+  pointer-events: none;
 }
 
 .status-box {
@@ -176,6 +178,7 @@ html, body {
 
 #panel.collapsed .panel-title,
 #panel.collapsed .panel-body,
+#panel.collapsed .panel-meta,
 #panel.collapsed .panel-footer {
   display: none;
 }
@@ -343,6 +346,16 @@ html, body {
   border-color: var(--accent);
 }
 
+.export-opt {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
 .export-x {
   color: var(--text-secondary);
 }
@@ -381,6 +394,43 @@ html, body {
 
 .export-warning.hidden {
   display: none;
+}
+
+/* ==================== 图元数据 ==================== */
+
+.panel-meta {
+  flex: none;
+  margin-top: 12px;
+  padding: 8px 2px 0;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+}
+
+.meta-title {
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.meta-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  line-height: 1.5;
+}
+
+.meta-row span {
+  color: var(--text-muted);
+  flex: none;
+}
+
+.meta-row b {
+  font-weight: normal;
+  color: var(--text-secondary);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ==================== 侧边栏页脚 ==================== */
@@ -433,8 +483,28 @@ html, body {
   overflow-wrap: break-word;
 }
 
+/* 富文本简介适配（mcmod 作者简介为原始 HTML） */
+.tt-desc p {
+  margin: 0 0 4px;
+}
+.tt-desc p:last-child {
+  margin-bottom: 0;
+}
+.tt-desc img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+}
+.tt-desc a {
+  color: var(--accent);
+}
+
 .tt-meta {
   color: var(--text-muted);
+}
+
+.tt-meta.team {
+  color: #ff6347;
 }
 
 .tt-stats {
@@ -648,13 +718,52 @@ html, body {
 .ctx-badge.dependsOn { color: var(--edge-dependency); }
 .ctx-badge.dependedBy { color: var(--edge-dependedby); }
 .ctx-badge.interacts { color: var(--edge-interaction); }
+.ctx-badge.teams { color: #ff6347; }
+.ctx-badge.members { color: #90ee90; }
 
 .ctx-empty {
   padding: 2px 8px 4px;
   color: var(--text-secondary);
 }
 
-/* ==================== 封面下载 modal ==================== */
+/* ==================== 二级筛选条（作者图：第一级类型 × 第二级关系） ==================== */
+
+.filter-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.filter-btn {
+  font-size: 11px;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.filter-btn:hover:not(.active) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.filter-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
 
 .cover-modal {
   position: fixed;
@@ -712,6 +821,23 @@ html, body {
   line-height: 1.6;
   margin-bottom: 14px;
   overflow-wrap: break-word;
+}
+
+/* 高并发下载警告（下载前醒目提示） */
+.cover-warn {
+  font-size: 12px;
+  line-height: 1.6;
+  margin-bottom: 14px;
+  padding: 8px 10px;
+  border: 1px solid var(--warning-border);
+  border-radius: 4px;
+  background: var(--warning-bg);
+  color: var(--warning);
+  overflow-wrap: break-word;
+}
+
+.cover-warn.hidden {
+  display: none;
 }
 
 .cover-progress {

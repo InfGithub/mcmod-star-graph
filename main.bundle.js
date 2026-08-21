@@ -7985,16 +7985,26 @@ var NodePictogramProgram = createNodeImageProgram({
 });
 
 // main.js
-var FadingNodeImageProgram = class extends NodeImageProgram {
-  getDefinition() {
-    const def = super.getDefinition();
-    def.FRAGMENT_SHADER_SOURCE = def.FRAGMENT_SHADER_SOURCE.replace("max(texel.a, v_color.a)", "v_color.a").replace(
-      "  #endif\n\n  // Crop in a circle when u_keepWithinCircle is truthy:",
-      "  color.rgb *= v_color.a;\n  #endif\n\n  // Crop in a circle when u_keepWithinCircle is truthy:"
-    );
-    return def;
+function makeFadingImageProgram(textureSize) {
+  class FadingImageProgram extends createNodeImageProgram({
+    size: { mode: "max", value: textureSize }
+  }) {
+    getDefinition() {
+      const def = super.getDefinition();
+      def.FRAGMENT_SHADER_SOURCE = def.FRAGMENT_SHADER_SOURCE.replace(
+        "color = vec4(mix(v_color, texel, texel.a).rgb, max(texel.a, v_color.a));",
+        "color = vec4(texel.rgb * texel.a, texel.a * v_color.a);"
+      ).replace(
+        "  #endif\n\n  // Crop in a circle when u_keepWithinCircle is truthy:",
+        "  color.rgb *= v_color.a;\n  #endif\n\n  // Crop in a circle when u_keepWithinCircle is truthy:"
+      );
+      return def;
+    }
   }
-};
+  return FadingImageProgram;
+}
+var FadingNodeImageProgram = makeFadingImageProgram(96);
+var FadingNodeImageProgramHi = makeFadingImageProgram(300);
 function drawNodeLabel(context, data, settings) {
   if (!data.label) return;
   const lines = String(data.label).split("\n");
@@ -8026,7 +8036,6 @@ function drawNodeLabel(context, data, settings) {
   }
 }
 var GRAPH_URL = "graph.json";
-var LOCAL_SERVER_ORIGINS = ["http://127.0.0.1:1119", "http://localhost:1119"];
 var PALETTE = [
   "#e6194b",
   "#3cb44b",
@@ -8051,41 +8060,133 @@ var PALETTE = [
 ];
 var EXTERNAL_COLOR = "#9e9e9e";
 var ISOLATED_COLOR = "#d6d6d6";
-var EDGE_ALPHA = 0.3;
+var EDGE_ALPHA = 0.16;
 var DEPENDENCY_EDGE_RGB = [255, 182, 193];
 var INTERACTION_EDGE_RGB = [173, 216, 230];
+var TEAM_TEAM_EDGE_RGB = [144, 238, 144];
+var TEAM_MIXED_EDGE_RGB = [255, 99, 71];
+var INDIVIDUAL_EDGE_RGB = [173, 216, 230];
+var MEMBER_EDGE_RGB = [180, 255, 180];
+var MEMBER_EDGE_ALPHA = 0.1;
+var MEMBER_EDGE_SIZE = 0.8;
+var MEMBER_SIZE_WEIGHT = 50;
 function premulRgba(rgb, alpha) {
   return "rgba(" + Math.round(rgb[0] * alpha) + "," + Math.round(rgb[1] * alpha) + "," + Math.round(rgb[2] * alpha) + "," + alpha.toFixed(4) + ")";
 }
-var DEPENDENCY_EDGE_COLOR = premulRgba(DEPENDENCY_EDGE_RGB, EDGE_ALPHA);
-var INTERACTION_EDGE_COLOR = premulRgba(INTERACTION_EDGE_RGB, EDGE_ALPHA);
 function rgbaString(rgb, alpha) {
   return "rgba(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + "," + alpha + ")";
 }
-var LOD_MAX_THRESHOLD = 50;
-var LOD_FULL_ZOOM_RATIO = 0.05;
 var LOD_THROTTLE_MS = 33;
-var NODE_LOD_MIN_VISIBLE = 300;
-var NODE_LOD_ENABLED = true;
 var NODE_DIAMETER_SCREEN_RATIO = 0.1;
 var LABEL_FONT_SIZE = 14;
+var EXPORT_TILE = 512;
+var MIN_LEVEL_SIZE = 1024;
 var HIGHLIGHT_NODE_COLOR = "#ffd700";
 var HIGHLIGHT_EDGE_RGB = [255, 215, 0];
 var HIGHLIGHT_EDGE_COLOR = premulRgba(HIGHLIGHT_EDGE_RGB, 1);
-var COVER_MANIFEST_URL = "covers/manifest.json";
-var COVER_SMALL_MANIFEST_URL = "covers/small-manifest.json";
-var COVER_LOAD_CONCURRENCY = 24;
-var COVER_LOAD_RETRIES = 2;
-var COVER_NETWORK_INTERVAL_MS = 150;
-function communityColor(community, type) {
+var COVER_DB_NAME = "mcmod-graph-covers";
+var COVER_STORE = "covers";
+var COVER_CONCURRENCY = 6;
+var COVER_INTERVAL_MS = 20;
+var COVER_RETRIES = 2;
+var COVER_PROXY = "/cover_proxy?url=";
+var COVER_SIZE = 300;
+var COVER_HI_RES_THRESHOLD = 20;
+var GRAPH_MODE = "mod";
+function communityColor(community, type, teamCommunity) {
   if (type === "external") return EXTERNAL_COLOR;
   if (community < 0) return ISOLATED_COLOR;
-  return PALETTE[community % PALETTE.length];
+  const base = PALETTE[community % PALETTE.length];
+  if (teamCommunity == null || teamCommunity < 0) return base;
+  const c = teamCommunity;
+  const dr = (c * 13 % 7 + 7) % 7 - 3;
+  const dg = (c * 29 % 7 + 7) % 7 - 3;
+  const db = (c * 47 % 7 + 7) % 7 - 3;
+  const cl = (v) => Math.max(0, Math.min(255, v));
+  const r = cl(parseInt(base.slice(1, 3), 16) + dr * 20);
+  const g = cl(parseInt(base.slice(3, 5), 16) + dg * 20);
+  const b = cl(parseInt(base.slice(5, 7), 16) + db * 20);
+  return "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
 }
-function nodeSize(inDegree, type) {
-  const d = Math.max(0, inDegree || 0);
+function nodeSize(inDegree, type, isTeam, memberCount) {
+  const d = Math.max(0, inDegree || 0) + (isTeam ? MEMBER_SIZE_WEIGHT * (memberCount || 0) : 0);
   const s = 2 + Math.sqrt(d);
-  return type === "external" ? Math.min(s, 10) : Math.min(s, 48);
+  return isTeam ? s * 1.618 : s;
+}
+function nodeKindLabel(node) {
+  if (GRAPH_MODE !== "author") return "class";
+  return node && node.is_team ? "\u56E2\u961F" : "\u4F5C\u8005";
+}
+var KIND_FILTERS = [
+  { key: "all", label: "\u5168\u90E8" },
+  { key: "team", label: "\u56E2\u961F" },
+  { key: "author", label: "\u666E\u901A\u4F5C\u8005" }
+];
+function filterNodesByKind(nodes, kind) {
+  if (kind === "team") return nodes.filter((n) => n.is_team);
+  if (kind === "author") return nodes.filter((n) => !n.is_team);
+  return nodes;
+}
+function filterNodesByRel(nodes, rel) {
+  if (rel === "contains") return nodes.filter((n) => n.is_team);
+  if (rel === "belongs") return nodes.filter((n) => n.teams && n.teams.length);
+  if (rel === "coop") return nodes.filter((n) => (n.degree || 0) > 0);
+  return nodes;
+}
+function buildFilterBar(kindCounts, relItems, state, onChange) {
+  const bar = document.createElement("div");
+  bar.className = "filter-bar";
+  const row1 = document.createElement("div");
+  row1.className = "filter-row";
+  for (const f of KIND_FILTERS) {
+    const c = kindCounts[f.key] || 0;
+    if (c <= 0) continue;
+    const b = document.createElement("button");
+    b.className = "filter-btn" + (state.kind === f.key ? " active" : "");
+    b.textContent = f.label + (f.key === "all" ? "" : " " + c);
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.kind = f.key;
+      onChange();
+    });
+    row1.appendChild(b);
+  }
+  bar.appendChild(row1);
+  const row2 = document.createElement("div");
+  row2.className = "filter-row";
+  const allBtn = document.createElement("button");
+  allBtn.className = "filter-btn" + (state.rel === "all" ? " active" : "");
+  allBtn.textContent = "\u5168\u90E8";
+  allBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    state.rel = "all";
+    onChange();
+  });
+  row2.appendChild(allBtn);
+  for (const item of relItems) {
+    if (!item.count) continue;
+    const b = document.createElement("button");
+    b.className = "filter-btn" + (state.rel === item.key ? " active" : "");
+    b.textContent = item.label + " " + item.count;
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.rel = item.key;
+      onChange();
+    });
+    row2.appendChild(b);
+  }
+  bar.appendChild(row2);
+  return bar;
+}
+function sortNodes(nodes) {
+  if (GRAPH_MODE === "author") {
+    return nodes.sort((a, b) => (b.degree || 0) - (a.degree || 0) || (b.views || 0) - (a.views || 0));
+  }
+  return nodes.sort((a, b) => (b.views || 0) - (a.views || 0));
+}
+function edgeSizeFor(weight) {
+  const w = Math.max(1, weight || 1);
+  return Math.min(0.5 + Math.log2(w) * 0.35, 3);
 }
 function formatNum(n) {
   if (n >= 1e4) return (n / 1e4).toFixed(1) + "\u4E07";
@@ -8098,409 +8199,491 @@ function formatDuration(ms) {
   const r = s % 60;
   return m + "m" + r + "s";
 }
-function edgeColorFor(rgb, alpha) {
-  return premulRgba(rgb, EDGE_ALPHA * alpha);
-}
-function hexToRgba(hex, alpha, premul) {
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  const rr = premul ? Math.round(r * alpha) : r;
-  const gg = premul ? Math.round(g * alpha) : g;
-  const bb = premul ? Math.round(b * alpha) : b;
-  return "rgba(" + rr + "," + gg + "," + bb + "," + alpha.toFixed(4) + ")";
-}
-async function loadGraph(source = null) {
-  const url = source ? `${source.base}/graph.json` : GRAPH_URL;
-  const res = await fetch(url, { cache: "no-store" });
+async function loadGraph(onProgress) {
+  const res = await fetch(GRAPH_URL);
   if (!res.ok) throw new Error("\u52A0\u8F7D graph.json \u5931\u8D25: " + res.status);
-  return res.json();
-}
-function normalizeCoverUrl(value) {
-  let url = String(value || "").trim();
-  if (url.startsWith("//")) url = "https:" + url;
-  return url;
-}
-async function loadExistingLocalCovers(source) {
-  try {
-    const res = await fetch(`${source.base}/cover_download/existing`, { mode: "cors", cache: "no-store" });
-    if (!res.ok) throw new Error(`existing covers: ${res.status}`);
-    const data = await res.json();
-    const keys = Array.isArray(data.keys) ? data.keys.map(String) : [];
-    const map = new Map(keys.map((key) => [key, {
-      thumb: `${source.base}/covers/${key}.jpg`,
-      orig: `${source.base}/covers/${key}.jpg`
-    }]));
-    return { count: keys.length, keys, map };
-  } catch {
-    const map = await loadCoverManifest(source.base);
-    return { count: map.size, keys: [...map.keys()], map };
+  const total = Number(res.headers.get("Content-Length")) || 0;
+  const reader = res.body.getReader();
+  const chunks = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (onProgress && total) onProgress(received, total);
   }
-}
-function buildLocalCoverMap(data, source, existingKeys = /* @__PURE__ */ new Set()) {
-  const map = /* @__PURE__ */ new Map();
-  for (const node of data.nodes || []) {
-    if (node.type !== "core" || !node.cover_url) continue;
-    const key = String(node.key);
-    const url = normalizeCoverUrl(node.cover_url);
-    const proxy = `${source.base}/cover_proxy?key=${encodeURIComponent(key)}&url=${encodeURIComponent(url)}`;
-    map.set(key, { thumb: proxy, orig: proxy, local: existingKeys.has(key) });
+  let text;
+  if (chunks.length === 1) {
+    text = new TextDecoder("utf-8").decode(chunks[0]);
+  } else {
+    const buf = new Uint8Array(received);
+    let off = 0;
+    for (const c of chunks) {
+      buf.set(c, off);
+      off += c.length;
+    }
+    text = new TextDecoder("utf-8").decode(buf);
   }
-  return map;
+  return JSON.parse(text);
 }
-var UPSTREAM_COVER_DB = "mcmod-graph-covers";
-var UPSTREAM_COVER_STORE = "covers";
-var UPSTREAM_COVER_CONCURRENCY = 20;
-var UPSTREAM_COVER_INTERVAL_MS = 200;
-var UPSTREAM_COVER_RETRIES = 2;
-function openUpstreamCoverDB() {
+function renderMetaPanel(meta) {
+  const el = document.getElementById("panel-meta");
+  if (!el || !meta) return;
+  const w = meta.weights || {};
+  const rows = GRAPH_MODE === "author" ? [
+    ["\u8282\u70B9", meta.node_count],
+    ["\u666E\u901A\u4F5C\u8005", meta.author_count],
+    ["\u56E2\u961F", meta.team_count],
+    ["\u5408\u4F5C\u8FB9", meta.cooperation_edges],
+    ["\u6210\u5458\u8FB9", meta.membership_edges],
+    ["\u793E\u533A", meta.community_count],
+    ["\u8FDE\u901A\u5206\u91CF", meta.component_count],
+    ["\u751F\u6210\u65F6\u95F4", meta.generated_at],
+    ["\u5E03\u5C40", meta.layout],
+    ["\u6570\u636E\u6E90", meta.source_db]
+  ] : [
+    ["\u7248\u672C", meta.mc_version],
+    ["\u52A0\u8F7D\u5668", meta.api],
+    ["\u8282\u70B9", meta.node_count],
+    ["\u4F9D\u8D56\u8FB9", meta.dependency_edges],
+    ["\u8054\u52A8\u8FB9", meta.interaction_edges],
+    ["\u793E\u533A", meta.community_count],
+    ["\u8FDE\u901A\u5206\u91CF", meta.component_count],
+    ["\u751F\u6210\u65F6\u95F4", meta.generated_at],
+    ["\u5E03\u5C40", meta.layout],
+    ["\u4F9D\u8D56\u6743\u91CD", w.dependency],
+    ["\u8054\u52A8\u6743\u91CD", w.interaction],
+    ["\u6570\u636E\u6E90", meta.source_db]
+  ];
+  const html = '<div class="meta-title">\u56FE\u5143\u6570\u636E</div>' + rows.map((row) => '<div class="meta-row"><span>' + row[0] + "</span><b>" + String(row[1]) + "</b></div>").join("");
+  el.innerHTML = html;
+}
+var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function debounce(fn, ms) {
+  let timer = null;
+  const wrapped = (...args) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      fn(...args);
+    }, ms);
+  };
+  wrapped.flush = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+      fn();
+    }
+  };
+  return wrapped;
+}
+function openCoverDB() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(UPSTREAM_COVER_DB, 1);
-    request.onupgradeneeded = () => {
-      if (!request.result.objectStoreNames.contains(UPSTREAM_COVER_STORE)) {
-        request.result.createObjectStore(UPSTREAM_COVER_STORE);
+    const req = indexedDB.open(COVER_DB_NAME, 3);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(COVER_STORE)) {
+        db.createObjectStore(COVER_STORE);
+        return;
       }
+      const store = req.transaction.objectStore(COVER_STORE);
+      if (req.oldVersion < 2) {
+        store.clear();
+        return;
+      }
+      const cursorReq = store.openCursor();
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        if (!cursor) return;
+        const url = cursor.value && cursor.value.url ? normalizeCoverUrl(cursor.value.url) : null;
+        if (url) store.put({ blob: cursor.value.blob }, url);
+        cursor.delete();
+        cursor.continue();
+      };
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
   });
 }
-function upstreamCoverGet(db, key) {
+function idbPut(db, key, value) {
   return new Promise((resolve, reject) => {
-    const request = db.transaction(UPSTREAM_COVER_STORE, "readonly").objectStore(UPSTREAM_COVER_STORE).get(key);
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    const req = db.transaction(COVER_STORE, "readwrite").objectStore(COVER_STORE).put(value, key);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
   });
 }
-function upstreamCoverPut(db, key, blob) {
+function idbClear(db) {
   return new Promise((resolve, reject) => {
-    const request = db.transaction(UPSTREAM_COVER_STORE, "readwrite").objectStore(UPSTREAM_COVER_STORE).put(blob, key);
-    request.onsuccess = resolve;
-    request.onerror = () => reject(request.error);
-  });
-}
-function upstreamCoverClear(db) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(UPSTREAM_COVER_STORE, "readwrite");
-    tx.objectStore(UPSTREAM_COVER_STORE).clear();
-    tx.oncomplete = resolve;
+    const tx = db.transaction(COVER_STORE, "readwrite");
+    tx.objectStore(COVER_STORE).clear();
+    tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
 }
-async function loadUpstreamCachedCovers(db, items) {
-  const map = /* @__PURE__ */ new Map();
-  for (const item of items) {
-    const blob = await upstreamCoverGet(db, item.key).catch(() => null);
-    if (blob) map.set(String(item.key), URL.createObjectURL(blob));
-  }
-  return map;
+function normalizeCoverUrl(url) {
+  if (!url) return null;
+  let u = String(url).trim();
+  if (u.startsWith("//")) u = "https:" + u;
+  return u.replace(/@\d+x\d+\.jpg$/, "@" + COVER_SIZE + "x" + COVER_SIZE + ".jpg");
 }
-async function downloadUpstreamCovers(db, items, onProgress) {
-  let cursor = 0;
+async function loadAllCovers(db, wantUrls, onProgress) {
+  const blobUrls = /* @__PURE__ */ new Map();
+  const staleKeys = [];
+  const want = new Set(wantUrls.map(String));
+  const tx = db.transaction(COVER_STORE, "readonly");
+  const store = tx.objectStore(COVER_STORE);
+  const req = store.openCursor();
+  let visited = 0;
+  req.onsuccess = () => {
+    const cursor = req.result;
+    if (!cursor) return;
+    visited++;
+    if (want.has(String(cursor.key))) {
+      const entry = cursor.value;
+      if (entry && entry.blob) blobUrls.set(String(cursor.key), URL.createObjectURL(entry.blob));
+    }
+    if (onProgress && visited % 500 === 0) onProgress(visited, wantUrls.length);
+    cursor.continue();
+  };
+  await new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  if (onProgress) onProgress(wantUrls.length, wantUrls.length);
+  for (const u of want) {
+    if (!blobUrls.has(u)) staleKeys.push(u);
+  }
+  return { blobUrls, staleKeys };
+}
+async function downloadCovers(db, items, onProgress) {
+  let idx = 0;
   let done = 0;
   let failed = 0;
-  const failedItems = [];
+  const failedKeys = [];
+  const errors = [];
+  const blobUrls = /* @__PURE__ */ new Map();
   async function worker() {
-    while (cursor < items.length) {
-      const item = items[cursor++];
+    while (idx < items.length) {
+      const i = idx++;
+      const item = items[i];
       let ok = false;
-      for (let attempt = 0; attempt <= UPSTREAM_COVER_RETRIES && !ok; attempt++) {
+      let lastErr = "";
+      for (let attempt = 0; attempt <= COVER_RETRIES && !ok; attempt++) {
         try {
-          const response = await fetch(`${item.proxyBase}/cover_proxy?url=${encodeURIComponent(item.url)}`, { cache: "no-store" });
-          if (!response.ok) throw new Error(`HTTP ${response.status}`);
-          await upstreamCoverPut(db, item.key, await response.blob());
+          const resp = await fetch(COVER_PROXY + encodeURIComponent(item.url) + "&ua=" + encodeURIComponent(navigator.userAgent));
+          if (!resp.ok) throw new Error("HTTP " + resp.status);
+          const blob = await resp.blob();
+          await idbPut(db, item.url, { blob });
+          blobUrls.set(item.url, URL.createObjectURL(blob));
           ok = true;
-        } catch {
-          if (attempt < UPSTREAM_COVER_RETRIES) await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+        } catch (e) {
+          lastErr = String(e && e.message || e);
+          if (!ok && attempt < COVER_RETRIES) {
+            await sleep(300 * (attempt + 1));
+          }
         }
       }
       if (!ok) {
-        failed += 1;
-        failedItems.push(item);
+        failed++;
+        failedKeys.push(item.url);
+        errors.push({ url: item.url, error: lastErr });
+        console.error("[\u9519\u8BEF] \u5C01\u9762\u4E0B\u8F7D\u5931\u8D25", item.url, lastErr);
       }
-      done += 1;
+      done++;
       if (onProgress) onProgress(done, items.length, failed);
-      await new Promise((resolve) => setTimeout(resolve, UPSTREAM_COVER_INTERVAL_MS));
+      await sleep(COVER_INTERVAL_MS);
     }
   }
-  await Promise.all(Array.from({ length: Math.min(UPSTREAM_COVER_CONCURRENCY, Math.max(1, items.length)) }, worker));
-  return { failed, failedItems };
+  const workers = [];
+  for (let w = 0; w < COVER_CONCURRENCY; w++) workers.push(worker());
+  await Promise.all(workers);
+  return { failed, failedKeys, errors, blobUrls };
 }
-function showUpstreamCoverModal(db, items, cachedMap) {
+function showCoverModal(db, downloadItems, existingBlobUrls, onGlobalProgress) {
   return new Promise((resolve) => {
     const modal = document.createElement("div");
     modal.className = "cover-modal";
-    modal.innerHTML = `
-      <div class="cover-box" role="dialog" aria-modal="true">
-        <div class="cover-head"><span class="cover-title"></span><button class="cover-close" type="button">\xD7</button></div>
-        <div class="cover-desc"></div>
-        <div class="cover-progress hidden"><div class="cover-track"><div class="cover-fill"></div></div><div class="cover-label"></div></div>
-        <div class="cover-actions"><button class="cover-btn primary" type="button"></button><button class="cover-btn ghost hidden" type="button"></button></div>
-      </div>`;
+    modal.innerHTML = '<div class="cover-box">  <div class="cover-head">    <span class="cover-title"></span>    <button class="cover-close" title="\u62D2\u7EDD\u4E0B\u8F7D">\xD7</button>  </div>  <div class="cover-desc"></div>  <div class="cover-warn hidden"></div>  <div class="cover-progress hidden">    <div class="cover-track"><div class="cover-fill"></div></div>    <div class="cover-label"></div>  </div>  <div class="cover-actions">    <button class="cover-btn primary"></button>    <button class="cover-btn ghost hidden"></button>  </div></div>';
     document.body.appendChild(modal);
-    const title = modal.querySelector(".cover-title");
-    const desc = modal.querySelector(".cover-desc");
-    const progress = modal.querySelector(".cover-progress");
-    const fill = modal.querySelector(".cover-fill");
-    const label = modal.querySelector(".cover-label");
-    const primary = modal.querySelector(".cover-btn.primary");
-    const retry = modal.querySelector(".cover-btn.ghost");
-    const close = modal.querySelector(".cover-close");
-    const pending = items.filter((item) => !cachedMap.has(String(item.key)));
-    let failedItems = [];
+    const titleEl = modal.querySelector(".cover-title");
+    const descEl = modal.querySelector(".cover-desc");
+    const warnEl = modal.querySelector(".cover-warn");
+    const closeEl = modal.querySelector(".cover-close");
+    const progressEl = modal.querySelector(".cover-progress");
+    const fillEl = modal.querySelector(".cover-fill");
+    const labelEl = modal.querySelector(".cover-label");
+    const primaryBtn = modal.querySelector(".cover-btn.primary");
+    const ghostBtn = modal.querySelector(".cover-btn.ghost");
     let state = "confirm";
-    const finish = () => {
-      modal.remove();
-      resolve(cachedMap);
-    };
-    const render = () => {
-      progress.classList.toggle("hidden", state !== "downloading");
-      retry.classList.toggle("hidden", state !== "failed");
-      close.classList.toggle("hidden", state !== "confirm");
+    let pending = downloadItems.slice();
+    let doneCount = 0;
+    const accumulated = new Map(existingBlobUrls);
+    let failedCount = 0;
+    let failedKeys = [];
+    let failErrors = [];
+    let elapsedStart = 0;
+    function showState() {
+      closeEl.classList.toggle("hidden", state !== "confirm");
+      progressEl.classList.toggle("hidden", state !== "downloading");
+      ghostBtn.classList.toggle("hidden", state !== "failed");
       if (state === "confirm") {
-        title.textContent = "\u4E0B\u8F7D\u5C01\u9762";
-        desc.textContent = `\u4E0A\u6E38\u6A21\u5F0F\u9700\u8981\u7F13\u5B58 ${pending.length} \u5F20\u5C01\u9762\u5230\u6D4F\u89C8\u5668 IndexedDB\u3002`;
-        primary.textContent = "\u786E\u5B9A\u4E0B\u8F7D";
+        titleEl.textContent = "\u4E0B\u8F7D\u5C01\u9762";
+        descEl.textContent = GRAPH_MODE === "author" ? "\u672C\u56FE\u9700\u8981\u4E0B\u8F7D " + downloadItems.length + " \u4F4D\u4F5C\u8005\u7684\u5934\u50CF\u624D\u80FD\u6B63\u5E38\u4F7F\u7528\u3002\u5934\u50CF\u5C06\u7F13\u5B58\u5230\u6D4F\u89C8\u5668\u672C\u5730\uFF0C\u4E0B\u6B21\u6253\u5F00\u65E0\u9700\u91CD\u590D\u4E0B\u8F7D\u3002" : "\u672C\u56FE\u9700\u8981\u4E0B\u8F7D " + downloadItems.length + " \u5F20\u6A21\u7EC4\u5C01\u9762\u624D\u80FD\u6B63\u5E38\u4F7F\u7528\u3002\u5C01\u9762\u5C06\u7F13\u5B58\u5230\u6D4F\u89C8\u5668\u672C\u5730\uFF0C\u4E0B\u6B21\u6253\u5F00\u65E0\u9700\u91CD\u590D\u4E0B\u8F7D\u3002";
+        warnEl.textContent = "\u8B66\u544A\uFF1A\u5C06\u4EE5 " + COVER_CONCURRENCY + " \u5E76\u53D1\u91CF\u4E0B\u8F7D " + downloadItems.length + " \u5F20\u5C01\u9762\u3002\u9AD8\u9891\u8BF7\u6C42\u53EF\u80FD\u89E6\u53D1 mcmod \u98CE\u63A7\uFF0C\u5E76\u5360\u7528\u7F51\u7EDC\u8D44\u6E90\u3002\u70B9\u51FB\u201C\u786E\u5B9A\u4E0B\u8F7D\u201D\u5373\u89C6\u4E3A\u5DF2\u77E5\u6089\u5E76\u63A5\u53D7\u98CE\u9669\uFF0C\u540E\u679C\u81EA\u8D1F\u3002";
+        warnEl.classList.remove("hidden");
+        primaryBtn.textContent = "\u786E\u5B9A\u4E0B\u8F7D";
+        primaryBtn.classList.remove("hidden");
+      } else {
+        warnEl.classList.add("hidden");
       }
-      if (state === "downloading") {
-        title.textContent = "\u6B63\u5728\u4E0B\u8F7D\u5C01\u9762";
-        desc.textContent = "\u4E0B\u8F7D\u5B8C\u6210\u540E\u8FDB\u5165\u661F\u56FE\u3002";
-        primary.classList.add("hidden");
+      if (state === "refuse") {
+        titleEl.textContent = "\u672A\u4E0B\u8F7D\u5C01\u9762";
+        descEl.textContent = "\u5C01\u9762\u662F\u672C\u56FE\u7684\u6838\u5FC3\u89C6\u89C9\u5143\u7D20\uFF0C\u672A\u4E0B\u8F7D\u65E0\u6CD5\u4F7F\u7528\u3002";
+        primaryBtn.textContent = "\u91CD\u65B0\u4E0B\u8F7D\u5C01\u9762";
+        primaryBtn.classList.remove("hidden");
+      } else if (state === "downloading") {
+        titleEl.textContent = "\u6B63\u5728\u4E0B\u8F7D\u5C01\u9762";
+        descEl.textContent = "\u4E0B\u8F7D\u5B8C\u6210\u540E\u81EA\u52A8\u8FDB\u5165\u661F\u56FE\u3002";
+        primaryBtn.classList.add("hidden");
+        updateProgress();
+      } else if (state === "failed") {
+        titleEl.textContent = "\u90E8\u5206\u5C01\u9762\u4E0B\u8F7D\u5931\u8D25";
+        const reasons = Array.from(new Set(failErrors.map((e) => e.error))).slice(0, 3);
+        let desc = failedCount + " \u5F20\u5C01\u9762\u672A\u80FD\u4E0B\u8F7D\uFF08\u6A21\u7EC4\u53EF\u80FD\u5DF2\u5220\u9664\u6216\u7F51\u7EDC\u9519\u8BEF\uFF09\u3002";
+        if (reasons.length) desc += "\n\u539F\u56E0\uFF1A" + reasons.join("\uFF1B");
+        descEl.textContent = desc;
+        primaryBtn.textContent = "\u8FDB\u5165\u56FE";
+        primaryBtn.classList.remove("hidden");
+        ghostBtn.textContent = "\u91CD\u8BD5\u4E0B\u8F7D";
       }
-      if (state === "failed") {
-        title.textContent = "\u90E8\u5206\u5C01\u9762\u4E0B\u8F7D\u5931\u8D25";
-        desc.textContent = `${failedItems.length} \u5F20\u5931\u8D25\uFF0C\u53EF\u91CD\u8BD5\u6216\u8FDB\u5165\u56FE\u3002`;
-        primary.textContent = "\u8FDB\u5165\u56FE";
-        primary.classList.remove("hidden");
-        retry.textContent = "\u91CD\u8BD5\u5931\u8D25\u9879";
-      }
-    };
-    const start = async (list) => {
+    }
+    function updateProgress() {
+      const total = pending.length;
+      const pct = total ? Math.round(doneCount / total * 100) : 100;
+      fillEl.style.width = pct + "%";
+      const elapsed = (Date.now() - elapsedStart) / 1e3;
+      const speed = doneCount / Math.max(1, elapsed);
+      const eta = speed > 0 ? formatDuration((total - doneCount) / speed * 1e3) : "--";
+      let text = "\u5DF2\u4E0B\u8F7D " + doneCount + " / " + total + " (" + pct + "%)";
+      if (failedCount > 0) text += " \xB7 \u5931\u8D25 " + failedCount;
+      text += " \xB7 \u5269\u4F59\u7EA6 " + eta;
+      labelEl.textContent = text;
+      if (onGlobalProgress) onGlobalProgress(pct, "\u6B63\u5728\u4E0B\u8F7D\u5C01\u9762\u2026", text);
+    }
+    function finish(blobUrls) {
+      modal.remove();
+      resolve({ blobUrls });
+    }
+    async function startDownload(items) {
       state = "downloading";
-      primary.classList.add("hidden");
-      render();
-      const result = await downloadUpstreamCovers(db, list, (done, total, failed) => {
-        fill.style.width = `${Math.round(done / Math.max(1, total) * 100)}%`;
-        label.textContent = `\u5DF2\u4E0B\u8F7D ${done} / ${total} \xB7 \u5931\u8D25 ${failed}`;
+      pending = items;
+      doneCount = 0;
+      failedCount = 0;
+      failedKeys = [];
+      elapsedStart = Date.now();
+      showState();
+      const result = await downloadCovers(db, items, (done, total, failed) => {
+        doneCount = done;
+        failedCount = failed;
+        updateProgress();
       });
-      failedItems = result.failedItems;
-      if (failedItems.length) {
+      failedKeys = result.failedKeys;
+      failedCount = result.failed;
+      failErrors = result.errors;
+      for (const [k, v] of result.blobUrls) accumulated.set(k, v);
+      if (result.failed > 0) {
         state = "failed";
-        primary.classList.remove("hidden");
-        render();
-      } else finish();
-    };
-    primary.addEventListener("click", () => state === "confirm" ? start(pending) : finish());
-    retry.addEventListener("click", () => start(failedItems));
-    close.addEventListener("click", () => {
-      state = "failed";
-      failedItems = pending;
-      render();
-    });
-    render();
-  });
-}
-async function loadUpstreamCoverMap(data, source) {
-  const items = (data.nodes || []).filter((node) => node.type === "core" && node.cover_url).map((node) => ({
-    key: String(node.key),
-    url: normalizeCoverUrl(node.cover_url),
-    proxyBase: source.base
-  }));
-  const db = await openUpstreamCoverDB();
-  try {
-    const clean = await fetch(`${source.base}/clean`, { cache: "no-store" }).then((res) => res.ok ? res.json() : { clean: false }).catch(() => ({ clean: false }));
-    if (clean.clean) await upstreamCoverClear(db);
-  } catch {
-  }
-  const cached = await loadUpstreamCachedCovers(db, items);
-  if (cached.size < items.length) await showUpstreamCoverModal(db, items, cached);
-  return cached;
-}
-async function detectLocalServer() {
-  const origins = [];
-  if ((location.hostname === "127.0.0.1" || location.hostname === "localhost") && location.origin !== "null") {
-    origins.push(location.origin);
-  }
-  for (const base of LOCAL_SERVER_ORIGINS) {
-    if (!origins.includes(base)) origins.push(base);
-  }
-  for (const base of origins) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 900);
-    try {
-      const res = await fetch(`${base}/health`, {
-        cache: "no-store",
-        mode: "cors",
-        signal: controller.signal
-      });
-      if (res.ok) {
-        const body = await res.json().catch(() => ({}));
-        if (body.service === "star-graph-server" || body.ok === true) {
-          clearTimeout(timer);
-          return { base, mode: body.mode === "upstream" ? "upstream" : "enhanced" };
-        }
+        showState();
+      } else {
+        finish(accumulated);
       }
-    } catch {
-    } finally {
-      clearTimeout(timer);
     }
-  }
-  return null;
-}
-async function loadCoverManifest(base = "") {
-  const map = /* @__PURE__ */ new Map();
-  const root = String(base || "").replace(/\/$/, "");
-  const smallUrl = root ? `${root}/covers/small-manifest.json` : COVER_SMALL_MANIFEST_URL;
-  const normalUrl = root ? `${root}/covers/manifest.json` : COVER_MANIFEST_URL;
-  const pathFor = (value) => {
-    const path = String(value || "").replace(/^\/+/, "");
-    return root ? `${root}/${path}` : path;
-  };
-  let data = null;
-  try {
-    const res = await fetch(smallUrl, { cache: "no-store" });
-    if (res.ok) data = await res.json();
-  } catch (e) {
-  }
-  if (!data) {
-    try {
-      const res = await fetch(normalUrl, { cache: "no-store" });
-      if (res.ok) data = await res.json();
-    } catch (e) {
-    }
-  }
-  if (!data) return map;
-  const keys = Array.isArray(data) ? data : data.keys;
-  const items = data && typeof data.items === "object" ? data.items : {};
-  for (const key of Array.isArray(keys) ? keys : []) {
-    const k = String(key);
-    const it = items[k] || {};
-    map.set(k, {
-      thumb: pathFor(it.path || `covers/small/${k}.png`),
-      orig: pathFor(it.orig || `covers/${k}.jpg`)
+    primaryBtn.addEventListener("click", async () => {
+      if (state === "confirm") {
+        startDownload(pending);
+      } else if (state === "refuse") {
+        startDownload(downloadItems.slice());
+      } else if (state === "failed") {
+        finish(accumulated);
+      }
     });
-  }
-  return map;
-}
-function coverPaths(node, coverMap) {
-  return coverMap.get(String(node.key)) || null;
-}
-var coverNetworkTail = Promise.resolve();
-var nextCoverNetworkTime = 0;
-function runCoverNetworkTask(task) {
-  const run = coverNetworkTail.then(async () => {
-    const wait = Math.max(0, nextCoverNetworkTime - performance.now());
-    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-    nextCoverNetworkTime = performance.now() + COVER_NETWORK_INTERVAL_MS;
-    return task();
-  });
-  coverNetworkTail = run.catch(() => {
-  });
-  return run;
-}
-function waitForImageSource(source) {
-  return new Promise((resolve, reject) => {
-    const image = new Image();
-    image.crossOrigin = "anonymous";
-    image.decoding = "async";
-    image.onload = resolve;
-    image.onerror = () => reject(new Error("image decode failed"));
-    image.src = source;
+    ghostBtn.addEventListener("click", () => {
+      startDownload(failedKeys.map((k) => ({ url: k })));
+    });
+    closeEl.addEventListener("click", () => {
+      if (state === "confirm") {
+        state = "refuse";
+        showState();
+      }
+    });
+    showState();
   });
 }
-async function loadCoverImageSource(source, localCover = false) {
-  const url = new URL(source, document.baseURI).href;
-  const isLocalProxy = new URL(url).pathname === "/cover_proxy";
-  if (isLocalProxy && !localCover) {
-    await runCoverNetworkTask(() => waitForImageSource(url));
-    return url;
-  }
-  await waitForImageSource(url);
-  return url;
-}
-async function loadCoverObjectUrlWithRetry(source, localCover = false) {
-  for (let attempt = 0; attempt <= COVER_LOAD_RETRIES; attempt++) {
-    try {
-      return await loadCoverImageSource(source, localCover);
-    } catch (error) {
-      if (attempt >= COVER_LOAD_RETRIES) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
-    }
-  }
-  return null;
-}
-async function cleanupLegacyServiceWorker() {
-  if (!("serviceWorker" in navigator)) return;
+async function checkCleanFlag() {
   try {
-    const registrations = await navigator.serviceWorker.getRegistrations();
-    await Promise.all(registrations.map((registration) => registration.unregister()));
-    if ("caches" in window) {
-      const keys = await caches.keys();
-      await Promise.all(keys.filter((key) => key.startsWith("star-graph-covers-")).map((key) => caches.delete(key)));
-    }
-  } catch {
+    const resp = await fetch("/clean");
+    if (!resp.ok) return false;
+    const data = await resp.json();
+    return !!data.clean;
+  } catch (e) {
+    return false;
   }
 }
-function buildGraph(data, coverMap, eagerImages = false) {
+async function checkCoverProxy() {
+  try {
+    const resp = await fetch(COVER_PROXY);
+    return resp.status === 404 ? "missing" : "ok";
+  } catch (e) {
+    return "unreachable";
+  }
+}
+function showProxyErrorModal(status) {
+  return new Promise((resolve) => {
+    const msg = status === "missing" ? "\u5F53\u524D\u670D\u52A1\u5668\u4E0D\u652F\u6301\u5C01\u9762\u4EE3\u7406\u3002\u8BF7\u4F7F\u7528 <b>python server.py</b> \u542F\u52A8\u672C\u670D\u52A1\u3002" : "\u65E0\u6CD5\u8FDE\u63A5\u672C\u5730\u670D\u52A1\u5668\u3002\u8BF7\u5148\u8FD0\u884C <b>python server.py</b>\uFF0C\u7136\u540E\u8BBF\u95EE http://127.0.0.1:1119/";
+    const modal = document.createElement("div");
+    modal.className = "cover-modal";
+    modal.innerHTML = '<div class="cover-box">  <div class="cover-head">    <span class="cover-title">\u65E0\u6CD5\u4E0B\u8F7D\u5C01\u9762</span>  </div>  <div class="cover-desc">' + msg + '</div>  <div class="cover-actions">    <button class="cover-btn primary">\u5237\u65B0\u9875\u9762</button>  </div></div>';
+    document.body.appendChild(modal);
+    modal.querySelector(".cover-btn").addEventListener("click", () => location.reload());
+  });
+}
+async function prewarmCovers(items, blobUrls, onProgress) {
+  const normal = /* @__PURE__ */ new Set();
+  const hi = /* @__PURE__ */ new Set();
+  for (const it of items) {
+    const src = blobUrls.get(it.url);
+    if (!src) continue;
+    (it.hiRes ? hi : normal).add(src);
+  }
+  const groups = [
+    { program: FadingNodeImageProgram, sources: [...normal] },
+    { program: FadingNodeImageProgramHi, sources: [...hi] }
+  ];
+  const total = normal.size + hi.size;
+  if (!total) return 0;
+  const BATCH = 300;
+  const BATCH_GAP = 40;
+  let registered = 0;
+  for (const g of groups) {
+    for (let i = 0; i < g.sources.length; i += BATCH) {
+      const chunk = g.sources.slice(i, i + BATCH);
+      for (const s of chunk) g.program.textureManager.registerImage(s);
+      registered += chunk.length;
+      if (onProgress) onProgress(registered, total, "\u6CE8\u518C");
+      await sleep(BATCH_GAP);
+    }
+  }
+  const countOf = (g) => Object.keys(g.program.textureManager.getAtlas()).length;
+  const deadline = Date.now() + 12e4;
+  let last = -1;
+  let stable = 0;
+  while (Date.now() < deadline) {
+    const done = groups.reduce((sum, g) => sum + countOf(g), 0);
+    if (onProgress) onProgress(done, total, "\u89E3\u7801");
+    if (done >= total) return done;
+    if (done === last) {
+      if (++stable >= 4) return done;
+    } else {
+      stable = 0;
+      last = done;
+    }
+    await sleep(250);
+  }
+  return groups.reduce((sum, g) => sum + countOf(g), 0);
+}
+async function buildGraph(data, blobUrls, onProgress) {
   const graph = new import_graphology.default({ multi: true });
   const labelIndex = /* @__PURE__ */ new Map();
   const degMap = /* @__PURE__ */ new Map();
-  for (const n of data.nodes) {
-    degMap.set(n.key, n.in_degree);
-    const isCore = n.type === "core";
-    const cover = isCore ? coverPaths(n, coverMap) : null;
+  const teamFlag = /* @__PURE__ */ new Map();
+  const nodeTotal = data.nodes.length;
+  for (let i = 0; i < nodeTotal; i++) {
+    const n = data.nodes[i];
+    const deg = n.degree != null ? n.degree : n.in_degree || 0;
+    const isTeam = !!n.is_team;
+    degMap.set(n.key, deg);
+    teamFlag.set(n.key, isTeam);
+    const hasImage = n.type === "core" || n.type === "author";
+    const sz = nodeSize(deg, n.type, isTeam, n.member_count);
+    const hiRes = sz > COVER_HI_RES_THRESHOLD;
+    const cover = hasImage && n.cover_url ? blobUrls.get(normalizeCoverUrl(n.cover_url)) || null : null;
     graph.addNode(n.key, {
       x: typeof n.x === "number" ? n.x : Math.random() * 100,
       y: typeof n.y === "number" ? n.y : Math.random() * 100,
-      size: nodeSize(n.in_degree, n.type),
-      color: communityColor(n.community, n.type),
-      label: n.label + "\nclass " + n.key,
+      size: sz,
+      color: communityColor(n.community, n.type, n.team_community),
+      label: n.label + "\n" + nodeKindLabel(n) + " " + n.key,
       name: n.label,
       name_en: n.name_en,
       description: n.description,
       kind: n.type,
-      // 初始只保留封面 URL；节点进入视口并由调度器加载成功后才切换 image。
-      // 已加载节点不会被切回 circle，因此离开/重新进入视口不会重复请求。
-      type: eagerImages && cover ? "image" : "circle",
-      image: eagerImages && cover ? cover.thumb : null,
-      thumb: cover ? cover.thumb : null,
-      imageSrc: cover ? cover.orig : null,
-      // 原图（导出大图用）
-      localCover: !!(cover && cover.local),
+      type: hasImage ? hiRes ? "imageHi" : "image" : "circle",
+      image: cover,
       views: n.views,
       favorites: n.favorites,
       category: n.category,
       status: n.status,
       in_degree: n.in_degree,
       out_degree: n.out_degree,
+      degree: deg,
       pagerank: n.pagerank,
       community: n.community,
       rank: n.rank,
-      density: n.density
+      density: n.density,
+      is_team: isTeam,
+      member_count: n.member_count || 0,
+      members: (n.members || []).map(String),
+      teams: (n.teams || []).map(String),
+      team_community: n.team_community != null ? n.team_community : null
     });
     if (n.label) {
       const k = n.label.toLowerCase();
       if (!labelIndex.has(k)) labelIndex.set(k, []);
       labelIndex.get(k).push(n.key);
     }
+    if ((i + 1) % 2e3 === 0) {
+      if (onProgress) onProgress(i + 1, nodeTotal);
+      await sleep(0);
+    }
   }
-  for (const e of data.edges) {
+  if (onProgress) onProgress(nodeTotal, nodeTotal);
+  const edgeTotal = data.edges.length;
+  for (let i = 0; i < edgeTotal; i++) {
+    const e = data.edges[i];
     const importance = Math.min(degMap.get(e.source) || 0, degMap.get(e.target) || 0);
-    const kind = e.type === "interaction" ? "interaction" : "dependency";
-    const rgb = kind === "interaction" ? INTERACTION_EDGE_RGB : DEPENDENCY_EDGE_RGB;
+    const kind = e.type === "interaction" ? "interaction" : e.type === "cooperation" ? "cooperation" : e.type === "membership" ? "membership" : "dependency";
+    let rgb;
+    if (kind === "cooperation" && GRAPH_MODE === "author") {
+      const sTeam = teamFlag.get(e.source);
+      const tTeam = teamFlag.get(e.target);
+      rgb = sTeam && tTeam ? TEAM_TEAM_EDGE_RGB : sTeam || tTeam ? TEAM_MIXED_EDGE_RGB : INDIVIDUAL_EDGE_RGB;
+    } else if (kind === "membership") {
+      rgb = MEMBER_EDGE_RGB;
+    } else {
+      rgb = kind === "interaction" ? INTERACTION_EDGE_RGB : DEPENDENCY_EDGE_RGB;
+    }
     graph.addEdge(e.source, e.target, {
-      size: 0.5,
-      color: kind === "interaction" ? INTERACTION_EDGE_COLOR : DEPENDENCY_EDGE_COLOR,
+      size: GRAPH_MODE === "author" ? kind === "membership" ? MEMBER_EDGE_SIZE : edgeSizeFor(e.weight) : 0.5,
+      color: premulRgba(rgb, kind === "membership" ? MEMBER_EDGE_ALPHA : EDGE_ALPHA),
+      alpha: kind === "membership" ? MEMBER_EDGE_ALPHA : EDGE_ALPHA,
+      // 导出绘制用，与屏幕一致
       type: "line",
       kind,
       rgb,
       importance,
+      weight: e.weight,
       group_name: e.group_name || ""
     });
+    if ((i + 1) % 5e3 === 0) {
+      if (onProgress) onProgress(i + 1, edgeTotal);
+      await sleep(0);
+    }
   }
+  if (onProgress) onProgress(edgeTotal, edgeTotal);
   return { graph, data, labelIndex };
 }
-function buildSearch(data) {
+async function buildSearch(data, onProgress) {
   const index = /* @__PURE__ */ new Map();
   const add = (term, n) => {
     if (!term) return;
@@ -8508,11 +8691,18 @@ function buildSearch(data) {
     if (!index.has(k)) index.set(k, /* @__PURE__ */ new Set());
     index.get(k).add(n);
   };
-  for (const n of data.nodes) {
+  const total = data.nodes.length;
+  for (let i = 0; i < total; i++) {
+    const n = data.nodes[i];
     add(n.label, n);
     add(n.name_en, n);
     add(n.key, n);
+    if ((i + 1) % 5e3 === 0) {
+      if (onProgress) onProgress(i + 1, total);
+      await sleep(0);
+    }
   }
+  if (onProgress) onProgress(total, total);
   return index;
 }
 function buildPagination(pageCount, current, onPage) {
@@ -8598,159 +8788,48 @@ async function encodePNG(width, height, getScanlines) {
   parts.push(pngChunk("IEND", new Uint8Array(0)));
   return new Blob(parts, { type: "image/png" });
 }
-var coverDownloadToast = null;
-function updateCoverDownloadProgress(job) {
-  let container = document.getElementById("toast-container");
-  if (!container) {
-    container = document.createElement("div");
-    container.id = "toast-container";
-    container.setAttribute("aria-live", "polite");
-    document.body.appendChild(container);
-  }
-  if (!coverDownloadToast) {
-    coverDownloadToast = document.createElement("div");
-    coverDownloadToast.className = "toast toast-progress toast-success toast-visible";
-    coverDownloadToast.innerHTML = '<div class="toast-progress-text"></div><div class="toast-progress-track"><div class="toast-progress-fill"></div></div>';
-    container.appendChild(coverDownloadToast);
-  }
-  const total = Math.max(1, Number(job.total) || 1);
-  const done = Math.min(total, Number(job.done) || 0);
-  const pct = Math.round(done / total * 100);
-  const downloaded = Number(job.downloaded) || 0;
-  const skipped = Number(job.skipped) || 0;
-  const failed = Number(job.failed) || 0;
-  coverDownloadToast.querySelector(".toast-progress-text").textContent = `\u6B63\u5728\u4FDD\u5B58\u672C\u5730\u5C01\u9762 ${done} / ${total}\uFF08${pct}%\uFF09 \xB7 \u6210\u529F ${downloaded} \xB7 \u5DF2\u5B58\u5728 ${skipped} \xB7 \u5931\u8D25 ${failed}`;
-  coverDownloadToast.querySelector(".toast-progress-fill").style.width = `${pct}%`;
-}
-function finishCoverDownloadProgress(message, kind = "success") {
-  if (!coverDownloadToast) return;
-  coverDownloadToast.className = `toast toast-progress toast-${kind} toast-visible`;
-  coverDownloadToast.querySelector(".toast-progress-text").textContent = message;
-  coverDownloadToast.querySelector(".toast-progress-fill").style.width = "100%";
-  const toast = coverDownloadToast;
-  coverDownloadToast = null;
-  setTimeout(() => {
-    toast.classList.remove("toast-visible");
-    setTimeout(() => toast.remove(), 300);
-  }, 1800);
-}
-function askLocalCoverDownload(existingCount, totalCount) {
-  return new Promise((resolve) => {
-    const modal = document.createElement("div");
-    modal.className = "cover-modal";
-    modal.innerHTML = `
-      <div class="cover-box" role="dialog" aria-modal="true" aria-labelledby="cover-download-title">
-        <div class="cover-head">
-          <div class="cover-title" id="cover-download-title">\u4FDD\u5B58\u672C\u5730\u5C01\u9762</div>
-          <button class="cover-close" type="button" aria-label="\u5173\u95ED">\xD7</button>
-        </div>
-        <div class="cover-desc">
-          \u5DF2\u8FDE\u63A5\u672C\u5730 server.py\u3002\u7126\u70B9\u8282\u70B9\u4F1A\u7EE7\u7EED\u901A\u8FC7\u53CD\u4EE3\u61D2\u52A0\u8F7D\uFF0C\u6210\u529F\u52A0\u8F7D\u7684\u5C01\u9762\u4F1A\u81EA\u52A8\u4FDD\u5B58\u5230\u672C\u5730\u3002<br>
-          \u662F\u5426\u540C\u65F6\u540E\u53F0\u4FDD\u5B58\u5168\u90E8\u5C01\u9762\uFF1F\u5DF2\u6709 ${existingCount} \u5F20\uFF0C\u6700\u591A\u5904\u7406 ${totalCount} \u5F20\u3002\u4E0B\u8F7D\u4E0D\u4F1A\u963B\u585E\u8282\u70B9\u56FE\u3002
-        </div>
-        <div class="cover-actions">
-          <button class="cover-btn ghost" data-action="cancel" type="button">\u6682\u4E0D\u4FDD\u5B58</button>
-          <button class="cover-btn primary" data-action="download" type="button">\u540E\u53F0\u4FDD\u5B58</button>
-        </div>
-      </div>`;
-    document.body.appendChild(modal);
-    const close = (value) => {
-      modal.remove();
-      resolve(value);
-    };
-    modal.querySelector("[data-action=cancel]").addEventListener("click", () => close(false));
-    modal.querySelector("[data-action=download]").addEventListener("click", () => close(true));
-    modal.querySelector(".cover-close").addEventListener("click", () => close(false));
-  });
-}
-async function downloadLocalCovers(data, source, orderedNodes = null) {
-  const nodes = (orderedNodes || data.nodes || []).filter((node) => node.type === "core" && node.cover_url).map((node) => ({ key: String(node.key), cover_url: node.cover_url }));
-  if (!nodes.length) return;
-  const response = await fetch(`${source.base}/cover_download/start`, {
-    method: "POST",
-    mode: "cors",
-    cache: "no-store",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ nodes })
-  });
-  if (!response.ok) throw new Error(`\u542F\u52A8\u672C\u5730\u4FDD\u5B58\u5931\u8D25\uFF1A${response.status}`);
-  const started = await response.json();
-  updateCoverDownloadProgress(started);
-  let job = started;
-  let cursor = Number(started.ready_cursor) || 0;
-  while (job.status === "running") {
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    const status = await fetch(`${source.base}/cover_download/status?id=${encodeURIComponent(started.id)}&since=${cursor}`, { mode: "cors", cache: "no-store" });
-    if (!status.ok) throw new Error(`\u8BFB\u53D6\u672C\u5730\u4FDD\u5B58\u8FDB\u5EA6\u5931\u8D25\uFF1A${status.status}`);
-    job = await status.json();
-    cursor = Number(job.ready_cursor) || cursor;
-    updateCoverDownloadProgress(job);
-  }
-  if (job.status !== "done") throw new Error("\u672C\u5730\u4FDD\u5B58\u5931\u8D25");
-  finishCoverDownloadProgress(`\u672C\u5730\u5C01\u9762\u4FDD\u5B58\u5B8C\u6210\uFF1A${job.downloaded} \u65B0\u589E\uFF0C${job.skipped} \u5DF2\u5B58\u5728\uFF0C${job.failed} \u5931\u8D25`);
-}
-function showToast(message, kind = "warning") {
-  let container = document.getElementById("toast-container");
-  if (!container) {
-    container = document.createElement("div");
-    container.id = "toast-container";
-    container.setAttribute("aria-live", "polite");
-    document.body.appendChild(container);
-  }
-  const toast = document.createElement("div");
-  toast.className = `toast toast-${kind}`;
-  toast.textContent = message;
-  container.appendChild(toast);
-  requestAnimationFrame(() => toast.classList.add("toast-visible"));
-  setTimeout(() => {
-    toast.classList.remove("toast-visible");
-    setTimeout(() => toast.remove(), 300);
-  }, 5e3);
-}
 function main() {
   const container = document.getElementById("container");
   const statusEl = document.getElementById("status");
   const tooltipEl = document.getElementById("tooltip");
   const contextMenu = document.getElementById("context-menu");
   const searchInput = document.getElementById("search-input");
+  const searchFilters = document.getElementById("search-filters");
   const searchResults = document.getElementById("search-results");
   const searchList = document.getElementById("search-list");
   const searchPagination = document.getElementById("search-pagination");
   const statusText = document.getElementById("status-text");
   const progressFill = document.getElementById("progress-fill");
   const progressLabel = document.getElementById("progress-label");
-  const lodSlider = document.getElementById("lod-slider");
-  const lodValue = document.getElementById("lod-value");
-  const edgeLodSlider = document.getElementById("edge-lod-slider");
-  const edgeLodValue = document.getElementById("edge-lod-value");
   const panel = document.getElementById("panel");
   const panelToggle = document.getElementById("panel-toggle");
   const edgeDependency = document.getElementById("edge-dependency");
   const edgeInteraction = document.getElementById("edge-interaction");
   const showLabels = document.getElementById("show-labels");
+  const showTeamsEl = document.getElementById("show-teams");
+  const showAuthorsEl = document.getElementById("show-authors");
   const exportWidth = document.getElementById("export-width");
   const exportHeight = document.getElementById("export-height");
   const exportButton = document.getElementById("export-button");
   const exportWarning = document.getElementById("export-warning");
+  const exportSinglePng = document.getElementById("export-single-png");
   let renderer = null;
   let graph = null;
   let searchIndex = null;
-  let lodThresholdValue = 0;
   let lodTimer = null;
   let culledEdges = /* @__PURE__ */ new Set();
-  let nodeVisibleCount = 0;
-  let edgeAlpha = /* @__PURE__ */ new Map();
-  let nodeAlpha = /* @__PURE__ */ new Map();
-  let fadeTimer = null;
   let searchMatches = [];
   let searchPage = 0;
+  const searchFilter = { kind: "all", rel: "all" };
   let allNodes = [];
-  let nodeLodStrength = 1;
-  let edgeLodStrength = 1;
   let showDependency = true;
   let showInteraction = true;
+  let showTeams = true;
+  let showAuthors = true;
+  let hiddenNodeSet = /* @__PURE__ */ new Set();
   let highlightNodes = /* @__PURE__ */ new Set();
   let highlightEdges = /* @__PURE__ */ new Set();
+  let coverBlobUrls = /* @__PURE__ */ new Map();
   function setProgress(pct, text, label) {
     statusText.textContent = text;
     progressFill.style.width = Math.max(0, Math.min(100, pct)) + "%";
@@ -8767,59 +8846,112 @@ function main() {
       if (statusEl.style.display !== "none") statusEl.style.display = "none";
     }, 700);
   }
-  async function boot(localServerOverride = null) {
-    const localServer = localServerOverride || await detectLocalServer();
-    let data;
-    let coverMap;
-    let eagerImages = false;
-    let localDownloadContext = null;
-    if (localServer) {
-      showToast("\u5DF2\u8FDE\u63A5\u672C\u5730 server.py\uFF0C\u4F7F\u7528\u672C\u5730\u56FE\u6570\u636E\u3002", "success");
-      setProgress(5, "\u52A0\u8F7D\u672C\u5730\u56FE\u6570\u636E\u2026\u2026", localServer.base + "/graph.json");
-      try {
-        data = await loadGraph(localServer);
-      } catch (error) {
-        showToast("\u672C\u5730 server.py \u6570\u636E\u52A0\u8F7D\u5931\u8D25\uFF0C\u5DF2\u56DE\u9000\u5728\u7EBF\u6570\u636E\u3002", "warning");
-        data = await loadGraph();
-        setProgress(10, "\u52A0\u8F7D\u9759\u6001\u5C01\u9762\u6E05\u5355\u2026\u2026", "covers/manifest.json");
-        coverMap = await loadCoverManifest();
-      }
-      if (!coverMap) {
-        if (localServer.mode === "upstream") {
-          const blobMap = await loadUpstreamCoverMap(data, localServer);
-          coverMap = new Map([...blobMap].map(([key, blobUrl]) => [key, { thumb: blobUrl, orig: blobUrl }]));
-          eagerImages = true;
-        } else {
-          const existingLocal = await loadExistingLocalCovers(localServer);
-          coverMap = buildLocalCoverMap(data, localServer, new Set(existingLocal.keys));
-          localDownloadContext = { data, source: localServer, existingCount: existingLocal.count };
-        }
-      }
-    } else {
-      showToast("\u672A\u8FDE\u63A5\u672C\u5730 server.py\uFF0C\u4F7F\u7528\u5728\u7EBF\u9759\u6001\u6570\u636E\u3002", "warning");
-      setProgress(5, "\u52A0\u8F7D\u5728\u7EBF\u6570\u636E\u2026\u2026", GRAPH_URL);
-      data = await loadGraph();
-      setProgress(10, "\u52A0\u8F7D\u9759\u6001\u5C01\u9762\u6E05\u5355\u2026\u2026", "covers/manifest.json");
-      await new Promise((r) => setTimeout(r, 30));
-      coverMap = await loadCoverManifest();
-    }
-    setProgress(20, coverMap.size ? "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026" : "\u672A\u627E\u5230\u5C01\u9762\uFF0C\u4F7F\u7528\u7EAF\u8272\u8282\u70B9\u2026\u2026", coverMap.size + " \u5F20\u5C01\u9762\u5DF2\u5C31\u7EEA");
+  async function boot() {
+    setProgress(0, "\u52A0\u8F7D\u6570\u636E\u4E2D\u2026\u2026", "");
+    const data = await loadGraph((received, total) => {
+      setProgress(
+        Math.round(received / total * 10),
+        "\u52A0\u8F7D\u6570\u636E\u4E2D\u2026\u2026",
+        (received / 1048576).toFixed(1) + " / " + (total / 1048576).toFixed(1) + " MB"
+      );
+    });
+    GRAPH_MODE = data.meta && data.meta.mode === "author" ? "author" : "mod";
+    document.getElementById("search-input").placeholder = GRAPH_MODE === "author" ? "\u641C\u7D22\u4F5C\u8005\u540D\u2026" : "\u641C\u7D22\u6A21\u7EC4\u540D\u2026";
+    document.querySelectorAll(".author-only").forEach((el) => {
+      el.style.display = GRAPH_MODE === "author" ? "" : "none";
+    });
+    renderMetaPanel(data.meta);
+    setProgress(10, "\u6B63\u5728\u8BFB\u53D6\u5C01\u9762\u7F13\u5B58\u2026\u2026", "");
     await new Promise((r) => setTimeout(r, 30));
-    const built = buildGraph(data, coverMap, eagerImages);
+    const coverItems = [];
+    for (const n of data.nodes) {
+      if (n.type !== "core" && n.type !== "author") continue;
+      const url = normalizeCoverUrl(n.cover_url);
+      if (url) coverItems.push({ key: n.key, url });
+    }
+    const db = await openCoverDB();
+    if (await checkCleanFlag()) {
+      await idbClear(db);
+      console.log("[\u4FE1\u606F] \u5DF2\u6E05\u7406\u5C01\u9762\u7F13\u5B58\uFF08clean \u6A21\u5F0F\uFF09");
+    }
+    let blobUrls;
+    if (!coverItems.length) {
+      console.warn("[\u8B66\u544A] graph.json \u65E0\u5C01\u9762 URL\uFF0C\u8282\u70B9\u5C06\u663E\u793A\u4E3A\u7EAF\u8272\u5706");
+      blobUrls = /* @__PURE__ */ new Map();
+    } else {
+      const proxyStatus = await checkCoverProxy();
+      if (proxyStatus !== "ok") {
+        await showProxyErrorModal(proxyStatus);
+        return;
+      }
+      const wantUrls = [...new Set(coverItems.map((it) => it.url))];
+      const loaded = await loadAllCovers(db, wantUrls, (done, total) => {
+        setProgress(
+          10 + Math.round(Math.min(done, total) / Math.max(1, total) * 5),
+          "\u6B63\u5728\u8BFB\u53D6\u5C01\u9762\u7F13\u5B58\u2026\u2026",
+          done + " / " + total
+        );
+      });
+      blobUrls = loaded.blobUrls;
+      if (loaded.staleKeys.length) {
+        const staleSet = new Set(loaded.staleKeys);
+        const uniqueUrls = [...new Set(coverItems.filter((it) => staleSet.has(it.url)).map((it) => it.url))];
+        const result = await showCoverModal(db, uniqueUrls.map((url) => ({ url })), blobUrls, (pct, text, label) => {
+          setProgress(15 + Math.round(pct * 0.25), text, label);
+        });
+        blobUrls = result.blobUrls;
+      }
+    }
+    if (blobUrls.size) {
+      const prewarmItems = [];
+      for (const n of data.nodes) {
+        if (n.type !== "core" && n.type !== "author") continue;
+        const url = normalizeCoverUrl(n.cover_url);
+        if (!url) continue;
+        const deg = n.degree != null ? n.degree : n.in_degree || 0;
+        const isTeam = !!n.is_team;
+        prewarmItems.push({
+          url,
+          hiRes: nodeSize(deg, n.type, isTeam, n.member_count) > COVER_HI_RES_THRESHOLD
+        });
+      }
+      await prewarmCovers(prewarmItems, blobUrls, (done, total, phase) => {
+        const register = phase === "\u6CE8\u518C";
+        const base = register ? 40 : 52;
+        const span = register ? 12 : 23;
+        const pct = base + Math.round(Math.min(done, total) / Math.max(1, total) * span);
+        setProgress(pct, register ? "\u6B63\u5728\u6CE8\u518C\u5C01\u9762\u56FE\u7247\u2026" : "\u6B63\u5728\u89E3\u7801\u5C01\u9762\u56FE\u7247\u2026", done + " / " + total);
+      });
+    }
+    setProgress(75, "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026", "");
+    const built = await buildGraph(data, blobUrls, (done, total) => {
+      setProgress(
+        75 + Math.round(Math.min(done, total) / Math.max(1, total) * 15),
+        "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026",
+        done + " / " + total
+      );
+    });
     graph = built.graph;
-    searchIndex = buildSearch(data);
-    allNodes = [...data.nodes].sort((a, b) => (b.views || 0) - (a.views || 0));
+    coverBlobUrls = blobUrls;
+    searchIndex = await buildSearch(data, (done, total) => {
+      setProgress(
+        90 + Math.round(Math.min(done, total) / Math.max(1, total) * 5),
+        "\u6784\u5EFA\u641C\u7D22\u7D22\u5F15\u2026\u2026",
+        done + " / " + total
+      );
+    });
+    allNodes = sortNodes([...data.nodes]);
     searchMatches = [...allNodes];
     searchPage = 0;
     renderSearchResults();
-    setProgress(100, "\u6E32\u67D3\u4E2D\u2026\u2026", "");
+    setProgress(95, "\u6E32\u67D3\u4E2D\u2026\u2026", "");
     await new Promise((r) => setTimeout(r, 30));
     renderer = new Sigma(graph, container, {
       renderLabels: true,
       renderEdgeLabels: false,
       hideEdgesOnMove: false,
       enableEdgeEvents: true,
-      // 节点尺寸与坐标同单位（世界单位），去重叠才能与渲染一致
+      // 节点尺寸与坐标同单位，即世界单位；去重叠才能与渲染一致
       itemSizesReference: "positions",
       zoomToSizeRatioFunction: (ratio) => ratio,
       defaultNodeType: "circle",
@@ -8833,10 +8965,10 @@ function main() {
       labelDensity: 0.4,
       defaultDrawNodeLabel: drawNodeLabel,
       nodeProgramClasses: {
-        image: FadingNodeImageProgram
+        image: FadingNodeImageProgram,
+        imageHi: FadingNodeImageProgramHi
       }
     });
-    window.__sigma = renderer;
     bindEvents();
     container.addEventListener("contextmenu", (e) => {
       e.preventDefault();
@@ -8859,10 +8991,8 @@ function main() {
       if (highlightEdges.has(edge)) {
         return { ...attrs, hidden: false, color: HIGHLIGHT_EDGE_COLOR, size: Math.max(attrs.size || 0.5, 1.6) };
       }
-      const alpha = edgeAlpha.get(edge);
-      if (alpha === 0) return { ...attrs, hidden: true };
-      if (alpha !== void 0 && alpha < 1) {
-        return { ...attrs, color: edgeColorFor(attrs.rgb || DEPENDENCY_EDGE_RGB, alpha) };
+      if (attrs.kind === "dependency" && !showDependency || attrs.kind === "interaction" && !showInteraction || culledEdges.has(edge) || hiddenNodeSet.has(graph.source(edge)) || hiddenNodeSet.has(graph.target(edge))) {
+        return { ...attrs, hidden: true };
       }
       return attrs;
     });
@@ -8870,171 +9000,53 @@ function main() {
       if (highlightNodes.has(node)) {
         return { ...attr, hidden: false, color: HIGHLIGHT_NODE_COLOR };
       }
-      const alpha = nodeAlpha.get(node);
-      if (alpha === 0) return { ...attr, hidden: true };
-      if (alpha !== void 0 && alpha < 1) {
-        const premul = attr.type !== "image";
-        return { ...attr, color: hexToRgba(attr.color, alpha, premul) };
-      }
+      if (hiddenNodeSet.has(node)) return { ...attr, hidden: true };
       return attr;
     });
     const cam = renderer.getCamera();
-    const coverStates = /* @__PURE__ */ new Map();
-    const coverQueue = [];
-    let activeCoverLoads = 0;
-    let coverScheduleTimer = null;
-    const pendingCoverUpdates = /* @__PURE__ */ new Map();
-    let coverUpdateFrame = null;
-    function flushCoverImageUpdates() {
-      coverUpdateFrame = null;
-      if (!pendingCoverUpdates.size) return;
-      const updates = new Map(pendingCoverUpdates);
-      pendingCoverUpdates.clear();
-      graph.updateEachNodeAttributes(
-        (key, attrs) => {
-          const objectUrl = updates.get(key);
-          return objectUrl ? { ...attrs, image: objectUrl, type: "image" } : attrs;
-        },
-        { attributes: ["image", "type"] }
-      );
-      renderer.refresh();
-    }
-    function queueCoverImageUpdate(key, imageSource) {
-      pendingCoverUpdates.set(key, imageSource);
-      if (coverUpdateFrame === null) {
-        coverUpdateFrame = requestAnimationFrame(flushCoverImageUpdates);
-      }
-    }
-    function coverState(key) {
-      let state = coverStates.get(key);
-      if (!state) {
-        state = { status: "idle", priority: Infinity, objectUrl: null };
-        coverStates.set(key, state);
-      }
-      return state;
-    }
-    function pumpCoverLoads() {
-      coverQueue.sort((a, b) => coverState(a.key).priority - coverState(b.key).priority);
-      while (activeCoverLoads < COVER_LOAD_CONCURRENCY && coverQueue.length) {
-        const item = coverQueue.shift();
-        const state = coverState(item.key);
-        if (state.status !== "queued") continue;
-        state.status = "loading";
-        activeCoverLoads += 1;
-        loadCoverObjectUrlWithRetry(item.src, item.local).then((imageSource) => {
-          if (!imageSource) throw new Error("empty image");
-          state.status = "ready";
-          state.objectUrl = imageSource;
-          queueCoverImageUpdate(item.key, imageSource);
-        }).catch(() => {
-          state.status = "failed";
-        }).finally(() => {
-          activeCoverLoads -= 1;
-          pumpCoverLoads();
-        });
-      }
-    }
-    function scheduleCoverLoads() {
-      const w = container.clientWidth;
-      const h = container.clientHeight;
-      const margin = 320;
-      if (w <= 0 || h <= 0) return;
-      const visible = /* @__PURE__ */ new Set();
-      graph.forEachNode((key, attrs) => {
-        if (!attrs.thumb || attrs.type === "image") return;
-        const state = coverState(key);
-        if (state.status === "ready" || state.status === "failed" || state.status === "loading") return;
-        const point = renderer.graphToViewport({ x: attrs.x, y: attrs.y });
-        const withinMargin = point.x >= -margin && point.x <= w + margin && point.y >= -margin && point.y <= h + margin;
-        if (!withinMargin) return;
-        const screenSize = renderer.scaleSize(attrs.size);
-        if (!Number.isFinite(screenSize) || screenSize < 6) return;
-        if (nodeAlpha.get(key) === 0) return;
-        visible.add(key);
-        const centerDistance = Math.hypot(point.x - w / 2, point.y - h / 2);
-        const insideViewport = point.x >= 0 && point.x <= w && point.y >= 0 && point.y <= h;
-        state.priority = (insideViewport ? 0 : 1e9) + centerDistance;
-        if (state.status === "idle") {
-          state.status = "queued";
-          coverQueue.push({ key, src: attrs.thumb, local: !!attrs.localCover });
-        }
-      });
-      for (const [key, state] of coverStates) {
-        if (state.status === "queued" && !visible.has(key)) state.status = "idle";
-      }
-      pumpCoverLoads();
-    }
-    function scheduleCoverLoadsSoon() {
-      if (coverScheduleTimer) return;
-      coverScheduleTimer = requestAnimationFrame(() => {
-        coverScheduleTimer = null;
-        scheduleCoverLoads();
-      });
-    }
     let lodLastRun = 0;
     cam.on("updated", () => {
       const now = performance.now();
       const applyLod = () => {
         lodLastRun = performance.now();
         const state = cam.getState();
-        lodThresholdValue = computeLodThreshold(state.ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
-        nodeVisibleCount = computeVisibleNodeCount(state.ratio, nodeLodStrength);
         updateCulling(state);
-        startFade();
-        scheduleCoverLoadsSoon();
       };
-      if (lodTimer) clearTimeout(lodTimer);
       const elapsed = now - lodLastRun;
       if (elapsed >= LOD_THROTTLE_MS) {
+        if (lodTimer) {
+          clearTimeout(lodTimer);
+          lodTimer = null;
+        }
         applyLod();
-      } else {
-        lodTimer = setTimeout(applyLod, LOD_THROTTLE_MS - elapsed);
+      } else if (!lodTimer) {
+        lodTimer = setTimeout(() => {
+          lodTimer = null;
+          applyLod();
+        }, LOD_THROTTLE_MS - elapsed);
       }
     });
-    lodThresholdValue = computeLodThreshold(cam.getState().ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
-    nodeVisibleCount = computeVisibleNodeCount(cam.getState().ratio, nodeLodStrength);
     updateCulling(cam.getState());
-    scheduleCoverLoads();
     renderer.refresh();
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    await new Promise((r) => setTimeout(r, 700));
-    startFade();
+    setProgress(100, "\u6E32\u67D3\u5B8C\u6210", "");
+    renderer.scheduleRefresh();
     finishLoading();
-    if (localDownloadContext) {
-      const context = localDownloadContext;
-      setTimeout(async () => {
-        const total = (context.data.nodes || []).filter((node) => node.type === "core" && node.cover_url).length;
-        if (!await askLocalCoverDownload(context.existingCount, total)) return;
-        try {
-          const centerX = container.clientWidth / 2;
-          const centerY = container.clientHeight / 2;
-          const orderedNodes = [...context.data.nodes].sort((a, b) => {
-            const pa = renderer.graphToViewport({ x: a.x, y: a.y });
-            const pb = renderer.graphToViewport({ x: b.x, y: b.y });
-            const ia = pa.x >= 0 && pa.x <= container.clientWidth && pa.y >= 0 && pa.y <= container.clientHeight;
-            const ib = pb.x >= 0 && pb.x <= container.clientWidth && pb.y >= 0 && pb.y <= container.clientHeight;
-            const da = Math.hypot(pa.x - centerX, pa.y - centerY);
-            const db = Math.hypot(pb.x - centerX, pb.y - centerY);
-            return (ia ? 0 : 1e9) + da - ((ib ? 0 : 1e9) + db);
-          });
-          await downloadLocalCovers(context.data, context.source, orderedNodes);
-        } catch (error) {
-          finishCoverDownloadProgress("\u672C\u5730\u4FDD\u5B58\u5931\u8D25\uFF0C\u7126\u70B9\u53CD\u4EE3\u52A0\u8F7D\u4ECD\u53EF\u7EE7\u7EED\u3002", "warning");
-          showToast("\u672C\u5730\u5C01\u9762\u540E\u53F0\u4FDD\u5B58\u5931\u8D25\uFF0C\u7126\u70B9\u53CD\u4EE3\u52A0\u8F7D\u4ECD\u53EF\u7EE7\u7EED\u3002", "warning");
-        }
-      }, 0);
-    }
   }
   function bindEvents() {
     renderer.on("enterNode", ({ node }) => {
+      hoveredNode = node;
+      if (altLock) return;
       const attrs = graph.getNodeAttributes(node);
       showTooltip(node, attrs);
     });
     renderer.on("leaveNode", () => {
-      hideTooltip();
+      hoveredNode = null;
+      if (!altLock) hideTooltip();
     });
     renderer.on("clickNode", ({ node }) => {
-      window.open("https://www.mcmod.cn/class/" + node + ".html", "_blank");
+      const base = GRAPH_MODE === "author" ? "author" : "class";
+      window.open("https://www.mcmod.cn/" + base + "/" + node + ".html", "_blank");
     });
     renderer.on("clickEdge", ({ edge }) => {
       const source = graph.source(edge);
@@ -9047,7 +9059,7 @@ function main() {
       const dt = (td.x - cam.x) * (td.x - cam.x) + (td.y - cam.y) * (td.y - cam.y);
       focusNode(ds >= dt ? source : target);
     });
-    searchInput.addEventListener("input", () => {
+    const debouncedSearch = debounce(() => {
       const q = searchInput.value.trim().toLowerCase();
       if (!q) {
         searchMatches = [...allNodes];
@@ -9061,27 +9073,17 @@ function main() {
           for (const n of nodes) matched.add(n);
         }
       }
-      searchMatches = [...matched].sort((a, b) => (b.views || 0) - (a.views || 0));
+      searchMatches = sortNodes([...matched]);
       searchPage = 0;
       renderSearchResults();
-    });
+    }, 150);
+    searchInput.addEventListener("input", debouncedSearch);
     searchInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
+        debouncedSearch.flush();
         const first = searchList.querySelector("li");
         if (first) first.click();
       }
-    });
-    lodSlider.addEventListener("input", () => {
-      nodeLodStrength = Number(lodSlider.value) / 100;
-      lodValue.textContent = Math.round(nodeLodStrength * 100) + "%";
-      nodeVisibleCount = computeVisibleNodeCount(renderer.getCamera().getState().ratio, nodeLodStrength);
-      startFade();
-    });
-    edgeLodSlider.addEventListener("input", () => {
-      edgeLodStrength = Number(edgeLodSlider.value) / 100;
-      edgeLodValue.textContent = Math.round(edgeLodStrength * 100) + "%";
-      lodThresholdValue = computeLodThreshold(renderer.getCamera().getState().ratio, LOD_MAX_THRESHOLD * edgeLodStrength);
-      startFade();
     });
     panelToggle.addEventListener("click", () => {
       const collapsed = panel.classList.toggle("collapsed");
@@ -9090,14 +9092,31 @@ function main() {
     });
     edgeDependency.addEventListener("change", () => {
       showDependency = edgeDependency.checked;
-      startFade();
+      renderer.scheduleRefresh();
     });
     edgeInteraction.addEventListener("change", () => {
       showInteraction = edgeInteraction.checked;
-      startFade();
+      renderer.scheduleRefresh();
     });
     showLabels.addEventListener("change", () => {
       renderer.setSetting("renderLabels", showLabels.checked);
+    });
+    function updateHiddenNodes() {
+      hiddenNodeSet = /* @__PURE__ */ new Set();
+      if (showTeams && showAuthors) return;
+      graph.forEachNode((node, attrs) => {
+        if (attrs.is_team && !showTeams || !attrs.is_team && !showAuthors) hiddenNodeSet.add(node);
+      });
+    }
+    showTeamsEl.addEventListener("change", () => {
+      showTeams = showTeamsEl.checked;
+      updateHiddenNodes();
+      renderer.scheduleRefresh();
+    });
+    showAuthorsEl.addEventListener("change", () => {
+      showAuthors = showAuthorsEl.checked;
+      updateHiddenNodes();
+      renderer.scheduleRefresh();
     });
     exportButton.addEventListener("click", exportPNG);
     function updateExportWarning() {
@@ -9112,16 +9131,39 @@ function main() {
   function renderSearchResults() {
     searchList.innerHTML = "";
     searchPagination.innerHTML = "";
-    const pageSize = 20;
-    const total = searchMatches.length;
+    let list = searchMatches;
+    if (GRAPH_MODE === "author") {
+      const pool = searchMatches;
+      searchFilters.innerHTML = "";
+      searchFilters.appendChild(buildFilterBar(
+        {
+          all: pool.length,
+          team: pool.filter((n) => n.is_team).length,
+          author: pool.filter((n) => !n.is_team).length
+        },
+        [
+          { key: "coop", label: "\u5408\u4F5C", count: pool.filter((n) => (n.degree || 0) > 0).length },
+          { key: "contains", label: "\u5305\u542B", count: pool.filter((n) => n.is_team).length },
+          { key: "belongs", label: "\u5C5E\u4E8E", count: pool.filter((n) => n.teams && n.teams.length).length }
+        ],
+        searchFilter,
+        () => {
+          searchPage = 0;
+          renderSearchResults();
+        }
+      ));
+      list = filterNodesByKind(filterNodesByRel(pool, searchFilter.rel), searchFilter.kind);
+    }
+    const pageSize = 10;
+    const total = list.length;
     const pages = Math.max(1, Math.ceil(total / pageSize));
     if (searchPage >= pages) searchPage = pages - 1;
     const start = searchPage * pageSize;
-    const page = searchMatches.slice(start, start + pageSize);
+    const page = list.slice(start, start + pageSize);
     for (const n of page) {
       const li = document.createElement("li");
       li.textContent = n.label + (n.name_en ? " (" + n.name_en + ")" : "");
-      li.title = "class " + n.key;
+      li.title = nodeKindLabel(n) + " " + n.key;
       li.addEventListener("click", () => {
         focusNode(n.key);
       });
@@ -9169,77 +9211,33 @@ function main() {
     const targetRatio = 2 * size * C / (NODE_DIAMETER_SCREEN_RATIO * width);
     cam.animate({ x: nd.x, y: nd.y, ratio: targetRatio }, { duration: 600 });
   }
-  function computeLodThreshold(ratio, maxThreshold) {
-    if (ratio <= LOD_FULL_ZOOM_RATIO) return 0;
-    const maxR = 1;
-    const r = Math.min(ratio, maxR);
-    const t = (Math.log(r) - Math.log(LOD_FULL_ZOOM_RATIO)) / (Math.log(maxR) - Math.log(LOD_FULL_ZOOM_RATIO));
-    return Math.round(maxThreshold * t);
-  }
-  function computeVisibleNodeCount(ratio, strength) {
-    const total = graph.order;
-    if (strength <= 0) return total;
-    if (ratio <= LOD_FULL_ZOOM_RATIO) return total;
-    const maxR = 1;
-    const r = Math.min(ratio, maxR);
-    const t = (Math.log(r) - Math.log(LOD_FULL_ZOOM_RATIO)) / (Math.log(maxR) - Math.log(LOD_FULL_ZOOM_RATIO));
-    return Math.round(total * Math.pow(NODE_LOD_MIN_VISIBLE / total, t * strength));
-  }
-  function edgeTarget(edge, attrs) {
-    if (attrs.kind === "dependency" && !showDependency) return 0;
-    if (attrs.kind === "interaction" && !showInteraction) return 0;
-    if ((attrs.importance || 0) < lodThresholdValue) return 0;
-    if (culledEdges.has(edge)) return 0;
-    return 1;
-  }
-  function nodeTarget(node, attrs) {
-    if (!NODE_LOD_ENABLED) return 1;
-    return (attrs.rank ?? Infinity) < nodeVisibleCount ? 1 : 0;
-  }
-  function fadeStep() {
-    const step = 0.36;
-    const changedNodes = [];
-    const changedEdges = [];
-    graph.forEachEdge((edge, attrs) => {
-      const target = edgeTarget(edge, attrs);
-      const cur = edgeAlpha.has(edge) ? edgeAlpha.get(edge) : 1;
-      if (cur === target) return;
-      let next = cur + (target - cur) * step;
-      if (Math.abs(next - target) < 0.02) next = target;
-      if (next === 1) edgeAlpha.delete(edge);
-      else edgeAlpha.set(edge, next);
-      changedEdges.push(edge);
-    });
-    graph.forEachNode((node, attrs) => {
-      const target = nodeTarget(node, attrs);
-      const cur = nodeAlpha.has(node) ? nodeAlpha.get(node) : 1;
-      if (cur === target) return;
-      let next = cur + (target - cur) * step;
-      if (Math.abs(next - target) < 0.02) next = target;
-      if (next === 1) nodeAlpha.delete(node);
-      else nodeAlpha.set(node, next);
-      changedNodes.push(node);
-    });
-    if (changedNodes.length || changedEdges.length) {
-      renderer.refresh();
-      fadeTimer = setTimeout(fadeStep, 33);
-    } else {
-      fadeTimer = null;
-    }
-  }
-  function startFade() {
-    if (fadeTimer) return;
-    fadeStep();
+  function teamNames(ids) {
+    return ids.map((id) => {
+      const a = graph.getNodeAttributes(String(id));
+      return a && a.name ? a.name : String(id);
+    }).join("\u3001");
   }
   function showTooltip(node, attrs) {
     const lines = [];
     lines.push("<div class='tt-title'>" + escapeHtml(attrs.name) + "</div>");
     if (attrs.name_en) lines.push("<div class='tt-sub'>" + escapeHtml(attrs.name_en) + "</div>");
-    if (attrs.description) lines.push("<div class='tt-desc'>" + escapeHtml(attrs.description) + "</div>");
-    lines.push("<div class='tt-meta'>" + (attrs.kind === "core" ? "\u6838\u5FC3\u6A21\u7EC4" : "\u5916\u90E8\u5F15\u7528") + " \xB7 " + escapeHtml(attrs.category || "\u65E0\u5206\u7C7B") + "</div>");
+    if (attrs.description) lines.push("<div class='tt-desc'>" + attrs.description + "</div>");
+    const kindText = GRAPH_MODE === "author" ? nodeKindLabel(attrs) : attrs.kind === "core" ? "\u6838\u5FC3\u6A21\u7EC4" : "\u5916\u90E8\u5F15\u7528";
+    lines.push("<div class='tt-meta'>" + kindText + " \xB7 " + escapeHtml(attrs.category || "\u65E0\u5206\u7C7B") + "</div>");
+    if (GRAPH_MODE === "author") {
+      if (attrs.is_team) {
+        lines.push("<div class='tt-meta team'>\u56E2\u961F \xB7 " + attrs.member_count + " \u540D\u6210\u5458</div>");
+      } else if (attrs.teams && attrs.teams.length) {
+        lines.push("<div class='tt-meta team'>\u53C2\u4E0E\u56E2\u961F\uFF1A" + escapeHtml(teamNames(attrs.teams)) + "</div>");
+      }
+    }
     if (attrs.status) lines.push("<div class='tt-meta'>\u72B6\u6001\uFF1A" + escapeHtml(attrs.status) + "</div>");
     lines.push("<div class='tt-stats'>\u6D4F\u89C8\u91CF " + formatNum(attrs.views) + " \xB7 \u6536\u85CF " + formatNum(attrs.favorites) + "</div>");
-    lines.push("<div class='tt-stats'>\u88AB\u4F9D\u8D56 " + attrs.in_degree + " \xB7 \u4F9D\u8D56 " + attrs.out_degree + " \xB7 PageRank " + attrs.pagerank.toFixed(5) + "</div>");
+    if (GRAPH_MODE === "author") {
+      lines.push("<div class='tt-stats'>\u5408\u4F5C\u5EA6 " + (attrs.degree != null ? attrs.degree : 0) + " \xB7 PageRank " + attrs.pagerank.toFixed(5) + "</div>");
+    } else {
+      lines.push("<div class='tt-stats'>\u88AB\u4F9D\u8D56 " + attrs.in_degree + " \xB7 \u4F9D\u8D56 " + attrs.out_degree + " \xB7 PageRank " + attrs.pagerank.toFixed(5) + "</div>");
+    }
     lines.push("<div class='tt-hint'>\u70B9\u51FB\u8DF3\u8F6C mcmod \u9875\u9762</div>");
     tooltipEl.innerHTML = lines.join("");
     tooltipEl.classList.remove("hidden");
@@ -9249,6 +9247,7 @@ function main() {
     tooltipEl.classList.add("hidden");
   }
   function positionTooltip() {
+    if (altLock) return;
     const pad = 12;
     const w = tooltipEl.offsetWidth;
     const h = tooltipEl.offsetHeight;
@@ -9256,10 +9255,37 @@ function main() {
     let y = lastMouse.y + pad;
     if (x + w > window.innerWidth) x = lastMouse.x - w - pad;
     if (y + h > window.innerHeight) y = lastMouse.y - h - pad;
+    x = Math.max(pad, Math.min(x, window.innerWidth - w - pad));
+    y = Math.max(pad, Math.min(y, window.innerHeight - h - pad));
     tooltipEl.style.left = x + "px";
     tooltipEl.style.top = y + "px";
   }
   let lastMouse = { x: 0, y: 0 };
+  let hoveredNode = null;
+  let altLock = false;
+  let lastAltPress = 0;
+  const ALT_DOUBLE_MS = 300;
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Alt") {
+      e.preventDefault();
+      altLock = true;
+      const now = performance.now();
+      if (now - lastAltPress < ALT_DOUBLE_MS) {
+        lastAltPress = 0;
+        if (panel.classList.contains("collapsed") || panel.style.display === "none") {
+          panel.style.display = panel.style.display === "none" ? "" : "none";
+        }
+      } else {
+        lastAltPress = now;
+      }
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.key === "Alt") {
+      altLock = false;
+      if (!hoveredNode) hideTooltip();
+    }
+  });
   window.addEventListener("mousemove", (e) => {
     lastMouse = { x: e.clientX, y: e.clientY };
     if (!tooltipEl.classList.contains("hidden")) positionTooltip();
@@ -9282,7 +9308,28 @@ function main() {
   function hideContextMenu() {
     contextMenu.classList.add("hidden");
   }
+  function nodeDeg(key) {
+    const a = graph.getNodeAttributes(key);
+    return a.degree != null ? a.degree : a.in_degree || 0;
+  }
   function collectRelations(key) {
+    if (GRAPH_MODE === "author") {
+      const attrs = graph.getNodeAttributes(key);
+      const byDeg = (a, b) => nodeDeg(b) - nodeDeg(a);
+      const partners = /* @__PURE__ */ new Set();
+      graph.forEachEdge((edge, eAttrs, source, target) => {
+        if (eAttrs.kind !== "cooperation") return;
+        if (source === key) partners.add(target);
+        else if (target === key) partners.add(source);
+      });
+      const teams = (attrs.teams || []).filter((id) => graph.hasNode(String(id)));
+      const members = (attrs.members || []).filter((id) => graph.hasNode(String(id)));
+      return {
+        partners: [...partners].sort(byDeg),
+        teams: [...teams].sort(byDeg),
+        members: [...members].sort(byDeg)
+      };
+    }
     const dependsOn = /* @__PURE__ */ new Set();
     const dependedBy = /* @__PURE__ */ new Set();
     const interacts = /* @__PURE__ */ new Set();
@@ -9298,7 +9345,7 @@ function main() {
       if (kind === "interaction") interacts.add(s);
       else dependedBy.add(s);
     });
-    const byInDegree = (a, b) => (graph.getNodeAttribute(b, "in_degree") || 0) - (graph.getNodeAttribute(a, "in_degree") || 0);
+    const byInDegree = (a, b) => nodeDeg(b) - nodeDeg(a);
     return {
       dependsOn: [...dependsOn].sort(byInDegree),
       dependedBy: [...dependedBy].sort(byInDegree),
@@ -9326,15 +9373,21 @@ function main() {
     const lines = [];
     lines.push(attrs.name || key);
     if (attrs.name_en) lines.push(attrs.name_en);
-    lines.push("class " + key);
-    lines.push("\u88AB\u4F9D\u8D56 " + attrs.in_degree + " \xB7 \u4F9D\u8D56 " + attrs.out_degree);
+    lines.push(nodeKindLabel(attrs) + " " + key);
+    if (GRAPH_MODE === "author") {
+      if (attrs.is_team) lines.push("\u56E2\u961F \xB7 " + attrs.member_count + " \u540D\u6210\u5458");
+      else if (attrs.teams && attrs.teams.length) lines.push("\u53C2\u4E0E\u56E2\u961F " + teamNames(attrs.teams));
+      lines.push("\u5408\u4F5C\u5EA6 " + (attrs.degree != null ? attrs.degree : 0));
+    } else {
+      lines.push("\u88AB\u4F9D\u8D56 " + attrs.in_degree + " \xB7 \u4F9D\u8D56 " + attrs.out_degree);
+    }
     lines.push("\u6D4F\u89C8\u91CF " + formatNum(attrs.views));
     lines.push("\u6536\u85CF " + formatNum(attrs.favorites));
     if (attrs.category) lines.push("\u5206\u7C7B " + attrs.category);
     if (attrs.status) lines.push("\u72B6\u6001 " + attrs.status);
     return lines.join("\n");
   }
-  const REL_LABELS = { dependsOn: "\u4F9D\u8D56", dependedBy: "\u88AB\u4F9D\u8D56", interacts: "\u8054\u52A8" };
+  const REL_LABELS = { dependsOn: "\u4F9D\u8D56", dependedBy: "\u88AB\u4F9D\u8D56", interacts: "\u8054\u52A8", partners: "\u5408\u4F5C", teams: "\u56E2\u961F", members: "\u6210\u5458" };
   function contextItem(key, badgeType) {
     const attrs = graph.getNodeAttributes(key);
     const div = document.createElement("div");
@@ -9397,10 +9450,11 @@ function main() {
     if (hops && hops.length) {
       for (const e of hops) if (e != null) highlightEdges.add(e);
     }
-    if (renderer) renderer.refresh();
+    if (renderer) renderer.scheduleRefresh();
   }
   function showSixDegreesMenu(source, x, y) {
     const state = { query: "", page: 0, target: null, result: null };
+    const filter = { kind: "all", rel: "all" };
     contextMenu.innerHTML = "";
     const titleEl = document.createElement("div");
     titleEl.className = "ctx-title ctx-title-row";
@@ -9421,9 +9475,12 @@ function main() {
     searchWrap.className = "ctx-search";
     const input = document.createElement("input");
     input.type = "text";
-    input.placeholder = "\u641C\u7D22\u76EE\u6807\u6A21\u7EC4\u2026";
+    input.placeholder = GRAPH_MODE === "author" ? "\u641C\u7D22\u76EE\u6807\u4F5C\u8005\u2026" : "\u641C\u7D22\u76EE\u6807\u6A21\u7EC4\u2026";
     searchWrap.appendChild(input);
     contextMenu.appendChild(searchWrap);
+    const filterEl = document.createElement("div");
+    filterEl.className = "ctx-filters";
+    contextMenu.appendChild(filterEl);
     const listEl = document.createElement("div");
     contextMenu.appendChild(listEl);
     const detectBtn = document.createElement("button");
@@ -9436,8 +9493,9 @@ function main() {
     contextMenu.appendChild(resultEl);
     function renderList() {
       listEl.innerHTML = "";
+      filterEl.innerHTML = "";
       const q = state.query.trim().toLowerCase();
-      let matches = [];
+      let pool = [];
       if (q) {
         const seen = /* @__PURE__ */ new Set();
         for (const [term, nodes] of searchIndex) {
@@ -9445,15 +9503,38 @@ function main() {
             for (const n of nodes) {
               if (!seen.has(n.key)) {
                 seen.add(n.key);
-                matches.push(n);
+                pool.push(n);
               }
             }
           }
         }
       } else {
-        matches = [...allNodes];
+        pool = [...allNodes];
       }
-      matches.sort((a, b) => (b.views || 0) - (a.views || 0));
+      if (GRAPH_MODE === "author") {
+        filterEl.appendChild(buildFilterBar(
+          {
+            all: pool.length,
+            team: pool.filter((n) => n.is_team).length,
+            author: pool.filter((n) => !n.is_team).length
+          },
+          [
+            { key: "coop", label: "\u5408\u4F5C", count: pool.filter((n) => (n.degree || 0) > 0).length },
+            { key: "contains", label: "\u5305\u542B", count: pool.filter((n) => n.is_team).length },
+            { key: "belongs", label: "\u5C5E\u4E8E", count: pool.filter((n) => n.teams && n.teams.length).length }
+          ],
+          filter,
+          () => {
+            state.page = 0;
+            state.target = null;
+            detectBtn.disabled = true;
+            renderList();
+            positionMenu(x, y);
+          }
+        ));
+      }
+      let matches = GRAPH_MODE === "author" ? filterNodesByKind(filterNodesByRel(pool, filter.rel), filter.kind) : pool;
+      matches = sortNodes(matches);
       const pageSize = 20;
       const pages = Math.max(1, Math.ceil(matches.length / pageSize));
       if (state.page >= pages) state.page = pages - 1;
@@ -9463,7 +9544,7 @@ function main() {
         const li = document.createElement("div");
         li.className = "ctx-item" + (state.target === n.key ? " selected" : "");
         li.textContent = n.label + (n.name_en ? " (" + n.name_en + ")" : "");
-        li.title = "class " + n.key;
+        li.title = nodeKindLabel(n) + " " + n.key;
         li.addEventListener("click", (e) => {
           e.stopPropagation();
           state.target = n.key;
@@ -9515,6 +9596,9 @@ function main() {
           if (kind === "interaction") {
             label = "\u8054\u52A8";
             cls = "interaction";
+          } else if (kind === "cooperation") {
+            label = "\u5408\u4F5C";
+            cls = "interaction";
           } else {
             const s = graph.source(hop);
             label = s === path[i] ? "\u4F9D\u8D56" : "\u88AB\u4F9D\u8D56";
@@ -9540,14 +9624,15 @@ function main() {
       positionMenu(x, y);
     }
     detectBtn.addEventListener("click", detect);
-    input.addEventListener("input", () => {
+    const onSixInput = debounce(() => {
       state.query = input.value;
       state.page = 0;
       state.target = null;
       detectBtn.disabled = true;
       renderList();
       positionMenu(x, y);
-    });
+    }, 150);
+    input.addEventListener("input", onSixInput);
     renderList();
     contextMenu.classList.remove("hidden");
     positionMenu(x, y);
@@ -9557,6 +9642,7 @@ function main() {
     const attrs = graph.getNodeAttributes(node);
     const rel = collectRelations(node);
     const state = { title: attrs.name || node, rel, tab: "all", page: 0, query: "" };
+    const filter = { kind: "all", rel: "all" };
     contextMenu.innerHTML = "";
     const titleEl = document.createElement("div");
     titleEl.className = "ctx-title ctx-title-row";
@@ -9577,7 +9663,7 @@ function main() {
     searchWrap.className = "ctx-search";
     const input = document.createElement("input");
     input.type = "text";
-    input.placeholder = "\u641C\u7D22\u5173\u8054\u6A21\u7EC4\u2026";
+    input.placeholder = GRAPH_MODE === "author" ? "\u641C\u7D22\u2026" : "\u641C\u7D22\u5173\u8054\u6A21\u7EC4\u2026";
     searchWrap.appendChild(input);
     contextMenu.appendChild(searchWrap);
     const tabs = document.createElement("div");
@@ -9591,6 +9677,22 @@ function main() {
       { key: "dependedBy", label: "\u88AB\u4F9D\u8D56" },
       { key: "interacts", label: "\u8054\u52A8" }
     ];
+    const unionKeys = GRAPH_MODE === "author" ? [.../* @__PURE__ */ new Set([...state.rel.partners, ...state.rel.teams, ...state.rel.members])] : [];
+    function kindCounts(keys) {
+      if (GRAPH_MODE !== "author") return { all: 0, team: 0, author: 0 };
+      const team = keys.filter((k) => graph.getNodeAttribute(k, "is_team")).length;
+      return { all: keys.length, team, author: keys.length - team };
+    }
+    function relItems() {
+      const items = [{ key: "coop", label: "\u5408\u4F5C", count: state.rel.partners.length }];
+      if (attrs.is_team) {
+        items.push({ key: "contains", label: "\u5305\u542B", count: state.rel.members.length });
+      }
+      if ((attrs.teams || []).length) {
+        items.push({ key: "belongs", label: "\u5C5E\u4E8E", count: state.rel.teams.length });
+      }
+      return items;
+    }
     function tabCount(key) {
       if (key === "all") {
         return state.rel.dependsOn.length + state.rel.dependedBy.length + state.rel.interacts.length;
@@ -9598,14 +9700,34 @@ function main() {
       return state.rel[key].length;
     }
     function activeList() {
+      if (GRAPH_MODE === "author") {
+        let keys;
+        if (filter.rel === "coop") keys = state.rel.partners;
+        else if (filter.rel === "contains") keys = state.rel.members;
+        else if (filter.rel === "belongs") keys = state.rel.teams;
+        else keys = unionKeys;
+        if (filter.kind === "team") keys = keys.filter((k) => graph.getNodeAttribute(k, "is_team"));
+        else if (filter.kind === "author") keys = keys.filter((k) => !graph.getNodeAttribute(k, "is_team"));
+        const items2 = keys.map((key) => {
+          let type = null;
+          if (filter.rel === "all") {
+            if (state.rel.members.includes(key)) type = "members";
+            else if (state.rel.teams.includes(key)) type = "teams";
+            else type = "partners";
+          } else {
+            type = filter.rel === "coop" ? "partners" : filter.rel;
+          }
+          return { key, type };
+        });
+        items2.sort((a, b) => nodeDeg(b.key) - nodeDeg(a.key));
+        return items2;
+      }
       const items = [];
       if (state.tab === "all") {
         for (const key of state.rel.dependsOn) items.push({ key, type: "dependsOn" });
         for (const key of state.rel.dependedBy) items.push({ key, type: "dependedBy" });
         for (const key of state.rel.interacts) items.push({ key, type: "interacts" });
-        items.sort(
-          (a, b) => (graph.getNodeAttribute(b.key, "in_degree") || 0) - (graph.getNodeAttribute(a.key, "in_degree") || 0)
-        );
+        items.sort((a, b) => nodeDeg(b.key) - nodeDeg(a.key));
       } else {
         for (const key of state.rel[state.tab]) items.push({ key, type: null });
       }
@@ -9613,6 +9735,15 @@ function main() {
     }
     function renderTabs() {
       tabs.innerHTML = "";
+      if (GRAPH_MODE === "author") {
+        tabs.appendChild(buildFilterBar(kindCounts(unionKeys), relItems(), filter, () => {
+          state.page = 0;
+          renderTabs();
+          renderBody();
+          positionMenu(x, y);
+        }));
+        return;
+      }
       for (const def of TAB_DEFS) {
         const t = document.createElement("button");
         t.className = "ctx-tab" + (state.tab === def.key ? " active" : "");
@@ -9679,7 +9810,8 @@ function main() {
     contextMenu.innerHTML = "";
     const titleEl = document.createElement("div");
     titleEl.className = "ctx-title";
-    titleEl.textContent = "\u5173\u7CFB";
+    const kind = graph.getEdgeAttribute(edge, "kind");
+    titleEl.textContent = GRAPH_MODE === "author" ? kind === "membership" ? "\u6210\u5458" : kind === "cooperation" ? "\u5408\u4F5C" : "\u5173\u7CFB" : "\u5173\u7CFB";
     contextMenu.appendChild(titleEl);
     const st = document.createElement("div");
     st.className = "ctx-section-title";
@@ -9693,7 +9825,7 @@ function main() {
   function drawEdges(ctx, tx, ty, scale2) {
     graph.forEachEdge((edge, attrs, source, target, sa, ta) => {
       const rgb = attrs.rgb || DEPENDENCY_EDGE_RGB;
-      ctx.strokeStyle = rgbaString(rgb, EDGE_ALPHA);
+      ctx.strokeStyle = rgbaString(rgb, attrs.alpha != null ? attrs.alpha : EDGE_ALPHA);
       ctx.lineWidth = Math.max(1, (attrs.size || 0.5) * scale2);
       ctx.beginPath();
       ctx.moveTo(tx(sa.x), ty(sa.y));
@@ -9701,10 +9833,21 @@ function main() {
       ctx.stroke();
     });
   }
-  function drawLabel(ctx, cx, cy, r, attrs) {
+  function drawEdgesBand(ctx, edges, tileX0, tileY0, tileW) {
+    for (const e of edges) {
+      if (Math.max(e.ax, e.bx) + e.half < tileX0 || Math.min(e.ax, e.bx) - e.half > tileX0 + tileW) continue;
+      ctx.strokeStyle = rgbaString(e.rgb, e.alpha);
+      ctx.lineWidth = e.lineWidth;
+      ctx.beginPath();
+      ctx.moveTo(e.ax - tileX0, e.ay - tileY0);
+      ctx.lineTo(e.bx - tileX0, e.by - tileY0);
+      ctx.stroke();
+    }
+  }
+  function drawLabel(ctx, cx, cy, r, attrs, labelScale) {
     const name = attrs.name || attrs.key;
-    const idText = "class " + attrs.key;
-    const fontSize = LABEL_FONT_SIZE;
+    const idText = nodeKindLabel(attrs) + " " + attrs.key;
+    const fontSize = LABEL_FONT_SIZE * (labelScale || 1);
     const lineHeight = fontSize * 1.25;
     ctx.font = fontSize + 'px "Microsoft YaHei", "PingFang SC", sans-serif';
     ctx.textAlign = "center";
@@ -9725,7 +9868,7 @@ function main() {
     ctx.fillStyle = "#9fb0c3";
     ctx.fillText(idText, cx, by + padY + lineHeight);
   }
-  async function drawNodesAt(ctx, items, onProgress) {
+  async function drawNodesAt(ctx, items, onProgress, labelScale) {
     const total = items.length;
     let idx = 0;
     let done = 0;
@@ -9737,7 +9880,7 @@ function main() {
         const attrs = item.attrs;
         const cx = item.cx, cy = item.cy, r = item.r;
         let img = null;
-        const src = attrs.imageSrc || attrs.image;
+        const src = coverBlobUrls.get(attrs.key) || attrs.image;
         if (src) {
           img = new Image();
           img.src = src;
@@ -9762,7 +9905,7 @@ function main() {
           ctx.fillStyle = attrs.color || "#888888";
           ctx.fill();
         }
-        drawLabel(ctx, cx, cy, r, attrs);
+        drawLabel(ctx, cx, cy, r, attrs, labelScale);
         done++;
         if (onProgress) onProgress(done, total);
       }
@@ -9801,16 +9944,45 @@ function main() {
   }
   async function renderTiled(W, H, scale2, nodePixels, toX, toY) {
     const TILE_W = 8192;
-    const TILE_H = 1024;
+    const TILE_H = 256;
     const cols = Math.ceil(W / TILE_W);
     const rows = Math.ceil(H / TILE_H);
     const totalTiles = cols * rows;
     let renderedTiles = 0;
     const startTime = Date.now();
+    const labelBottom = LABEL_FONT_SIZE * 3.25;
+    const bandNodes = Array.from({ length: rows }, () => []);
+    for (const n of nodePixels) {
+      const top = Math.max(0, Math.floor((n.py - n.pr) / TILE_H));
+      const bottom = Math.min(rows - 1, Math.floor((n.py + n.pr + labelBottom) / TILE_H));
+      for (let r = top; r <= bottom; r++) bandNodes[r].push(n);
+    }
+    const bandEdges = Array.from({ length: rows }, () => []);
+    graph.forEachEdge((edge, attrs, source, target, sa, ta) => {
+      const ax = toX(sa.x), ay = toY(sa.y);
+      const bx = toX(ta.x), by = toY(ta.y);
+      const lineWidth = Math.max(1, (attrs.size || 0.5) * scale2);
+      const half = lineWidth / 2 + 1;
+      const top = Math.max(0, Math.floor((Math.min(ay, by) - half) / TILE_H));
+      const bottom = Math.min(rows - 1, Math.floor((Math.max(ay, by) + half) / TILE_H));
+      const item = {
+        ax,
+        ay,
+        bx,
+        by,
+        half,
+        lineWidth,
+        rgb: attrs.rgb || DEPENDENCY_EDGE_RGB,
+        alpha: attrs.alpha != null ? attrs.alpha : EDGE_ALPHA
+      };
+      for (let r = top; r <= bottom; r++) bandEdges[r].push(item);
+    });
     async function* getScanlines() {
       for (let r = 0; r < rows; r++) {
         const tileY0 = r * TILE_H;
         const tileH = Math.min(TILE_H, H - tileY0);
+        const band = bandNodes[r];
+        const bandE = bandEdges[r];
         const colData = [];
         for (let c = 0; c < cols; c++) {
           const tileX0 = c * TILE_W;
@@ -9821,14 +9993,11 @@ function main() {
           const ctx = canvas.getContext("2d");
           ctx.fillStyle = "#000000";
           ctx.fillRect(0, 0, tileW, tileH);
-          const tx = (x) => toX(x) - tileX0;
-          const ty = (y) => toY(y) - tileY0;
-          drawEdges(ctx, tx, ty, scale2);
+          drawEdgesBand(ctx, bandE, tileX0, tileY0, tileW);
           const items = [];
-          for (const n of nodePixels) {
-            const labelBottom = LABEL_FONT_SIZE * 3.25;
+          for (const n of band) {
             const labelHalf = Math.max(n.pr, LABEL_FONT_SIZE * 16);
-            if (n.px + labelHalf >= tileX0 && n.px - labelHalf <= tileX0 + tileW && n.py + n.pr + labelBottom >= tileY0 && n.py - n.pr <= tileY0 + tileH) {
+            if (n.px + labelHalf >= tileX0 && n.px - labelHalf <= tileX0 + tileW) {
               items.push({ attrs: n.attrs, cx: n.px - tileX0, cy: n.py - tileY0, r: n.pr });
             }
           }
@@ -9859,10 +10028,146 @@ function main() {
     }
     return encodePNG(W, H, getScanlines);
   }
+  async function zipStore(files) {
+    const parts = [];
+    const central = [];
+    let offset = 0;
+    let cdBytes = 0;
+    const enc = new TextEncoder();
+    for (const f of files) {
+      const name = enc.encode(f.name);
+      const crc = crc32(f.bytes, 0, f.bytes.length);
+      const size = f.bytes.length;
+      const lh = new DataView(new ArrayBuffer(30));
+      lh.setUint32(0, 67324752, true);
+      lh.setUint16(4, 20, true);
+      lh.setUint16(6, 2048, true);
+      lh.setUint16(8, 0, true);
+      lh.setUint16(10, 0, true);
+      lh.setUint16(12, 33, true);
+      lh.setUint32(14, crc, true);
+      lh.setUint32(18, size, true);
+      lh.setUint32(22, size, true);
+      lh.setUint16(26, name.length, true);
+      lh.setUint16(28, 0, true);
+      parts.push(lh.buffer, name, f.bytes.buffer);
+      const ch = new DataView(new ArrayBuffer(46));
+      ch.setUint32(0, 33639248, true);
+      ch.setUint16(4, 20, true);
+      ch.setUint16(6, 20, true);
+      ch.setUint16(8, 2048, true);
+      ch.setUint16(10, 0, true);
+      ch.setUint16(12, 0, true);
+      ch.setUint16(14, 33, true);
+      ch.setUint32(16, crc, true);
+      ch.setUint32(20, size, true);
+      ch.setUint32(24, size, true);
+      ch.setUint16(28, name.length, true);
+      ch.setUint16(30, 0, true);
+      ch.setUint16(32, 0, true);
+      ch.setUint16(34, 0, true);
+      ch.setUint16(36, 0, true);
+      ch.setUint32(38, 0, true);
+      ch.setUint32(42, offset, true);
+      central.push(ch.buffer, name);
+      offset += 30 + name.length + size;
+      cdBytes += 46 + name.length;
+    }
+    const eocd = new DataView(new ArrayBuffer(22));
+    eocd.setUint32(0, 101010256, true);
+    eocd.setUint16(4, 0, true);
+    eocd.setUint16(6, 0, true);
+    eocd.setUint16(8, files.length, true);
+    eocd.setUint16(10, files.length, true);
+    eocd.setUint32(12, cdBytes, true);
+    eocd.setUint32(16, offset, true);
+    eocd.setUint16(20, 0, true);
+    parts.push(...central, eocd.buffer);
+    return new Blob(parts, { type: "application/zip" });
+  }
+  function viewerHtml(W, H, maxLevel) {
+    const css = "html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif}#view{position:fixed;inset:0;cursor:grab;touch-action:none}#view.drag{cursor:grabbing}#hint{position:fixed;left:10px;bottom:10px;color:#888;font-size:12px;background:rgba(0,0,0,.5);padding:4px 8px;border-radius:4px;pointer-events:none}";
+    const js = "const W=" + W + ",H=" + H + ",TILE=" + EXPORT_TILE + ",MAX_LEVEL=" + maxLevel + ";const c=document.getElementById('view'),ctx=c.getContext('2d');let vw=0,vh=0;function rs(){vw=c.width=innerWidth;vh=c.height=innerHeight;}addEventListener('resize',rs);rs();let s=Math.min(vw/W,vh/H)*.95,ox=(vw-W*s)/2,oy=(vh-H*s)/2;const cache=new Map(),pending=new Set();function lvl(){return Math.max(0,Math.min(MAX_LEVEL,Math.ceil(Math.log2(1/s))));}function draw(){ctx.fillStyle='#000';ctx.fillRect(0,0,vw,vh);const l=lvl(),div=1<<l,span=TILE*div;const x0=-ox/s,x1=(vw-ox)/s,y0=-oy/s,y1=(vh-oy)/s;const c0=Math.max(0,Math.floor(x0/span)),c1=Math.min(Math.ceil(W/span)-1,Math.floor(x1/span));const r0=Math.max(0,Math.floor(y0/span)),r1=Math.min(Math.ceil(H/span)-1,Math.floor(y1/span));for(let r=r0;r<=r1;r++)for(let cc=c0;cc<=c1;cc++){const key=l+':'+cc+':'+r,img=cache.get(key);if(img)ctx.drawImage(img,ox+cc*span*s,oy+r*span*s,span*s,span*s);else if(!pending.has(key)){pending.add(key);load(key,l,cc,r);}}}function load(key,l,cc,r){const im=new Image();im.onload=()=>{cache.set(key,im);pending.delete(key);draw();};im.onerror=()=>pending.delete(key);im.src='tiles/'+l+'/'+cc+'_'+r+'.png';}let drag=false,lx=0,ly=0;c.addEventListener('mousedown',e=>{drag=true;lx=e.clientX;ly=e.clientY;c.classList.add('drag');});addEventListener('mousemove',e=>{if(!drag)return;ox+=e.clientX-lx;oy+=e.clientY-ly;lx=e.clientX;ly=e.clientY;draw();});addEventListener('mouseup',()=>{drag=false;c.classList.remove('drag');});c.addEventListener('wheel',e=>{e.preventDefault();const f=Math.exp(-e.deltaY*.0012),nx=e.clientX,ny=e.clientY;const gx=(nx-ox)/s,gy=(ny-oy)/s;s=Math.min(Math.max(s*f,Math.min(vw/W,vh/H)*.5),2);ox=nx-gx*s;oy=ny-gy*s;draw();},{passive:false});let t=null;c.addEventListener('touchstart',e=>{t={x:e.touches[0].clientX,y:e.touches[0].clientY};},{passive:true});c.addEventListener('touchmove',e=>{if(!t)return;ox+=e.touches[0].clientX-t.x;oy+=e.touches[0].clientY-t.y;t={x:e.touches[0].clientX,y:e.touches[0].clientY};draw();},{passive:true});c.addEventListener('touchend',()=>{t=null;});draw();";
+    return "<!DOCTYPE html>\n<html lang='zh-CN'>\n<head>\n<meta charset='utf-8'>\n<meta name='viewport' content='width=device-width,initial-scale=1'>\n<title>\u661F\u56FE\u5BFC\u51FA</title>\n<style>" + css + "</style>\n</head>\n<body>\n<canvas id='view'></canvas>\n<div id='hint'>\u62D6\u62FD\u5E73\u79FB \xB7 \u6EDA\u8F6E\u7F29\u653E</div>\n<script>" + js + "<\/script>\n</body>\n</html>";
+  }
+  async function renderPyramidTiles(W, H, scale0, ox0, oy0, minX, minY, nodePixels0, onProgress) {
+    const maxDim = Math.max(W, H);
+    const maxLevel = Math.max(0, Math.ceil(Math.log2(maxDim / MIN_LEVEL_SIZE)));
+    const toX0 = (x) => (x - minX) * scale0 + ox0;
+    const toY0 = (y) => (y - minY) * scale0 + oy0;
+    let total = 0;
+    for (let l = 0; l <= maxLevel; l++) {
+      const d = 1 << l;
+      total += Math.ceil(Math.ceil(W / d) / EXPORT_TILE) * Math.ceil(Math.ceil(H / d) / EXPORT_TILE);
+    }
+    const files = [];
+    let done = 0;
+    const labelBottom = LABEL_FONT_SIZE * 3.25;
+    for (let l = 0; l <= maxLevel; l++) {
+      const d = 1 << l;
+      const Wl = Math.ceil(W / d), Hl = Math.ceil(H / d);
+      const cols = Math.ceil(Wl / EXPORT_TILE), rows = Math.ceil(Hl / EXPORT_TILE);
+      const labelScale = 1 / d;
+      const bandNodes = Array.from({ length: rows }, () => []);
+      for (const n of nodePixels0) {
+        const px = n.px / d, py = n.py / d, pr = n.pr / d;
+        const top = Math.max(0, Math.floor((py - pr) / EXPORT_TILE));
+        const bottom = Math.min(rows - 1, Math.floor((py + pr + labelBottom * labelScale) / EXPORT_TILE));
+        for (let r = top; r <= bottom; r++) bandNodes[r].push({ attrs: n.attrs, px, py, pr });
+      }
+      const bandEdges = Array.from({ length: rows }, () => []);
+      graph.forEachEdge((edge, attrs, source, target, sa, ta) => {
+        const ax = toX0(sa.x) / d, ay = toY0(sa.y) / d;
+        const bx = toX0(ta.x) / d, by = toY0(ta.y) / d;
+        const lineWidth = Math.max(1, (attrs.size || 0.5) * scale0 / d);
+        const half = lineWidth / 2 + 1;
+        const top = Math.max(0, Math.floor((Math.min(ay, by) - half) / EXPORT_TILE));
+        const bottom = Math.min(rows - 1, Math.floor((Math.max(ay, by) + half) / EXPORT_TILE));
+        const item = {
+          ax,
+          ay,
+          bx,
+          by,
+          half,
+          lineWidth,
+          rgb: attrs.rgb || DEPENDENCY_EDGE_RGB,
+          alpha: attrs.alpha != null ? attrs.alpha : EDGE_ALPHA
+        };
+        for (let r = top; r <= bottom; r++) bandEdges[r].push(item);
+      });
+      for (let r = 0; r < rows; r++) {
+        const bandE = bandEdges[r];
+        const band = bandNodes[r];
+        for (let c = 0; c < cols; c++) {
+          const canvas = document.createElement("canvas");
+          canvas.width = EXPORT_TILE;
+          canvas.height = EXPORT_TILE;
+          const ctx = canvas.getContext("2d");
+          ctx.fillStyle = "#000000";
+          ctx.fillRect(0, 0, EXPORT_TILE, EXPORT_TILE);
+          drawEdgesBand(ctx, bandE, c * EXPORT_TILE, r * EXPORT_TILE, EXPORT_TILE);
+          const items = [];
+          for (const n of band) {
+            const labelHalf = Math.max(n.pr, LABEL_FONT_SIZE * 16 * labelScale);
+            if (n.px + labelHalf >= c * EXPORT_TILE && n.px - labelHalf <= c * EXPORT_TILE + EXPORT_TILE) {
+              items.push({ attrs: n.attrs, cx: n.px - c * EXPORT_TILE, cy: n.py - r * EXPORT_TILE, r: n.pr });
+            }
+          }
+          await drawNodesAt(ctx, items, null, labelScale);
+          const blob = await canvasToBlob(canvas);
+          files.push({ name: "tiles/" + l + "/" + c + "_" + r + ".png", bytes: new Uint8Array(await blob.arrayBuffer()) });
+          done++;
+          if (onProgress) onProgress(done, total);
+        }
+      }
+    }
+    return { files, maxLevel };
+  }
   async function exportPNG() {
     if (!graph) return;
-    const W = parseInt(exportWidth.value, 10) || 65536;
-    const H = parseInt(exportHeight.value, 10) || 65536;
+    const W = Math.max(64, parseInt(exportWidth.value, 10) || 65536);
+    const H = Math.max(64, parseInt(exportHeight.value, 10) || 65536);
+    const wantSinglePng = exportSinglePng.checked;
     exportButton.disabled = true;
     exportButton.textContent = "\u5BFC\u51FA\u4E2D\u2026";
     try {
@@ -9893,30 +10198,42 @@ function main() {
         py: toY(attrs.y),
         pr: attrs.size * scale2
       }));
-      const SINGLE_MAX = 16384;
-      const blob = W < SINGLE_MAX && H < SINGLE_MAX ? await renderSingle(W, H, scale2, nodePixels, toX, toY) : await renderTiled(W, H, scale2, nodePixels, toX, toY);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "mcmod-graph-" + W + "x" + H + ".png";
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      const { files, maxLevel } = await renderPyramidTiles(W, H, scale2, ox, oy, minX, minY, nodePixels, (done, total) => {
+        exportButton.textContent = "\u5BFC\u51FA\u74E6\u7247 " + Math.round(done / total * 100) + "% \xB7 " + done + " / " + total;
+      });
+      files.push({ name: "viewer.html", bytes: new TextEncoder().encode(viewerHtml(W, H, maxLevel)) });
+      const zipBlob = await zipStore(files);
+      downloadBlob(zipBlob, "mcmod-graph-" + W + "x" + H + ".zip");
+      if (wantSinglePng) {
+        exportButton.textContent = "\u5BFC\u51FA\u5355\u5F20 PNG\u2026";
+        const SINGLE_MAX = 16384;
+        const blob = W < SINGLE_MAX && H < SINGLE_MAX ? await renderSingle(W, H, scale2, nodePixels, toX, toY) : await renderTiled(W, H, scale2, nodePixels, toX, toY);
+        downloadBlob(blob, "mcmod-graph-" + W + "x" + H + ".png");
+      }
     } catch (err) {
-      console.error("[\u9519\u8BEF] \u5BFC\u51FA PNG \u5931\u8D25", err);
+      console.error("[\u9519\u8BEF] \u5BFC\u51FA\u5931\u8D25", err);
       exportButton.textContent = "\u5BFC\u51FA\u5931\u8D25";
       setTimeout(() => {
         exportButton.textContent = "\u4E0B\u8F7D\u6E32\u67D3\u56FE";
       }, 2e3);
     } finally {
       exportButton.disabled = false;
-      if (exportButton.textContent.startsWith("\u5BFC\u51FA\u4E2D")) {
+      if (exportButton.textContent.startsWith("\u5BFC\u51FA") && !exportButton.textContent.startsWith("\u5BFC\u51FA\u5931\u8D25")) {
         exportButton.textContent = "\u4E0B\u8F7D\u6E32\u67D3\u56FE";
       }
     }
   }
-  cleanupLegacyServiceWorker().then(() => boot()).catch((err) => {
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+  boot().catch((err) => {
     statusText.textContent = "\u51FA\u9519\u4E86\uFF1A" + err.message;
     progressLabel.textContent = "";
     console.error("[\u9519\u8BEF]", err);

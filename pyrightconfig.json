@@ -1,0 +1,4 @@
+{
+  "typeCheckingMode": "strict",
+  "include": ["server.py"]
+}

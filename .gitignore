@@ -1,16 +1,13 @@
-# Python
 __pycache__/
 *.py[cod]
-
-# Node
+*.egg-info/
 node_modules/
-
-# 构建产物（sourcemap 不入库）
 main.bundle.js.map
-
-# 数据与发布产物（GitHub Releases 分发，不入库）
-graph.json
+graph*.json
 release/
+releasing/
+graph/
+covers/
 
 # CI 生成的封面与合并缓存（release 资产缓存、封面、dist 均随站点发布不入库）
 /covers/

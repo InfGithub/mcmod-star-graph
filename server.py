@@ -25,6 +25,7 @@ star_graph/server.py - 本地服务器：静态文件服务 + 封面代理
     防止被当作开放代理（SSRF）。
 """
 
+import hashlib
 import json
 import os
 import re
@@ -32,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -40,6 +42,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict, List, Optional
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 1119
@@ -61,15 +64,19 @@ REQUEST_TIMEOUT = 15
 ROOT_DIR = Path(__file__).resolve().parent
 COVERS_DIR = ROOT_DIR / "covers"
 STATIC_FALLBACK_BASE = os.environ.get("STAR_GRAPH_STATIC_FALLBACK", "").rstrip("/")
+# 封面磁盘缓存：跨浏览器/跨设备共享，命中直接回文件不再请求 mcmod（上游优化）
+COVER_CACHE_TTL = 7 * 24 * 3600  # 缓存有效期 7 天，CDN 图片可能更新
+# 缓存文件名按真实图片格式命名，由 Content-Type 决定扩展名
+EXT_BY_TYPE = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}
 
 # clean 模式：一次性标志，下次页面加载时前端清空封面缓存
 _CLEAN_CACHE = False
 # --data 指定的图数据文件（以 DATA_ALIAS 名字服务），None 时直接服务根目录同名文件
-_DATA_FILE = None
-_DOWNLOAD_JOBS = {}
+_DATA_FILE: Optional[str] = None
+_DOWNLOAD_JOBS: Dict[str, Any] = {}
 _DOWNLOAD_LOCK = threading.Lock()
 _SERVER_MODE = DEFAULT_MODE
-_COVER_LOCKS = {}
+_COVER_LOCKS: Dict[str, threading.Lock] = {}
 _COVER_LOCKS_GUARD = threading.Lock()
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -79,25 +86,25 @@ USER_AGENT = (
 REFERER = "https://www.mcmod.cn/"
 
 
-def _normalize_cover_url(value):
+def _normalize_cover_url(value: Any) -> str:
     url = str(value or "").strip()
     if url.startswith("//"):
         url = "https:" + url
     return re.sub(r"@\d+x\d+\.jpg$", f"@{COVER_SIZE}x{COVER_SIZE}.jpg", url)
 
 
-def _cover_lock(key):
+def _cover_lock(key: str) -> threading.Lock:
     with _COVER_LOCKS_GUARD:
         return _COVER_LOCKS.setdefault(str(key), threading.Lock())
 
 
-def _download_cover_one(item):
+def _download_cover_one(item: Dict[str, Any]) -> tuple[str, str]:
     key = str(item.get("key", ""))
     with _cover_lock(key):
         return _download_cover_one_unlocked(item)
 
 
-def _download_cover_one_unlocked(item):
+def _download_cover_one_unlocked(item: Dict[str, Any]) -> tuple[str, str]:
     key = str(item["key"])
     url = _normalize_cover_url(item.get("cover_url"))
     if not re.fullmatch(r"\d+", key) or not Handler._is_allowed(url):
@@ -120,6 +127,18 @@ def _download_cover_one_unlocked(item):
                 raise ValueError("not an image")
             temp.write_bytes(data)
             temp.replace(target)
+            # 同时写入 digest 缓存，供 URL-keyed 访问复用
+            try:
+                digest = hashlib.sha1(url.encode("utf-8")).hexdigest()
+                ctype = content_type.split(";")[0].strip().lower() if content_type else "image/jpeg"
+                ext = EXT_BY_TYPE.get(ctype, "jpg")
+                cache_path = COVERS_DIR / f"{digest}.{ext}"
+                if not cache_path.exists():
+                    tmp2 = COVERS_DIR / f".{digest}.{uuid.uuid4().hex}.tmp"
+                    tmp2.write_bytes(data)
+                    tmp2.replace(cache_path)
+            except Exception:
+                pass
             return key, "downloaded"
         except Exception:
             try:
@@ -128,8 +147,9 @@ def _download_cover_one_unlocked(item):
                 pass
     return key, "failed"
 
-def _existing_cover_keys():
-    keys = []
+
+def _existing_cover_keys() -> List[str]:
+    keys: List[str] = []
     if COVERS_DIR.exists():
         for file in COVERS_DIR.glob("*.jpg"):
             if re.fullmatch(r"\d+", file.stem) and file.is_file() and file.stat().st_size > 0:
@@ -137,9 +157,9 @@ def _existing_cover_keys():
     return sorted(keys, key=lambda value: int(value))
 
 
-def _write_cover_manifest(nodes):
+def _write_cover_manifest(nodes: List[Dict[str, Any]]) -> None:
     """按当前已落盘文件写清单；单个图片文件在下载完成时就已原子保存。"""
-    items = {}
+    items: Dict[str, Any] = {}
     for item in nodes:
         key = str(item["key"])
         target = COVERS_DIR / f"{key}.jpg"
@@ -162,7 +182,7 @@ def _write_cover_manifest(nodes):
     temp_manifest.replace(COVERS_DIR / "manifest.json")
 
 
-def _record_download_result(job, result, manifest_nodes):
+def _record_download_result(job: Dict[str, Any], result: Dict[str, Any], manifest_nodes: List[Dict[str, Any]]) -> None:
     key = str(result.get("key", ""))
     status = result.get("status", "failed")
     with _DOWNLOAD_LOCK:
@@ -176,7 +196,7 @@ def _record_download_result(job, result, manifest_nodes):
         _write_cover_manifest(manifest_nodes)
 
 
-def _run_node_cover_download(job, nodes, manifest_nodes):
+def _run_node_cover_download(job: Dict[str, Any], nodes: List[Dict[str, Any]], manifest_nodes: List[Dict[str, Any]]) -> bool:
     node_bin = shutil.which("node")
     if not node_bin:
         return False
@@ -211,7 +231,7 @@ def _run_node_cover_download(job, nodes, manifest_nodes):
             pass
 
 
-def _run_cover_download(job_id, nodes, manifest_nodes):
+def _run_cover_download(job_id: str, nodes: List[Dict[str, Any]], manifest_nodes: List[Dict[str, Any]]) -> None:
     with _DOWNLOAD_LOCK:
         job = _DOWNLOAD_JOBS[job_id]
     if not nodes:
@@ -226,7 +246,7 @@ def _run_cover_download(job_id, nodes, manifest_nodes):
         return
 
     # Node 不可用时保留 Python 兜底下载器。
-    def done(result):
+    def done(result: tuple[str, str]) -> None:
         key, status = result
         _record_download_result(job, {"key": key, "status": status}, manifest_nodes)
 
@@ -240,32 +260,35 @@ def _run_cover_download(job_id, nodes, manifest_nodes):
 
 
 class _NullLock:
-    def __enter__(self): return self
-    def __exit__(self, exc_type, exc, tb): return False
+    def __enter__(self) -> Any: return self
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool: return False
 
 
 class Handler(SimpleHTTPRequestHandler):
     """静态文件（继承 SimpleHTTPRequestHandler，自带目录穿越防护）+ /cover_proxy 代理。"""
 
-    def end_headers(self):
+    # HTTP/1.1 keep-alive：复用连接，避免每张封面一次 TCP 建连（上游优化）
+    protocol_version = "HTTP/1.1"
+
+    def end_headers(self) -> None:
         # 允许在线页面探测/使用本机 server.py（不携带凭据）。
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
         super().end_headers()
 
-    def do_OPTIONS(self):
+    def do_OPTIONS(self) -> None:
         self.send_response(204)
         self.end_headers()
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path == DOWNLOAD_START_PATH:
             self._handle_download_start()
         else:
             self.send_error(404)
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path == HEALTH_PATH:
             self._handle_health()
@@ -282,7 +305,7 @@ class Handler(SimpleHTTPRequestHandler):
         else:
             super().do_GET()
 
-    def _send_json(self, status, payload):
+    def _send_json(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -291,7 +314,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _handle_download_start(self):
+    def _handle_download_start(self) -> None:
         if _SERVER_MODE != "enhanced":
             self._send_json(404, {"error": "cover download disabled in upstream mode"})
             return
@@ -301,7 +324,7 @@ class Handler(SimpleHTTPRequestHandler):
                 raise ValueError("invalid request size")
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             raw_nodes = payload.get("nodes", [])
-            nodes = []
+            nodes: List[Dict[str, Any]] = []
             seen = set()
             for item in raw_nodes:
                 key = str(item.get("key", ""))
@@ -317,7 +340,7 @@ class Handler(SimpleHTTPRequestHandler):
             existing = set(_existing_cover_keys())
             pending = [node for node in nodes if str(node["key"]) not in existing]
             job_id = uuid.uuid4().hex
-            job = {
+            job: Dict[str, Any] = {
                 "id": job_id,
                 "status": "running",
                 "total": len(nodes),
@@ -334,7 +357,7 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as error:
             self._send_json(400, {"error": str(error)})
 
-    def _handle_existing_covers(self):
+    def _handle_existing_covers(self) -> None:
         if _SERVER_MODE != "enhanced":
             self._send_json(404, {"error": "local cover storage disabled in upstream mode"})
             return
@@ -343,7 +366,7 @@ class Handler(SimpleHTTPRequestHandler):
         _write_cover_manifest([{"key": key} for key in keys])
         self._send_json(200, {"count": len(keys), "keys": keys})
 
-    def _handle_download_status(self, parsed):
+    def _handle_download_status(self, parsed: urllib.parse.SplitResult) -> None:
         query = urllib.parse.parse_qs(parsed.query)
         job_id = query.get("id", [""])[0]
         try:
@@ -360,7 +383,7 @@ class Handler(SimpleHTTPRequestHandler):
         job["ready_cursor"] = len(ready)
         self._send_json(200, job)
 
-    def _handle_health(self):
+    def _handle_health(self) -> None:
         body = json.dumps({"ok": True, "service": "star-graph-server", "mode": _SERVER_MODE}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -369,10 +392,14 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _handle_data(self):
+    def _handle_data(self) -> None:
         """把 --data 指定的文件以 /graph.json 名字返回。"""
+        data_file = _DATA_FILE
+        if data_file is None:
+            self.send_error(500)
+            return
         try:
-            with open(_DATA_FILE, "rb") as f:
+            with open(data_file, "rb") as f:
                 data = f.read()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -380,10 +407,10 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         except OSError as e:
-            print(f"[ERROR] read data file: {_DATA_FILE} -> {e}")
+            print(f"[ERROR] read data file: {data_file} -> {e}")
             self.send_error(500)
 
-    def _handle_clean(self):
+    def _handle_clean(self) -> None:
         """clean 模式探测：首次返回 true 并复位，之后返回 false（一次性）。"""
         global _CLEAN_CACHE
         body = json.dumps({"clean": _CLEAN_CACHE}).encode("utf-8")
@@ -395,11 +422,15 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _handle_proxy(self, parsed):
-        """焦点懒加载反代：返回图片的同时按 key 原子保存到本地 covers。"""
-        qs = urllib.parse.parse_qs(parsed.query)
-        url = qs.get("url", [""])[0]
-        key = qs.get("key", [""])[0]
+    def _handle_proxy(self, parsed: urllib.parse.SplitResult) -> None:
+        """焦点懒加载反代：返回图片的同时按 key 原子保存到本地 covers；兼容上游 UA 与 digest 缓存。"""
+        qs: Dict[str, List[str]] = urllib.parse.parse_qs(parsed.query)
+        url: str = qs.get("url", [""])[0]
+        key: str = qs.get("key", [""])[0]
+        # 上游：真实浏览器 UA，前端传 navigator.userAgent；非法或缺省回退默认 UA
+        ua: str = qs.get("ua", [""])[0]
+        if not ua or len(ua) > 512 or "\r" in ua or "\n" in ua:
+            ua = USER_AGENT
         if not url:
             self.send_error(400, "url param required")
             return
@@ -413,33 +444,84 @@ class Handler(SimpleHTTPRequestHandler):
         persist = _SERVER_MODE == "enhanced" and bool(key)
         target = COVERS_DIR / f"{key}.jpg" if persist else None
         content_type = "image/jpeg"
-        data = None
-        with _cover_lock(key) if key else _NullLock():
+        data: Optional[bytes] = None
+
+        # 1) 若有 key 且本地已存在，直接返回，避免网络开销
+        lock = _cover_lock(key) if key else _NullLock()
+        with lock:
             if target and target.exists() and target.stat().st_size > 0:
-                data = target.read_bytes()
-            else:
-                # CI 已经把大多数封面部署为静态文件；优先取静态回源，
-                # 避免本机 Python/OpenSSL 先在 MC CDN TLS 上等待超时。
+                try:
+                    data = target.read_bytes()
+                except OSError:
+                    data = None
+
+            if data is None:
+                # 2) 尝试 digest 磁盘缓存（上游：URL 为键，跨浏览器共享，带 TTL）
+                digest = hashlib.sha1(url.encode("utf-8")).hexdigest()
+                cache_path: Optional[Path] = None
+                for ext in EXT_BY_TYPE.values():
+                    p = COVERS_DIR / f"{digest}.{ext}"
+                    if p.exists() and (time.time() - p.stat().st_mtime) < COVER_CACHE_TTL:
+                        cache_path = p
+                        break
+                if cache_path:
+                    try:
+                        data = cache_path.read_bytes()
+                        ext = cache_path.suffix.lstrip(".")
+                        content_type = "image/" + ("jpeg" if ext == "jpg" else ext)
+                        # 若有 key，同时补一份 key 文件供 fork 逻辑复用
+                        if target and not target.exists():
+                            try:
+                                COVERS_DIR.mkdir(parents=True, exist_ok=True)
+                                tmp = COVERS_DIR / f".{key}.{uuid.uuid4().hex}.tmp"
+                                tmp.write_bytes(data)
+                                tmp.replace(target)
+                            except OSError:
+                                pass
+                    except OSError:
+                        data = None
+
+            if data is None:
+                # 3) 网络抓取：优先静态回源（CI 已预下载），再走 MC CDN
                 sources = [url]
                 if key and STATIC_FALLBACK_BASE:
                     sources.insert(0, f"{STATIC_FALLBACK_BASE}/covers/{key}.jpg")
                 for source in sources:
                     try:
-                        req = urllib.request.Request(source, headers={"User-Agent": USER_AGENT, "Referer": REFERER})
+                        req = urllib.request.Request(source, headers={"User-Agent": ua, "Referer": REFERER})
                         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
                             candidate = resp.read()
-                            candidate_type = resp.headers.get("Content-Type", "image/jpeg")
+                            candidate_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip().lower()
                         if len(candidate) < 100 or (candidate_type and not candidate_type.startswith("image/")):
                             continue
                         data = candidate
                         content_type = candidate_type
+                        # 落盘：key 文件 + digest 缓存
                         if target:
-                            COVERS_DIR.mkdir(parents=True, exist_ok=True)
-                            temp = COVERS_DIR / f".{key}.{uuid.uuid4().hex}.tmp"
-                            temp.write_bytes(data)
-                            temp.replace(target)
+                            try:
+                                COVERS_DIR.mkdir(parents=True, exist_ok=True)
+                                tmp = COVERS_DIR / f".{key}.{uuid.uuid4().hex}.tmp"
+                                tmp.write_bytes(data)
+                                tmp.replace(target)
+                            except OSError:
+                                pass
+                        try:
+                            digest = hashlib.sha1(url.encode("utf-8")).hexdigest()
+                            ext = EXT_BY_TYPE.get(content_type, "jpg")
+                            cache_path2 = COVERS_DIR / f"{digest}.{ext}"
+                            if not cache_path2.exists() or (time.time() - cache_path2.stat().st_mtime) >= COVER_CACHE_TTL:
+                                COVERS_DIR.mkdir(parents=True, exist_ok=True)
+                                tmp2 = COVERS_DIR / f".{digest}.{uuid.uuid4().hex}.tmp"
+                                tmp2.write_bytes(data)
+                                tmp2.replace(cache_path2)
+                        except OSError:
+                            pass
                         break
-                    except Exception:
+                    except urllib.error.HTTPError as e:
+                        print(f"[ERROR] cover proxy: {source} -> HTTP {e.code}")
+                        continue
+                    except Exception as e:
+                        print(f"[ERROR] cover proxy: {source} -> {e}")
                         continue
         if data is None:
             self.send_error(502, "cover download failed")
@@ -462,17 +544,17 @@ class Handler(SimpleHTTPRequestHandler):
             return False
         return parts.netloc.lower() in ALLOWED_HOSTS
 
-    def log_message(self, fmt, *args):
+    def log_message(self, format: str, *args: Any) -> None:
         # 静默：封面代理请求量大，不打访问日志
         pass
 
 
-def main():
+def main() -> None:
     args = sys.argv[1:]
     port = DEFAULT_PORT
     host = DEFAULT_HOST
     clean_mode = False
-    data_file = None
+    data_file: Optional[str] = None
     mode = DEFAULT_MODE
     i = 0
     while i < len(args):
@@ -517,6 +599,17 @@ def main():
         print(f"[INFO] serving data file as /{DATA_ALIAS}: {data_file}")
     if clean_mode:
         print("[INFO] clean mode: browser cover cache will be cleared on next page load")
+        # 上游：清理磁盘缓存；fork：额外兼容旧 key 文件
+        if COVERS_DIR.is_dir():
+            removed = 0
+            for f in COVERS_DIR.iterdir():
+                try:
+                    if f.is_file():
+                        f.unlink()
+                        removed += 1
+                except OSError:
+                    pass
+            print(f"[INFO] cover disk cache cleared ({removed} files)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
